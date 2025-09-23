@@ -9,6 +9,7 @@ from email.mime.multipart import MIMEMultipart
 from typing import TypedDict, Literal, Dict, Any, List, Optional
 from langgraph.graph import StateGraph, END
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 import logging
@@ -43,7 +44,7 @@ class EmailAgentState(BaseAgentState):
     email_content: str
 
 class BaseAgent(ABC):
-    def __init__(self, llm: ChatGroq):
+    def __init__(self, llm):
         self.llm = llm
     
     @abstractmethod
@@ -55,31 +56,10 @@ class BaseAgent(ABC):
         pass
 
 class DBQueryAgent(BaseAgent):
-    def __init__(self, llm: ChatGroq):
+    def __init__(self, llm, schema_file_path: str = "schema"):
         super().__init__(llm)
-        
-        self.table_schemas = {
-            "users": {
-                "columns": ["user_id", "username", "email", "created_at", "last_login"],
-                "types": ["INT PRIMARY KEY", "VARCHAR(50)", "VARCHAR(100)", "DATETIME", "DATETIME"],
-                "description": "User account information"
-            },
-            "products": {
-                "columns": ["product_id", "name", "price", "category", "stock_quantity", "created_at"],
-                "types": ["INT PRIMARY KEY", "VARCHAR(100)", "DECIMAL(10,2)", "VARCHAR(50)", "INT", "DATETIME"],
-                "description": "Product catalog"
-            },
-            "orders": {
-                "columns": ["order_id", "user_id", "product_id", "quantity", "total_amount", "order_date", "status"],
-                "types": ["INT PRIMARY KEY", "INT", "INT", "INT", "DECIMAL(10,2)", "DATETIME", "VARCHAR(20)"],
-                "description": "Customer orders"
-            },
-            "cart": {
-                "columns": ["cart_id", "user_id", "product_id", "quantity", "added_at"],
-                "types": ["INT PRIMARY KEY", "INT", "INT", "INT", "DATETIME"],
-                "description": "Shopping cart items"
-            }
-        }
+        self.schema_file_path = schema_file_path
+        self.schema_content = self._load_schema_file()
         
         self.query_templates = {
             "insert": "INSERT INTO {table} ({columns}) VALUES ({values})",
@@ -91,14 +71,33 @@ class DBQueryAgent(BaseAgent):
     def get_agent_type(self) -> str:
         return "db_query"
     
+    def _load_schema_file(self) -> str:
+        """Load the database schema from the schema file."""
+        try:
+            with open(self.schema_file_path, 'r', encoding='utf-8') as file:
+                content = file.read()
+                # Remove the outer quotes if present
+                if content.startswith('"') and content.endswith('"'):
+                    content = content[1:-1]
+                # Replace escaped newlines with actual newlines
+                content = content.replace('\\n', '\n')
+                
+                logger.info(f"Successfully loaded schema file: {self.schema_file_path}")
+                logger.info(f"Schema content length: {len(content)} characters")
+                
+                return content
+        except FileNotFoundError:
+            error_msg = f"Schema file not found: {self.schema_file_path}"
+            logger.error(error_msg)
+            return "Schema file not found. Unable to load database schema."
+        except Exception as e:
+            error_msg = f"Error loading schema file: {e}"
+            logger.error(error_msg)
+            return f"Error loading schema: {str(e)}"
+    
     def get_schema_info(self) -> str:
-        schema_info = "Available Database Tables:\n"
-        for table, info in self.table_schemas.items():
-            schema_info += f"\n{table.upper()}:\n"
-            schema_info += f"  Description: {info['description']}\n"
-            schema_info += f"  Columns: {', '.join(info['columns'])}\n"
-            schema_info += f"  Types: {', '.join(info['types'])}\n"
-        return schema_info
+        """Return the loaded schema information."""
+        return self.schema_content
     
     def process(self, state: BaseAgentState) -> DBAgentState:
         db_state = DBAgentState(**state)
@@ -107,29 +106,39 @@ class DBQueryAgent(BaseAgent):
             schema_info = self.get_schema_info()
             
             query_prompt = ChatPromptTemplate.from_template("""
-            You are a SQL query generator. Convert the user's natural language request into a SQL query.
-            Use the provided database schema to ensure accurate table and column names.
+            You are an expert SQL query generator with access to a comprehensive database schema.
+            Convert the user's natural language request into an accurate PostgreSQL query.
             
+            DATABASE SCHEMA:
             {schema_info}
             
-            User Query: {query}
+            USER REQUEST: {query}
             
-            Guidelines:
-            - Use exact table and column names from the schema
-            - For user-related queries, assume user_id can be extracted from context
-            - For cart operations, use the cart table
-            - For product queries, use the products table
-            - For order operations, use the orders table
+            INSTRUCTIONS:
+            1. Analyze the user request carefully to understand the intent
+            2. Identify the most relevant table(s) from the schema above
+            3. Use exact table and column names as specified in the schema
+            4. Pay attention to data types (text, numeric, timestamp, bigint, boolean, etc.)
+            5. Use proper PostgreSQL syntax and functions
+            6. For date/time operations, use appropriate PostgreSQL date functions
+            7. Consider relationships between tables when necessary
+            8. Ensure the query is efficient and returns meaningful results
             
-            Respond in this EXACT format:
+            RESPONSE FORMAT (respond with EXACTLY this format):
             QUERY_TYPE: [INSERT/SELECT/UPDATE/DELETE]
-            SQL: [Your SQL query here]
-            EXPLANATION: [Brief explanation of what the query does]
+            SQL: [Your complete SQL query here - ensure it's valid PostgreSQL syntax]
+            EXPLANATION: [Brief explanation of what the query does, which tables/columns are used, and the logic behind your choice]
             
-            Examples:
-            - "add product 2 to cart for user 1" → INSERT INTO cart (user_id, product_id, quantity, added_at) VALUES (1, 2, 1, NOW())
-            - "show my orders" → SELECT * FROM orders WHERE user_id = 1
-            - "update my profile email" → UPDATE users SET email = 'new_email@example.com' WHERE user_id = 1
+            EXAMPLES OF GOOD RESPONSES:
+            - For "show all brands": 
+              QUERY_TYPE: SELECT
+              SQL: SELECT * FROM Brand ORDER BY name;
+              EXPLANATION: Retrieves all brand records from the Brand table, ordered by name for better readability.
+            
+            - For "find customers in Mumbai":
+              QUERY_TYPE: SELECT  
+              SQL: SELECT * FROM ViewCustomer WHERE city = 'Mumbai';
+              EXPLANATION: Uses the ViewCustomer table which contains customer information including city field to filter for Mumbai customers.
             """)
             
             messages = query_prompt.format_messages(
@@ -154,7 +163,8 @@ class DBQueryAgent(BaseAgent):
                     "sql_query": db_state["sql_query"],
                     "query_type": db_state["query_type"],
                     "explanation": explanation,
-                    "table_schemas": self.table_schemas
+                    "schema_source": "loaded_from_file",
+                    "schema_file": self.schema_file_path
                 }
                 
                 print(f"\nGenerated SQL Query:")
@@ -171,7 +181,7 @@ class DBQueryAgent(BaseAgent):
         return db_state
 
 class EmailAgent(BaseAgent):
-    def __init__(self, llm: ChatGroq):
+    def __init__(self, llm):
         super().__init__(llm)
         load_dotenv()
         
@@ -315,7 +325,7 @@ class EmailAgent(BaseAgent):
         return True
 
 class MeetingSchedulerAgent(BaseAgent):
-    def __init__(self, llm: ChatGroq, files_directory: str = "./user_files"):
+    def __init__(self, llm, files_directory: str = "./user_files"):
         super().__init__(llm)
         self.files_directory = files_directory
         os.makedirs(self.files_directory, exist_ok=True)
@@ -459,25 +469,44 @@ class MeetingSchedulerAgent(BaseAgent):
             state["status"] = "failed"
 
 class CentralOrchestrator:
-    def __init__(self, files_directory: str = "./user_files"):
+    def __init__(self, files_directory: str = "./user_files", schema_file_path: str = "schema"):
         load_dotenv()
         
+        # Get API keys
         groq_api_key = os.getenv("GROQ_API_KEY")
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        
         if not groq_api_key:
             raise ValueError("GROQ_API_KEY not found in environment variables.")
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY not found in environment variables.")
         
+        # Create standard LLM for general agents
         self.llm = ChatGroq(
             model="llama-3.1-8b-instant",
             api_key=groq_api_key,
             temperature=0.1,
-            max_tokens=150
+            max_tokens=1000
+        )
+        
+        # Create OpenAI LLM specifically for DB queries with large context window
+        self.db_llm = ChatOpenAI(
+            model="gpt-4o",  # GPT-4o has 128k context window
+            api_key=openai_api_key,
+            temperature=0.1,
+            max_tokens=2000
         )
         
         self.agents = {
-            "db_query": DBQueryAgent(self.llm),
+            "db_query": DBQueryAgent(self.db_llm, schema_file_path),
             "email": EmailAgent(self.llm),
             "meeting": MeetingSchedulerAgent(self.llm, files_directory)
         }
+        
+        logger.info("Initialized CentralOrchestrator with:")
+        logger.info(f"  - DB Query Agent: OpenAI GPT-4o (large context for schema)")
+        logger.info(f"  - Email Agent: Groq Llama-3.1-8b-instant")
+        logger.info(f"  - Meeting Agent: Groq Llama-3.1-8b-instant")
         
         self.classification_keywords = {
             "db_query": [
@@ -647,7 +676,7 @@ class CentralOrchestrator:
 
 def main():
     try:
-        orchestrator = CentralOrchestrator(files_directory="./user_files")
+        orchestrator = CentralOrchestrator(files_directory="./user_files", schema_file_path="schema")
         
     except ValueError as e:
         print(f"Error: {e}")
@@ -655,28 +684,32 @@ def main():
         return
     
     print("Multi-Agent Orchestrator System")
-    print("=" * 55)
+    print("=" * 70)
     print("Available Agents:")
-    print("  • DB Query Agent - Database operations with schema support")
+    print("  • DB Query Agent - Database operations with comprehensive schema support")
+    print("    └─ Powered by OpenAI GPT-4o (128k context window)")
     print("  • Email Agent - Send emails via SMTP")
+    print("    └─ Powered by Groq Llama-3.1-8b-instant")
     print("  • Meeting Agent - Schedule meetings")
-    print("=" * 55)
-    print("Database Schema Available:")
-    print("  • users (user_id, username, email, created_at, last_login)")
-    print("  • products (product_id, name, price, category, stock_quantity)")
-    print("  • orders (order_id, user_id, product_id, quantity, total_amount)")
-    print("  • cart (cart_id, user_id, product_id, quantity, added_at)")
-    print("=" * 55)
+    print("    └─ Powered by Groq Llama-3.1-8b-instant")
+    print("=" * 70)
+    print("Database Schema:")
+    print("  • Comprehensive database schema loaded from 'schema' file")
+    print("  • Includes tables: Brand, CampaignResponse*, Category, Customer*, Distributor*,")
+    print("    Order*, Sku, Team*, User*, View* and many more")
+    print("  • Full schema details available to DB Query Agent for accurate SQL generation")
+    print("=" * 70)
     print("Commands:")
     print("  - 'quit' - Exit the system")
-    print("=" * 55)
+    print("=" * 70)
     print("Example queries:")
-    print("  - 'Add product 5 to cart for user 1'")
-    print("  - 'Send email to john@example.com about today's deals'")
+    print("  - 'Show all brands'")
+    print("  - 'Find customers in Mumbai'")
+    print("  - 'Get campaign responses from last week'")
+    print("  - 'Show user performance data'")
+    print("  - 'Send email to john@example.com about campaign results'")
     print("  - 'Schedule meeting with user 3 tomorrow'")
-    print("  - 'Schedule meeting with user 2 next Monday'")
-    print("  - 'Book appointment with user 5 day after tomorrow'")
-    print("  - 'Show all orders for user 2'")
+    print("=" * 70)
     print("=" * 55)
     
     while True:
