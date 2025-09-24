@@ -76,10 +76,8 @@ class DBQueryAgent(BaseAgent):
         try:
             with open(self.schema_file_path, 'r', encoding='utf-8') as file:
                 content = file.read()
-                # Remove the outer quotes if present
                 if content.startswith('"') and content.endswith('"'):
                     content = content[1:-1]
-                # Replace escaped newlines with actual newlines
                 content = content.replace('\\n', '\n')
                 
                 logger.info(f"Successfully loaded schema file: {self.schema_file_path}")
@@ -472,7 +470,6 @@ class CentralOrchestrator:
     def __init__(self, files_directory: str = "./user_files", schema_file_path: str = "schema"):
         load_dotenv()
         
-        # Get API keys
         groq_api_key = os.getenv("GROQ_API_KEY")
         openai_api_key = os.getenv("OPENAI_API_KEY")
         
@@ -481,7 +478,6 @@ class CentralOrchestrator:
         if not openai_api_key:
             raise ValueError("OPENAI_API_KEY not found in environment variables.")
         
-        # Create standard LLM for general agents
         self.llm = ChatGroq(
             model="llama-3.1-8b-instant",
             api_key=groq_api_key,
@@ -489,9 +485,8 @@ class CentralOrchestrator:
             max_tokens=1000
         )
         
-        # Create OpenAI LLM specifically for DB queries with large context window
         self.db_llm = ChatOpenAI(
-            model="gpt-4o",  # GPT-4o has 128k context window
+            model="gpt-4o", 
             api_key=openai_api_key,
             temperature=0.1,
             max_tokens=2000
@@ -685,20 +680,6 @@ def main():
     
     print("Multi-Agent Orchestrator System")
     print("=" * 70)
-    print("Available Agents:")
-    print("  • DB Query Agent - Database operations with comprehensive schema support")
-    print("    └─ Powered by OpenAI GPT-4o (128k context window)")
-    print("  • Email Agent - Send emails via SMTP")
-    print("    └─ Powered by Groq Llama-3.1-8b-instant")
-    print("  • Meeting Agent - Schedule meetings")
-    print("    └─ Powered by Groq Llama-3.1-8b-instant")
-    print("=" * 70)
-    print("Database Schema:")
-    print("  • Comprehensive database schema loaded from 'schema' file")
-    print("  • Includes tables: Brand, CampaignResponse*, Category, Customer*, Distributor*,")
-    print("    Order*, Sku, Team*, User*, View* and many more")
-    print("  • Full schema details available to DB Query Agent for accurate SQL generation")
-    print("=" * 70)
     print("Commands:")
     print("  - 'quit' - Exit the system")
     print("=" * 70)
@@ -710,7 +691,6 @@ def main():
     print("  - 'Send email to john@example.com about campaign results'")
     print("  - 'Schedule meeting with user 3 tomorrow'")
     print("=" * 70)
-    print("=" * 55)
     
     while True:
         query = input("\nEnter your query: ").strip()
