@@ -2,6 +2,7 @@ import os
 import re
 import smtplib
 import time
+import json
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
@@ -30,6 +31,8 @@ class BaseAgentState(TypedDict):
     start_time: float
     end_time: float
     execution_time: float
+    classification_confidence: Optional[float]
+    redirect_count: Optional[int]
 
 class MeetingAgentState(BaseAgentState):
     meeting_date: str
@@ -486,13 +489,11 @@ Question: {question}
             
             import json
             try:
-                # Try to extract JSON from the response
                 json_match = re.search(r'\{.*\}', content, re.DOTALL)
                 if json_match:
                     json_content = json_match.group(0)
                     result_data = json.loads(json_content)
                 else:
-                    # If no JSON found, treat as passthrough
                     logger.warning(f"No JSON found in campaign response: {content}")
                     state["status"] = "campaign_processed"
                     state["result"] = {"source": "campaign_agent_no_json"}
@@ -685,6 +686,56 @@ class MeetingSchedulerAgent(BaseAgent):
             state["status"] = "failed"
 
 
+class ClassificationValidator:
+    """Validates classification accuracy and provides feedback loop for improvement"""
+    def __init__(self):
+        self.classification_history = deque(maxlen=100)
+        self.error_patterns = {}
+    
+    def validate_classification(self, query: str, predicted_agent: str, actual_result: str) -> bool:
+        """Validate if classification was correct based on execution result"""
+        is_correct = actual_result == "completed"
+        
+        self.classification_history.append({
+            "query": query,
+            "predicted": predicted_agent,
+            "correct": is_correct,
+            "timestamp": time.time()
+        })
+        
+        if not is_correct:
+            self._record_error_pattern(query, predicted_agent)
+        
+        return is_correct
+    
+    def _record_error_pattern(self, query: str, wrong_agent: str):
+        """Record patterns that lead to misclassification"""
+        key_phrases = re.findall(r'\b\w+\b', query.lower())
+        for phrase in key_phrases:
+            if phrase not in self.error_patterns:
+                self.error_patterns[phrase] = {}
+            if wrong_agent not in self.error_patterns[phrase]:
+                self.error_patterns[phrase][wrong_agent] = 0
+            self.error_patterns[phrase][wrong_agent] += 1
+    
+    def get_classification_accuracy(self) -> float:
+        """Calculate recent classification accuracy"""
+        if not self.classification_history:
+            return 0.0
+        
+        correct = sum(1 for entry in self.classification_history if entry["correct"])
+        return correct / len(self.classification_history)
+    
+    def get_problematic_patterns(self) -> List[str]:
+        """Get patterns that frequently lead to misclassification"""
+        problematic = []
+        for phrase, agents in self.error_patterns.items():
+            total_errors = sum(agents.values())
+            if total_errors >= 3:
+                problematic.append(phrase)
+        return problematic
+
+
 class MemoryManager:
     """In memory conversattion manager - uses llm to enrich the query with previous memory
 
@@ -708,7 +759,6 @@ class MemoryManager:
         return list(self.history)[-n:]
 
     def _heuristic_expand(self, query: str) -> Optional[str]:
-        # Basic heuristic
         lowered = query.lower()
         if any(token in lowered for token in ["that date", "that day", "that time", "that slot"]):
             for entry in reversed(self.history):
@@ -717,7 +767,6 @@ class MemoryManager:
                     if meeting_date:
                         return re.sub(r"(?i)that date|that day|that time|that slot", meeting_date, query)
         
-        # Check for ambiguous follow-up patterns that need LLM enrichment
         ambiguous_patterns = [
             "also invite", "also send", "also include", "also add",
             "confirm the", "update the", "change the", "modify the",
@@ -726,7 +775,6 @@ class MemoryManager:
         ]
         
         if any(pattern in lowered for pattern in ambiguous_patterns):
-            # Return None to force LLM enrichment for these cases
             return None
         
         return None
@@ -824,6 +872,89 @@ class MemoryManager:
         # fallback: return original
         return original_query
 
+
+class EnhancedMemoryManager(MemoryManager):
+    """Enhanced memory manager with robust context enrichment and failure handling"""
+    def __init__(self, llm, max_history: int = 3):
+        super().__init__(llm, max_history)
+        self.enrichment_cache = {}  
+        self.failed_patterns = set() 
+        self.enrichment_timeout = 10  
+    
+    def enrich_query(self, original_query: str) -> str:
+        """Enhanced query enrichment with failure handling"""
+        cache_key = self._get_cache_key(original_query)
+        if cache_key in self.enrichment_cache:
+            logger.info(f"Using cached enrichment for: {original_query}")
+            return self.enrichment_cache[cache_key]
+        
+        if self._is_problematic_pattern(original_query):
+            logger.warning(f"Skipping enrichment for problematic pattern: {original_query}")
+            return original_query
+        
+        try:
+            enriched = self._safe_enrich_query(original_query)
+            
+            if self._validate_enriched_query(original_query, enriched):
+                self.enrichment_cache[cache_key] = enriched
+                return enriched
+            else:
+                logger.warning(f"Enriched query validation failed, using original")
+                return original_query
+                
+        except Exception as e:
+            logger.error(f"Query enrichment failed: {e}")
+            self.failed_patterns.add(self._extract_pattern(original_query))
+            return original_query
+    
+    def _get_cache_key(self, query: str) -> str:
+        """Generate cache key for query"""
+        return f"{query.lower().strip()}_{len(self.history)}"
+    
+    def _is_problematic_pattern(self, query: str) -> bool:
+        """Check if query contains known problematic patterns"""
+        pattern = self._extract_pattern(query)
+        return pattern in self.failed_patterns
+    
+    def _extract_pattern(self, query: str) -> str:
+        """Extract key pattern from query for failure tracking"""
+        words = query.lower().split()[:3]
+        return " ".join(words)
+    
+    def _safe_enrich_query(self, original_query: str) -> str:
+        """Enrichment with timeout and retry logic"""
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                enriched = super().enrich_query(original_query)
+                if enriched and len(enriched.strip()) > 0:
+                    return enriched
+            except Exception as e:
+                logger.warning(f"Enrichment attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    raise
+        
+        return original_query
+    
+    def _validate_enriched_query(self, original: str, enriched: str) -> bool:
+        """Validate that enriched query makes sense"""
+        if not enriched or len(enriched.strip()) == 0:
+            return False
+        
+        if len(enriched) > len(original) * 3:  
+            return False
+        
+        original_emails = re.findall(r'\b\w+@[\w.-]+\.\w+\b', original)
+        enriched_emails = re.findall(r'\b\w+@[\w.-]+\.\w+\b', enriched)
+        
+        for email in original_emails:
+            if email not in enriched:
+                return False
+        
+        return True
+
+
 class CentralOrchestrator:
     def __init__(self, files_directory: str = "./user_files", schema_file_path: str = "schema"):
         load_dotenv()
@@ -867,7 +998,7 @@ class CentralOrchestrator:
                 "database", "query", "sql", "insert", "select", "update", "delete",
                 "add to cart", "product", "order", "table", "record", "data",
                 "create", "remove", "modify", "store", "retrieve", "cart", "user profile",
-                "show", "find", "get", "list", "search", "display"
+                "show", "find", "get", "list", "search", "display", "customers", "brands"
             ],
             "email": [
                 "email", "mail", "send", "notify", "message", "contact",
@@ -885,33 +1016,36 @@ class CentralOrchestrator:
                 "active campaigns", "campaign metrics", "campaign response"
             ]
         }
-        #email classification patterns.
+        
         self.classification_patterns = {
             "email": [
-                r"\b\w+@\w+\.\w+\b",  
-                r"\bcc\s+\w+@\w+\.\w+",  
-                r"\bsend\s+.*?@", 
-                r"\bsubject\s*:", 
-                r"\bemail.*?to\b", 
+                (r'\b\w+@[\w.-]+\.\w+\b', 3.0),  # Email addresses
+                (r'\b(send|compose|email|mail)\b.*@', 2.5),
+                (r'\bcc\s+\w+@', 2.0),
+                (r'\bsubject\s*:', 2.0),
             ],
             "meeting": [
-                r"\bschedule.*?(meeting|demo|call|appointment)",
-                r"\b(book|arrange).*?(meeting|demo|call)",
-                r"\bmeet.*?(with|at|on)",
-                r"\b(tomorrow|today|next\s+\w+|monday|tuesday|wednesday|thursday|friday|saturday|sunday)",
-                r"\b\d{1,2}[:/]\d{2}(\s*(am|pm))?",
+                (r'\b(schedule|book|arrange)\s+(meeting|appointment|demo|call)', 3.0),
+                (r'\bmeet\s+with\s+user\s+\d+', 2.5),
+                (r'\b(tomorrow|today|next\s+\w+day)\b', 1.5),
+                (r'\b\d{1,2}[:/]\d{2}(\s*(am|pm))?\b', 1.0),
             ],
             "db_query": [
-                r"\b(show|find|get|list|display|retrieve).*?(all|from)",
-                r"\b(add|insert|create|store).*?(to|in|into)",
-                r"\b(update|modify|change|edit)",
-                r"\b(delete|remove|drop)",
-                r"\btable\b.*?\b(records?|data|entries)",
+                (r'\b(show|find|get|list|display)\s+(all|from)', 2.5),
+                (r'\b(insert|create|add)\s+.*\s+(to|into|in)\b', 2.0),
+                (r'\b(update|modify|change|edit)\b', 2.0),
+                (r'\btable\b.*\b(records?|data|entries)\b', 2.0),
+            ],
+            "campaign": [
+                (r'\b(holiday\s+sale|summer\s+promo|black\s+friday)\b', 3.0),
+                (r'\bcampaign\s+(id|name|data|info|metrics)\b', 2.5),
+                (r'\bactive\s+campaigns\b', 2.0),
             ]
         }
         
+        self.classification_validator = ClassificationValidator()
         self.graph = self._build_orchestrator_graph()
-        self.memory = MemoryManager(self.llm, max_history=3)
+        self.memory = EnhancedMemoryManager(self.llm, max_history=3)
     
     def _build_orchestrator_graph(self) -> StateGraph:
         workflow = StateGraph(BaseAgentState)
@@ -945,18 +1079,76 @@ class CentralOrchestrator:
         return workflow.compile()
     
     def _classify_query(self, state: BaseAgentState) -> BaseAgentState:
-        """Pure LLM classification for maximum accuracy"""
+        """Enhanced hybrid classification with confidence scoring"""
+        query = state["query"].lower()
+        
+        pattern_scores = self._pattern_classification(query)
+        keyword_scores = self._keyword_classification(query)
+        
+        combined_scores = {}
+        for agent_type in self.agents.keys():
+            pattern_score = pattern_scores.get(agent_type, 0)
+            keyword_score = keyword_scores.get(agent_type, 0)
+            combined_scores[agent_type] = (pattern_score * 0.6) + (keyword_score * 0.4)
+        
+        max_score = max(combined_scores.values()) if combined_scores else 0
+        best_agent = max(combined_scores, key=combined_scores.get) if combined_scores else None
+        
+        if max_score >= 2.0 and best_agent: 
+            state["agent_type"] = best_agent
+            state["status"] = "classified"
+            state["classification_confidence"] = max_score
+            logger.info(f"High-confidence classification: {best_agent} (score: {max_score:.2f})")
+            return state
+        
+        return self._llm_classify_with_context(state, combined_scores)
+    
+    def _pattern_classification(self, query: str) -> Dict[str, float]:
+        """Enhanced pattern matching with weighted scoring"""
+        scores = {}
+        
+        for agent_type, patterns in self.classification_patterns.items():
+            total_score = 0
+            for pattern, weight in patterns:
+                matches = len(re.findall(pattern, query, re.IGNORECASE))
+                total_score += matches * weight
+            scores[agent_type] = total_score
+        
+        return scores
+    
+    def _keyword_classification(self, query: str) -> Dict[str, float]:
+        """Keyword-based classification with scoring"""
+        scores = {}
+        query_words = set(query.lower().split())
+        
+        for agent_type, keywords in self.classification_keywords.items():
+            keyword_matches = sum(1 for keyword in keywords if keyword in query)
+            scores[agent_type] = keyword_matches * 0.5 
+        
+        return scores
+    
+    def _llm_classify_with_context(self, state: BaseAgentState, scores: Dict[str, float]) -> BaseAgentState:
+        """LLM classification with context from pattern/keyword scores and multi-step detection"""
         try:
+            # First, detect if this is a multi-step query
+            if self._is_multi_step_query(state["query"]):
+                return self._handle_multi_step_query(state, scores)
+            
+            scores_text = ", ".join([f"{k}: {v:.1f}" for k, v in scores.items()])
+            
             classify_prompt = ChatPromptTemplate.from_template("""
-            You are a production query classifier. Classify this query into exactly ONE category.
+            You are a production query classifier with access to preliminary scoring analysis.
             
             Query: {query}
+            Preliminary Scores: {scores}
             
             Categories:
             1. campaign - Questions about campaigns, campaign IDs, campaign names, campaign data, Holiday Sale, Summer Promo, Black Friday, active campaigns, campaign metrics, etc.
             2. db_query - Database operations (show, find, insert, select, update, delete, list, display, retrieve data, etc.)
             3. email - Email operations (send, compose, cc, bcc, notify, @ symbols, email addresses, etc.)  
             4. meeting - Meeting/scheduling (schedule, book, appointment, meet, demo, call, dates, times, etc.)
+            
+            IMPORTANT: For multi-step queries, focus on the PRIMARY action (usually the first verb).
             
             EXAMPLES:
             "what is the holiday sale campaign id" → campaign
@@ -965,127 +1157,235 @@ class CentralOrchestrator:
             "schedule meeting with user 2" → meeting
             "show all customers" → db_query
             "find customers in Mumbai" → db_query
-            "schedule a meet with user 3 on 30th sep 2025" → meeting
+            "show all campaigns and email results to team@company.com" → campaign (PRIMARY action is "show campaigns")
+            "get customer data and send to manager@company.com" → db_query (PRIMARY action is "get data")
+            
+            Focus on the FIRST/PRIMARY action in compound queries.
             
             Respond with ONLY one word: campaign, db_query, email, or meeting
             """)
             
-            messages = classify_prompt.format_messages(query=state["query"])
+            messages = classify_prompt.format_messages(query=state["query"], scores=scores_text)
             response = self.llm.invoke(messages)
             agent_type = response.content.strip().lower()
             
-            # Validate response
             valid_agents = ["campaign", "db_query", "email", "meeting"]
             if agent_type in valid_agents:
                 state["agent_type"] = agent_type
                 state["status"] = "classified"
+                state["classification_confidence"] = scores.get(agent_type, 1.0)
                 logger.info(f"LLM Classification: {agent_type}")
                 return state
             else:
-                # Fallback classification based on simple heuristics
-                query_lower = state["query"].lower()
-                if any(word in query_lower for word in ["campaign", "holiday sale", "summer promo", "black friday"]):
-                    fallback_type = "campaign"
-                elif "@" in state["query"]:
-                    fallback_type = "email"
-                elif any(word in query_lower for word in ["schedule", "meeting", "meet", "book"]):
-                    fallback_type = "meeting"
-                else:
-                    fallback_type = "db_query"
-                
-                state["agent_type"] = fallback_type
+                best_agent = max(scores, key=scores.get) if scores else "db_query"
+                state["agent_type"] = best_agent
                 state["status"] = "classified"
-                logger.warning(f"LLM gave invalid response '{agent_type}', using fallback: {fallback_type}")
+                state["classification_confidence"] = scores.get(best_agent, 0.5)
+                logger.warning(f"LLM gave invalid response '{agent_type}', using highest score: {best_agent}")
                 return state
                 
         except Exception as e:
-            # Ultimate fallback
-            query_lower = state["query"].lower()
-            if any(word in query_lower for word in ["campaign", "holiday sale", "summer promo", "black friday"]):
-                fallback_type = "campaign"
-            elif "@" in state["query"]:
-                fallback_type = "email"
-            elif any(word in query_lower for word in ["schedule", "meeting", "meet"]):
-                fallback_type = "meeting"
-            else:
-                fallback_type = "db_query"
-            
-            state["agent_type"] = fallback_type
+            best_agent = max(scores, key=scores.get) if scores else "db_query"
+            state["agent_type"] = best_agent
             state["status"] = "classified"
-            logger.error(f"Classification completely failed: {e}, using fallback: {fallback_type}")
+            state["classification_confidence"] = 0.1  # Low confidence
+            logger.error(f"LLM classification failed: {e}, using fallback: {best_agent}")
             return state
     
+    def _is_multi_step_query(self, query: str) -> bool:
+        """Detect if query contains multiple actions requiring different agents"""
+        query_lower = query.lower()
+        
+        # Multi-step indicators
+        multi_step_patterns = [
+            r'\band\s+(email|send|notify)',  # "show data and email results"
+            r'\band\s+(schedule|book|meet)',  # "get info and schedule meeting"  
+            r'(show|get|find).*and.*(email|send)',  # "show X and send to Y"
+            r'(email|send).*and.*(schedule|meet)',  # "email X and schedule Y"
+            r'(show|get).*then.*(email|send|schedule)',  # "show X then send Y"
+        ]
+        
+        return any(re.search(pattern, query_lower) for pattern in multi_step_patterns)
+    
+    def _handle_multi_step_query(self, state: BaseAgentState, scores: Dict[str, float]) -> BaseAgentState:
+        """Handle multi-step queries by identifying primary action"""
+        query = state["query"].lower()
+        
+        # Priority order for multi-step queries (primary action wins)
+        priority_patterns = [
+            ("campaign", [r'\b(show|get|find|list|display)\s+.*campaigns?', r'\bcampaign\s+(data|info|id|name)']),
+            ("db_query", [r'\b(show|get|find|list|display)\s+.*(customers?|data|records?|users?|products?)', r'\b(insert|update|delete|create)\s+']),
+            ("meeting", [r'\b(schedule|book|arrange)\s+.*(meeting|appointment|demo|call)', r'\bmeet\s+with\s+user\s+\d+']),
+            ("email", [r'^\s*(send|compose|email|mail)\s+', r'^.*email\s+to\s+\w+@'])  # Only if email is the primary action
+        ]
+        
+        # Find the primary action
+        for agent_type, patterns in priority_patterns:
+            for pattern in patterns:
+                if re.search(pattern, query):
+                    logger.info(f"Multi-step query detected. Primary action: {agent_type}")
+                    state["agent_type"] = agent_type
+                    state["status"] = "classified"
+                    state["classification_confidence"] = scores.get(agent_type, 1.5)  # Moderate confidence
+                    
+                    # Store the full query for potential chaining
+                    state["original_multi_step_query"] = state["query"]
+                    return state
+        
+        # Fallback to highest scoring agent
+        best_agent = max(scores, key=scores.get) if scores else "db_query"
+        state["agent_type"] = best_agent
+        state["status"] = "classified" 
+        state["classification_confidence"] = scores.get(best_agent, 0.8)
+        logger.info(f"Multi-step query fallback to: {best_agent}")
+        return state
+    
     def _route_to_agent(self, state: BaseAgentState) -> BaseAgentState:
+        """Enhanced routing with proper error handling and circuit breaker"""
         try:
             agent_type = state["agent_type"]
             if agent_type not in self.agents:
-                state["error_message"] = f"No agent found for type: {agent_type}"
-                state["status"] = "routing_error"
-                return state
+                return self._handle_routing_error(state, f"No agent found for type: {agent_type}")
             
             logger.info(f"Routing to {agent_type} agent")
             agent = self.agents[agent_type]
             
-            # Special handling for campaign agent - it may enrich the query or provide direct answer
             if agent_type == "campaign":
-                campaign_result = agent.process(state)
-                
-                # If campaign agent provided a direct answer, we're done
-                if campaign_result["status"] == "completed":
-                    logger.info("Campaign agent provided direct answer")
-                    return campaign_result
-                
-                # If campaign agent enriched the query, reclassify the enriched query
-                if campaign_result["status"] == "campaign_processed" and "enriched_query" in campaign_result.get("result", {}):
-                    enriched_query = campaign_result["result"]["enriched_query"]
-                    logger.info(f"Campaign agent enriched query: '{state['query']}' → '{enriched_query}'")
-                    
-                    # Reclassify the enriched query (excluding campaign this time)
-                    reclassify_prompt = ChatPromptTemplate.from_template("""
-                    Classify this enriched query into exactly ONE category.
-                    
-                    Query: {query}
-                    
-                    Categories:
-                    1. db_query - Database operations (show, find, insert, select, update, delete, list, display, retrieve data, etc.)
-                    2. email - Email operations (send, compose, cc, bcc, notify, @ symbols, email addresses, etc.)  
-                    3. meeting - Meeting/scheduling (schedule, book, appointment, meet, demo, call, dates, times, etc.)
-                    
-                    Respond with ONLY one word: db_query, email, or meeting
-                    """)
-                    
-                    messages = reclassify_prompt.format_messages(query=enriched_query)
-                    response = self.llm.invoke(messages)
-                    new_agent_type = response.content.strip().lower()
-                    
-                    if new_agent_type in ["db_query", "email", "meeting"]:
-                        # Update state with new classification and enriched query
-                        state["agent_type"] = new_agent_type
-                        state["query"] = enriched_query
-                        
-                        # Route to the correct agent
-                        logger.info(f"Reclassified enriched query as: {new_agent_type}")
-                        final_agent = self.agents[new_agent_type]
-                        return final_agent.process(state)
-                    else:
-                        # Fallback to db_query if reclassification fails
-                        state["agent_type"] = "db_query"
-                        state["query"] = enriched_query
-                        return self.agents["db_query"].process(state)
-                else:
-                    # Campaign agent processed but didn't enrich, treat as passthrough
-                    logger.info("Campaign agent processed without enrichment")
-                    return campaign_result
+                return self._handle_campaign_routing(state, agent)
             else:
-                # For non-campaign agents, process directly
-                result_state = agent.process(state)
-                return result_state
-            
+                return self._handle_direct_routing(state, agent)
+                
         except Exception as e:
-            state["error_message"] = f"Routing error: {str(e)}"
-            state["status"] = "routing_error"
-            logger.error(f"Routing error: {e}")
-            return state
+            return self._handle_routing_error(state, f"Routing error: {str(e)}")
+    
+    def _handle_campaign_routing(self, state: BaseAgentState, agent: BaseAgent) -> BaseAgentState:
+        """Handle campaign agent routing with proper state management"""
+        max_redirects = 2  
+        redirect_count = state.get("redirect_count", 0)
+        
+        if redirect_count >= max_redirects:
+            logger.error(f"Maximum redirects exceeded for campaign routing")
+            return self._handle_routing_error(state, "Campaign routing exceeded maximum redirects")
+        
+        campaign_result = agent.process(state)
+        
+        if campaign_result["status"] == "completed":
+            logger.info("Campaign agent provided direct answer")
+            return campaign_result
+        
+        if campaign_result["status"] == "campaign_processed":
+            enriched_query = campaign_result.get("result", {}).get("enriched_query")
+            
+            if not enriched_query:
+                logger.warning("Campaign agent processed but no enriched query found")
+                return self._fallback_to_db_query(state)
+            
+            return self._reclassify_enriched_query(state, enriched_query, redirect_count + 1)
+        
+        logger.warning(f"Unexpected campaign agent status: {campaign_result['status']}")
+        return self._fallback_to_db_query(state)
+    
+    def _handle_direct_routing(self, state: BaseAgentState, agent: BaseAgent) -> BaseAgentState:
+        """Handle direct agent routing with validation"""
+        try:
+            if not self._validate_agent_capability(state["agent_type"], state["query"]):
+                logger.warning(f"Agent {state['agent_type']} may not be suitable for query: {state['query']}")
+            
+            result_state = agent.process(state)
+            
+            self.classification_validator.validate_classification(
+                state["query"], 
+                state["agent_type"], 
+                result_state["status"]
+            )
+            
+            return result_state
+        except Exception as e:
+            logger.error(f"Direct routing failed for {state['agent_type']}: {e}")
+            return self._handle_agent_failure(state, state["agent_type"])
+    
+    def _reclassify_enriched_query(self, state: BaseAgentState, enriched_query: str, redirect_count: int) -> BaseAgentState:
+        """Reclassify enriched query with error handling"""
+        try:
+            reclassify_prompt = ChatPromptTemplate.from_template("""
+            Classify this enriched query into exactly ONE category.
+            
+            Query: {query}
+            
+            Categories:
+            1. db_query - Database operations
+            2. email - Email operations  
+            3. meeting - Meeting/scheduling
+            
+            Respond with ONLY one word: db_query, email, or meeting
+            """)
+            
+            messages = reclassify_prompt.format_messages(query=enriched_query)
+            response = self.llm.invoke(messages)
+            new_agent_type = response.content.strip().lower()
+            
+            if new_agent_type in ["db_query", "email", "meeting"]:
+                new_state = dict(state)
+                new_state["agent_type"] = new_agent_type
+                new_state["query"] = enriched_query
+                new_state["redirect_count"] = redirect_count
+                
+                logger.info(f"Reclassified enriched query as: {new_agent_type}")
+                return self.agents[new_agent_type].process(new_state)
+            else:
+                return self._fallback_to_db_query(state)
+                
+        except Exception as e:
+            logger.error(f"Reclassification failed: {e}")
+            return self._fallback_to_db_query(state)
+    
+    def _validate_agent_capability(self, agent_type: str, query: str) -> bool:
+        """Validate if agent can handle the specific query"""
+        validation_rules = {
+            "email": lambda q: bool(re.search(r'\b\w+@[\w.-]+\.\w+\b', q)),
+            "meeting": lambda q: bool(re.search(r'\buser\s+\d+\b', q)),
+            "db_query": lambda q: len(q.split()) >= 3,  
+            "campaign": lambda q: any(term in q.lower() for term in ["campaign", "holiday", "promo", "sale"])
+        }
+        
+        return validation_rules.get(agent_type, lambda q: True)(query)
+    
+    def _fallback_to_db_query(self, state: BaseAgentState) -> BaseAgentState:
+        """Fallback to db_query agent"""
+        logger.info("Falling back to db_query agent")
+        state["agent_type"] = "db_query"
+        return self.agents["db_query"].process(state)
+    
+    def _handle_routing_error(self, state: BaseAgentState, error_message: str) -> BaseAgentState:
+        """Centralized error handling for routing"""
+        state["error_message"] = error_message
+        state["status"] = "routing_error"
+        logger.error(error_message)
+        return state
+    
+    def _handle_agent_failure(self, state: BaseAgentState, failed_agent: str) -> BaseAgentState:
+        """Handle agent failures with graceful degradation"""
+        fallback_order = {
+            "campaign": ["db_query"],
+            "email": ["db_query"],
+            "meeting": ["db_query"],
+            "db_query": []  
+        }
+        
+        fallbacks = fallback_order.get(failed_agent, [])
+        
+        for fallback_agent in fallbacks:
+            try:
+                logger.info(f"Attempting fallback from {failed_agent} to {fallback_agent}")
+                state["agent_type"] = fallback_agent
+                return self.agents[fallback_agent].process(state)
+            except Exception as e:
+                logger.error(f"Fallback to {fallback_agent} also failed: {e}")
+                continue
+        
+        state["error_message"] = f"All agents failed for query type: {failed_agent}"
+        state["status"] = "failed"
+        return state
     
     def _handle_error(self, state: BaseAgentState) -> BaseAgentState:
         state["status"] = "failed"
@@ -1095,8 +1395,8 @@ class CentralOrchestrator:
     def _should_classify_or_error(self, state: BaseAgentState) -> Literal["route", "error"]:
         if state["status"] == "classified":
             return "route"
-        elif state["status"] == "completed":  # Campaign agent answered directly
-            return "route"  # This will go to route_to_agent but it should return immediately
+        elif state["status"] == "completed": 
+            return "route"  
         else:
             return "error"
     
@@ -1124,11 +1424,15 @@ class CentralOrchestrator:
             result={},
             start_time=time.time(),
             end_time=0.0,
-            execution_time=0.0
+            execution_time=0.0,
+            classification_confidence=None,
+            redirect_count=0
         )
         initial_state["original_query"] = query
         
         print(f"\nProcessing Query: '{query}'")
+        if enriched_query != query:
+            print(f"Enriched Query: '{enriched_query}'")
         
         start_time = time.time()
         result = self.graph.invoke(initial_state)
@@ -1141,18 +1445,26 @@ class CentralOrchestrator:
         
         print(f"Execution Time: {execution_time:.4f} seconds")
         
+        if result.get("classification_confidence"):
+            print(f"Classification Confidence: {result['classification_confidence']:.2f}")
+        
+        accuracy = self.classification_validator.get_classification_accuracy()
+        if accuracy > 0:
+            print(f"Recent Classification Accuracy: {accuracy:.1%}")
+        
         if result["status"] == "completed":
             print(f"Success: {result['success_message']}")
             try:
                 self.memory.add_entry(query, enriched_query, result.get("agent_type", ""), result.get("result", {}))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to add memory entry: {e}")
             return {
                 "success": True,
                 "message": result["success_message"],
                 "agent_type": result.get("agent_type", "campaign"),
                 "result": result["result"],
-                "execution_time": execution_time
+                "execution_time": execution_time,
+                "classification_confidence": result.get("classification_confidence")
             }
         else:
             print(f"Error: {result['error_message']}")
@@ -1161,7 +1473,8 @@ class CentralOrchestrator:
                 "error": result.get("error_message", "Unknown error occurred"),
                 "status": result["status"],
                 "agent_type": result.get("agent_type", "unknown"),
-                "execution_time": execution_time
+                "execution_time": execution_time,
+                "classification_confidence": result.get("classification_confidence")
             }
 
 
