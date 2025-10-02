@@ -1,4 +1,6 @@
 langgraph
 langchain
 langchain-groq
+langchain-openai
 python-dotenv
+scikit-learn
