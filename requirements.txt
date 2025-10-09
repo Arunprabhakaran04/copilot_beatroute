@@ -5,3 +5,5 @@ langchain-openai
 python-dotenv
 scikit-learn
 psycopg2-binary
+pandas
+plotly

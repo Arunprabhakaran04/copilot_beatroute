@@ -16,7 +16,10 @@ from email_agent import EmailAgent
 from campaign_agent import CampaignAgent
 from meeting_scheduler_agent import MeetingSchedulerAgent
 from sql_retriever_agent import SQLRetrieverAgent
+from summary_agent import SummaryAgent
+from visualization_agent import VisualizationAgent
 from memory_manager import ClassificationValidator, EnhancedMemoryManager
+from token_tracker import get_token_tracker, track_llm_call
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,7 +56,9 @@ class CentralOrchestrator:
             "email": EmailAgent(self.llm),
             "meeting": MeetingSchedulerAgent(self.llm, files_directory),
             "campaign": CampaignAgent(self.llm),
-            "sql_retriever": SQLRetrieverAgent(self.db_llm, "embeddings.pkl")
+            "sql_retriever": SQLRetrieverAgent(self.db_llm, "embeddings.pkl"),
+            "summary": SummaryAgent(self.db_llm, "gpt-4o"),
+            "visualization": VisualizationAgent(self.db_llm, "gpt-4o")
         }
         
         logger.info("Initialized CentralOrchestrator with:")
@@ -61,6 +66,8 @@ class CentralOrchestrator:
         logger.info(f"  - Email Agent: Groq Llama-3.1-8b-instant")
         logger.info(f"  - Meeting Agent: Groq Llama-3.1-8b-instant")
         logger.info(f"  - SQL Retriever Agent: OpenAI GPT-4o (for embeddings and retrieval)")
+        logger.info(f"  - Summary Agent: OpenAI GPT-4o (for data summarization)")
+        logger.info(f"  - Visualization Agent: OpenAI GPT-4o (for data visualization)")
         
         self.classification_keywords = {
             "db_query": [
@@ -83,6 +90,17 @@ class CentralOrchestrator:
                 "campaign", "holiday sale", "summer promo", "black friday",
                 "campaign id", "campaign name", "campaign data", "campaign info",
                 "active campaigns", "campaign metrics", "campaign response"
+            ],
+            "summary": [
+                "summarize", "summary", "analyze", "analysis", "insights", "overview",
+                "explain", "breakdown", "interpret", "describe", "what does this mean",
+                "tell me about", "explain the data", "data insights", "trends"
+            ],
+            "visualization": [
+                "visualize", "chart", "graph", "plot", "show", "display", "draw",
+                "bar chart", "line chart", "pie chart", "scatter plot", "histogram",
+                "visualization", "visual", "graphical", "dashboard", "plot it",
+                "create chart", "make graph", "draw chart", "show chart", "render"
             ]
         }
         
@@ -109,6 +127,19 @@ class CentralOrchestrator:
                 (r'\b(holiday\s+sale|summer\s+promo|black\s+friday)\b', 3.0),
                 (r'\bcampaign\s+(id|name|data|info|metrics)\b', 2.5),
                 (r'\bactive\s+campaigns\b', 2.0),
+            ],
+            "summary": [
+                (r'\b(summarize|summary|analyze|analysis)\b', 3.0),
+                (r'\b(explain|describe|interpret)\s+.*\b(data|results|trends)\b', 2.5),
+                (r'\b(what\s+does\s+this\s+mean|tell\s+me\s+about|insights)\b', 2.0),
+                (r'\b(breakdown|overview)\s+', 1.5),
+            ],
+            "visualization": [
+                (r'\b(visualize|chart|graph|plot|draw)\b', 3.0),
+                (r'\b(bar\s+chart|line\s+chart|pie\s+chart|scatter\s+plot)\b', 3.5),
+                (r'\b(show|display|render)\s+.*\b(chart|graph|plot|visual)\b', 2.5),
+                (r'\b(create|make|generate)\s+.*\b(chart|graph|visualization)\b', 2.5),
+                (r'\bplot\s+it\b', 2.0),
             ]
         }
         
@@ -120,7 +151,12 @@ class CentralOrchestrator:
         """Clear memory and reset session state"""
         self.memory.clear_memory()
         self.classification_validator = ClassificationValidator()  # Reset validation history
-        logger.info("Session memory and validation history cleared")
+        
+        # Clear token tracking session
+        token_tracker = get_token_tracker()
+        token_tracker.clear_session()
+        
+        logger.info("Session memory, validation history, and token tracking cleared")
     
     def get_session_stats(self) -> Dict[str, Any]:
         """Get current session statistics"""
@@ -255,6 +291,8 @@ class CentralOrchestrator:
             2. db_query - Database operations (show, find, insert, select, update, delete, list, display, retrieve data, etc.)
             3. email - Email operations (send, compose, cc, bcc, notify, @ symbols, email addresses, etc.)  
             4. meeting - Meeting/scheduling (schedule, book, appointment, meet, demo, call, dates, times, etc.)
+            5. summary - Data summarization and analysis (summarize, analyze, explain, insights, overview, breakdown, interpret, describe data)
+            6. visualization - Data visualization (visualize, chart, graph, plot, show chart, create graph, bar chart, line chart, pie chart, etc.)
             
             IMPORTANT: For multi-step queries, focus on the PRIMARY action (usually the first verb).
             
@@ -265,19 +303,25 @@ class CentralOrchestrator:
             "schedule meeting with user 2" → meeting
             "show all customers" → db_query
             "find customers in Mumbai" → db_query
+            "summarize customer data" → summary
+            "analyze sales trends" → summary
+            "create a chart of sales data" → visualization
+            "visualize customer trends" → visualization
             "show all campaigns and email results to team@company.com" → campaign (PRIMARY action is "show campaigns")
             "get customer data and send to manager@company.com" → db_query (PRIMARY action is "get data")
+            "show top customers and summarize" → db_query (PRIMARY action is "show customers")
+            "show customers and create chart" → db_query (PRIMARY action is "show customers")
             
             Focus on the FIRST/PRIMARY action in compound queries.
             
-            Respond with ONLY one word: campaign, db_query, email, or meeting
+            Respond with ONLY one word: campaign, db_query, email, meeting, summary, or visualization
             """)
             
             messages = classify_prompt.format_messages(query=state["query"], scores=scores_text)
             response = self.llm.invoke(messages)
             agent_type = response.content.strip().lower()
             
-            valid_agents = ["campaign", "db_query", "email", "meeting"]
+            valid_agents = ["campaign", "db_query", "email", "meeting", "summary", "visualization"]
             if agent_type in valid_agents:
                 state["agent_type"] = agent_type
                 state["status"] = "classified"
@@ -312,9 +356,36 @@ class CentralOrchestrator:
             r'(email|send).*and.*(schedule|meet)',  # "email X and schedule Y"
             r'(show|get).*then.*(email|send|schedule)',  # "show X then send Y"
             r'\bthen\s+(email|send|schedule|book)',  # "do X then Y"
+            r'(show|get|find).*and.*(summarize|analyze|explain)',  # "show X and summarize"
+            r'\band\s+(summarize|analyze|summary)',  # "get data and summarize"
+            r'(show|get).*then.*(summarize|analyze)',  # "show X then summarize"
+            r'(show|get|find).*and.*(visualize|chart|plot|graph)',  # "show X and visualize"
+            r'\band\s+(visualize|chart|plot|graph)',  # "get data and visualize"
+            r'(show|get).*then.*(visualize|chart|plot)',  # "show X then visualize"
+            r'(summarize|analyze).*and.*(visualize|chart|plot)',  # "summarize and visualize"
+            r'(visualize|chart|plot).*and.*(summarize|analyze)',  # "visualize and summarize"
         ]
         
         return any(re.search(pattern, query_lower) for pattern in multi_step_patterns)
+    
+    def _is_db_with_summary_query(self, query: str) -> bool:
+        """Detect if query requires both DB query and summarization"""
+        query_lower = query.lower()
+        
+        # Check for DB + Summary/Visualization patterns
+        db_summary_patterns = [
+            r'\b(show|get|find|list).*and.*(summarize|analyze|explain)',
+            r'\b(summarize|analyze|explain).*\b(customers|sales|data|orders|products)',
+            r'\b(what|how).*\b(customers|sales|data|orders|products)',
+            r'\btell\s+me\s+about.*\b(customers|sales|data|orders)',
+            r'\bexplain.*\b(data|results|trends)',
+            r'\b(show|get|find|list).*and.*(visualize|chart|plot|graph)',
+            r'\b(visualize|chart|plot|graph).*\b(customers|sales|data|orders|products)',
+            r'\b(create|make|generate).*\b(chart|graph|visualization).*\b(of|for).*\b(customers|sales|data)',
+            r'\bplot.*\b(customers|sales|data|orders|products)',
+        ]
+        
+        return any(re.search(pattern, query_lower) for pattern in db_summary_patterns)
     
     def _decompose_query(self, query: str) -> List[str]:
         """Decompose multi-step query into individual tasks"""
@@ -325,10 +396,11 @@ class CentralOrchestrator:
             Query: {query}
             
             Rules:
-            1. Each task should be actionable by a single agent type (database, email, meeting, campaign)
+            1. Each task should be actionable by a single agent type (database, email, meeting, campaign, summary, visualization)
             2. Preserve all specific details (emails, dates, conditions, etc.)
             3. Tasks should be in logical execution order
             4. Use {{RESULT_FROM_STEP_N}} placeholder for data from previous steps
+            5. For queries requiring data analysis/summarization/visualization, first get the data, then analyze/visualize
             
             Examples:
             Query: "find top 10 customers in Mumbai and send the list to xyz@gmail.com"
@@ -341,12 +413,42 @@ class CentralOrchestrator:
             TASK_1: get campaign data for Holiday Sale
             TASK_2: schedule meeting with user 5 tomorrow
             
+            Query: "show me top customers and summarize their behavior"
+            Output:
+            TASK_1: show me top customers
+            TASK_2: summarize the customer behavior data from {{RESULT_FROM_STEP_1}}
+            
+            Query: "analyze sales trends for top products"
+            Output:
+            TASK_1: get sales data for top products
+            TASK_2: analyze and summarize the sales trends from {{RESULT_FROM_STEP_1}}
+            
+            Query: "show top customers and create a chart"
+            Output:
+            TASK_1: show top customers
+            TASK_2: create a visualization chart from {{RESULT_FROM_STEP_1}}
+            
+            Query: "get sales data, summarize it and visualize the trends"
+            Output:
+            TASK_1: get sales data
+            TASK_2: summarize the sales data from {{RESULT_FROM_STEP_1}}
+            TASK_3: create a visualization chart from {{RESULT_FROM_STEP_1}}
+            
             Respond with each task on a new line starting with TASK_N:
             """)
             
             messages = decompose_prompt.format_messages(query=query)
             response = self.llm.invoke(messages)
             content = response.content.strip()
+            
+            # Track token usage
+            track_llm_call(
+                input_prompt=messages,
+                output=content,
+                agent_type="orchestrator", 
+                operation="query_decomposition",
+                model_name="llama-3.1-8b-instant"
+            )
             
             # Parse tasks
             tasks = []
@@ -422,15 +524,17 @@ class CentralOrchestrator:
             - db_query: Database operations (show, find, get, list, insert, update, delete)
             - email: Email operations (send, compose, notify, email addresses with @)
             - meeting: Meeting/scheduling (schedule, book, appointment, meet with user)
+            - summary: Data summarization (summarize, analyze, explain, insights, overview)
+            - visualization: Data visualization (visualize, chart, graph, plot, create chart)
             
-            Respond with ONLY one word: campaign, db_query, email, or meeting
+            Respond with ONLY one word: campaign, db_query, email, meeting, summary, or visualization
             """)
             
             messages = classify_prompt.format_messages(task=task)
             response = self.llm.invoke(messages)
             agent_type = response.content.strip().lower()
             
-            if agent_type in ["campaign", "db_query", "email", "meeting"]:
+            if agent_type in ["campaign", "db_query", "email", "meeting", "summary", "visualization"]:
                 return agent_type
             else:
                 return "db_query"  # Default fallback
@@ -746,6 +850,11 @@ class CentralOrchestrator:
         
         print(f"Execution Time: {execution_time:.4f} seconds")
         
+        # Get token usage summary
+        token_tracker = get_token_tracker()
+        token_summary = token_tracker.get_session_summary()
+        print(f"Token Usage: {token_summary['total_tokens']} tokens (${token_summary['total_cost']:.4f})")
+        
         if result.get("classification_confidence"):
             print(f"Classification Confidence: {result['classification_confidence']:.2f}")
         
@@ -782,7 +891,8 @@ class CentralOrchestrator:
                 "completed_steps": result.get("completed_steps", []),
                 "is_multi_step": result.get("is_multi_step", False),
                 "execution_time": execution_time,
-                "classification_confidence": result.get("classification_confidence")
+                "classification_confidence": result.get("classification_confidence"),
+                "token_usage": token_summary
             }
         else:
             print(f"Error: {result['error_message']}")
@@ -792,7 +902,8 @@ class CentralOrchestrator:
                 "status": result["status"],
                 "agent_type": result.get("agent_type", "unknown"),
                 "execution_time": execution_time,
-                "classification_confidence": result.get("classification_confidence")
+                "classification_confidence": result.get("classification_confidence"),
+                "token_usage": token_summary
             }
 
 
@@ -820,6 +931,12 @@ def main():
     print("  - 'Show user performance data'")
     print("  - 'Send email to john@example.com about campaign results'")
     print("  - 'Schedule meeting with user 3 tomorrow'")
+    print("  - 'Show top 5 customers and summarize their behavior'")
+    print("  - 'Analyze sales trends for Mumbai customers'")
+    print("  - 'Get customer data and explain the key insights'")
+    print("  - 'Create a chart of top 10 customers by sales'")
+    print("  - 'Visualize sales trends for the last quarter'")
+    print("  - 'Show customer data, summarize it and create a chart'")
     print("=" * 70)
     
     while True:

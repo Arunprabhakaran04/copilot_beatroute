@@ -4,12 +4,16 @@ import json
 import time
 from datetime import datetime
 from typing import List, Dict, Any
+import pandas as pd
+import time
+import logging
 from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from sql_query_decomposer import SQLQueryDecomposer
 from sql_generator_agent import SQLGeneratorAgent
 from sql_exception_agent import SQLExceptionAgent
 from db_connection import get_database_connection, execute_sql
+from token_tracker import track_llm_call, get_token_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +150,9 @@ class DBQueryAgent(BaseAgent):
                 )
                 
                 if execution_result["success"]:
+                    # Convert query results to pandas DataFrame
+                    query_data_df = self._convert_to_dataframe(execution_result.get("query_results", {}))
+                    
                     db_state["query_type"] = result_state["query_type"]
                     db_state["sql_query"] = execution_result["final_sql"]
                     db_state["status"] = "completed"
@@ -156,6 +163,7 @@ class DBQueryAgent(BaseAgent):
                     db_state["result"]["exception_handling"] = execution_result.get("exception_summary")
                     # Add database execution results
                     db_state["result"]["query_results"] = execution_result.get("query_results", {})
+                    db_state["result"]["query_data"] = query_data_df  # Add DataFrame for summary agent
                     db_state["result"]["formatted_output"] = execution_result.get("formatted_output", "")
                     db_state["result"]["json_results"] = execution_result.get("json_results", "[]")
                     db_state["query_data"] = execution_result.get("query_results", {}).get("data", [])
@@ -359,6 +367,10 @@ class DBQueryAgent(BaseAgent):
             # Get final step results for database data
             final_step_results = executed_steps[-1] if executed_steps else {}
             
+            # Convert final results to DataFrame for summary agent
+            final_query_results = final_step_results.get("query_results", {})
+            query_data_df = self._convert_to_dataframe(final_query_results)
+            
             db_state["query_type"] = "SELECT"  
             db_state["sql_query"] = final_sql
             db_state["status"] = "completed"
@@ -373,15 +385,16 @@ class DBQueryAgent(BaseAgent):
                 "all_sql_queries": all_sql_queries,
                 "original_question": state["query"],
                 "decomposed_questions": steps,
-                "format": "multi_step_cube_js_api",
+                "format": "multi_step_cube_js_api_with_dataframe",
                 # Add final database results
-                "query_results": final_step_results.get("query_results", {}),
+                "query_results": final_query_results,
+                "query_data": query_data_df,  # Add DataFrame for summary agent
                 "formatted_output": final_step_results.get("formatted_output", ""),
                 "json_results": final_step_results.get("json_results", "[]")
             }
             
             # Add final query data for easy access by other agents
-            db_state["query_data"] = final_step_results.get("query_results", {}).get("data", [])
+            db_state["query_data"] = final_query_results.get("data", [])
             
             # Add to conversation history
             summary = f"Multi-step query with {step_count} steps completed. Final SQL: {final_sql}"
@@ -804,3 +817,43 @@ class DBQueryAgent(BaseAgent):
             ] if self.sql_retriever else ["Limited context accuracy"],
             "estimated_accuracy_improvement": "25-35%" if self.sql_retriever else "0%"
         }
+    
+    def _convert_to_dataframe(self, query_results: Dict[str, Any]):
+        """
+        Convert query results to pandas DataFrame for summary agent consumption.
+        
+        Args:
+            query_results: Dictionary containing query results with 'data' key
+            
+        Returns:
+            pandas.DataFrame or None if conversion fails
+        """
+        try:
+            # Import pandas here to avoid global import issues
+            import pandas as pd
+            
+            if not query_results or 'data' not in query_results:
+                logger.warning("No data found in query_results for DataFrame conversion")
+                return pd.DataFrame()  # Return empty DataFrame
+            
+            data = query_results['data']
+            
+            if not data:
+                logger.info("Empty data list, returning empty DataFrame")
+                return pd.DataFrame()
+            
+            if not isinstance(data, list):
+                logger.warning(f"Data is not a list, type: {type(data)}")
+                return pd.DataFrame()
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(data)
+            logger.info(f"Successfully converted {len(df)} rows to DataFrame with columns: {list(df.columns)}")
+            return df
+            
+        except ImportError:
+            logger.error("Pandas not available for DataFrame conversion")
+            return None
+        except Exception as e:
+            logger.error(f"Error converting to DataFrame: {e}")
+            return None
