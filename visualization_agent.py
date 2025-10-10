@@ -1,11 +1,3 @@
-"""
-Visualization Agent
-==================
-
-This agent generates visual representations (charts, graphs, plots) of SQL query results.
-It takes a pandas DataFrame from the DB Agent and creates HTML-based visualizations using Plotly.
-"""
-
 import logging
 import pandas as pd
 import json
@@ -99,7 +91,6 @@ class VisualizationAgent(BaseAgent):
         - Nested result structures
         """
         try:
-            # Import pandas here to avoid global import issues
             import pandas as pd
             
             # Case 1: Direct DataFrame
@@ -308,11 +299,11 @@ class VisualizationAgent(BaseAgent):
             </head>
             <body>
                 <div class="error-container">
-                    <h2>📊 Visualization Generation Failed</h2>
+                    <h2> Visualization Generation Failed</h2>
                     <p><strong>Question:</strong> {question}</p>
                     <p><strong>Error:</strong> {str(e)}</p>
                     <p><strong>Data Points:</strong> {len(df)} rows available</p>
-                    <p>💡 Please try again or check the data format</p>
+                    <p> Please try again or check the data format</p>
                 </div>
             </body>
             </html>
@@ -336,12 +327,10 @@ class VisualizationAgent(BaseAgent):
             question_lower = question.lower()
             num_rows, num_cols = df.shape
             
-            # Detect numeric and categorical columns
             numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
             categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
             datetime_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
             
-            # Analyze question for visualization hints
             chart_keywords = {
                 'bar': ['top', 'bottom', 'compare', 'comparison', 'versus', 'vs', 'ranking', 'rank'],
                 'line': ['trend', 'over time', 'time series', 'growth', 'change', 'progression'],
@@ -353,13 +342,11 @@ class VisualizationAgent(BaseAgent):
             suggested_charts = []
             analysis_points = []
             
-            # Question-based analysis
             for chart_type, keywords in chart_keywords.items():
                 if any(keyword in question_lower for keyword in keywords):
                     suggested_charts.append(chart_type)
                     analysis_points.append(f"Question suggests {chart_type} chart (keywords: {keywords})")
             
-            # Data structure analysis
             if len(datetime_cols) > 0:
                 suggested_charts.append('line')
                 analysis_points.append(f"Time-based data detected: {datetime_cols}")
@@ -381,12 +368,10 @@ class VisualizationAgent(BaseAgent):
                     suggested_charts.append('bar')
                     analysis_points.append(f"Many categories ({unique_categories}) better as bar chart")
             
-            # Top N queries
             if any(word in question_lower for word in ['top', 'bottom', 'highest', 'lowest', 'best', 'worst']):
                 suggested_charts.append('bar')
                 analysis_points.append("Top/bottom ranking query suggests bar chart")
             
-            # Default fallback logic
             if not suggested_charts:
                 if len(numeric_cols) >= 1:
                     suggested_charts.append('bar')
@@ -395,7 +380,6 @@ class VisualizationAgent(BaseAgent):
                     suggested_charts.append('bar')
                     analysis_points.append("Default: Bar chart as general purpose visualization")
             
-            # Select the most appropriate chart
             chart_priority = ['line', 'bar', 'pie', 'scatter', 'histogram']
             final_chart = next((chart for chart in chart_priority if chart in suggested_charts), suggested_charts[0])
             
@@ -513,5 +497,5 @@ class VisualizationAgent(BaseAgent):
                 "token_usage_tracking", "error_handling"
             ],
             "model": self.model_name,
-            "max_data_points": 50000  # Reasonable limit for browser performance
+            "max_data_points": 50000  
         }

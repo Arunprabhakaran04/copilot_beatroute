@@ -47,24 +47,19 @@ class SummaryAgent(BaseAgent):
         try:
             logger.info(f"SummaryAgent processing query: {state['query']}")
             
-            # Extract data from state
             question = state.get('query', '')
             result_data = state.get('result', {})
             
-            # Get DataFrame from various possible sources
             df = self._extract_dataframe_from_result(result_data, question)
             
             if df is None or df.empty:
                 return self._handle_no_data_case(state)
             
-            # Generate summary
             summary_html = self.generate_summary(question, df)
             
-            # Update state with summary results
             state['status'] = 'completed'
             state['success_message'] = 'Summary generated successfully'
             
-            # Store summary in result
             if 'result' not in state:
                 state['result'] = {}
             
@@ -142,9 +137,9 @@ class SummaryAgent(BaseAgent):
         
         no_data_html = """
         <ul>
-        <li>📋 <strong>Query Status:</strong> No data returned</li>
-        <li>🔍 <strong>Reason:</strong> The query executed successfully but returned no results</li>
-        <li>💡 <strong>Suggestion:</strong> Check if the search criteria match existing data</li>
+        <li> <strong>Query Status:</strong> No data returned</li>
+        <li> <strong>Reason:</strong> The query executed successfully but returned no results</li>
+        <li> <strong>Suggestion:</strong> Check if the search criteria match existing data</li>
         </ul>
         """
         
@@ -183,7 +178,6 @@ class SummaryAgent(BaseAgent):
             # Get response language configuration (defaulting to English)
             response_language = self._get_response_language()
             
-            # Create system message
             system_message_content = (
                 f"You are a helpful data assistant. The user asked the question: '{question}'\n\n"
                 f"The following is a pandas DataFrame with the results of the query:\n"
@@ -310,7 +304,7 @@ class SummaryAgent(BaseAgent):
                 'success': False,
                 'error': str(e),
                 'summary': {
-                    'html': f"<ul><li>❌ <strong>Error:</strong> {str(e)}</li></ul>",
+                    'html': f"<ul><li> <strong>Error:</strong> {str(e)}</li></ul>",
                     'type': 'error_summary',
                     'question': question,
                     'row_count': 0,
@@ -340,5 +334,5 @@ class SummaryAgent(BaseAgent):
                 "token_usage_tracking"
             ],
             "model": self.model_name,
-            "max_data_points": 10000  # Reasonable limit for summary generation
+            "max_data_points": 10000  
         }

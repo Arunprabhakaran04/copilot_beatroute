@@ -90,7 +90,6 @@ class TokenTracker:
             stats["cost"] += usage.cost_estimate
             stats["operations"].add(usage.operation)
         
-        # Convert sets to lists for serialization
         for agent_type in agent_stats:
             agent_stats[agent_type]["operations"] = list(agent_stats[agent_type]["operations"])
         
@@ -113,7 +112,6 @@ class TokenTracker:
         self.session_start = datetime.now()
         logger.info("Token tracking session cleared")
 
-# Global token tracker instance
 _token_tracker = None
 
 def get_token_tracker() -> TokenTracker:
@@ -143,7 +141,6 @@ def get_cost(input_prompt: Any, output: str, model_name: str = "gpt-4o") -> Dict
     Returns:
         Dictionary with token counts and cost estimate
     """
-    # Convert input to text for token counting
     if isinstance(input_prompt, list):
         input_text = " ".join([
             msg.get("content", "") if isinstance(msg, dict) 
@@ -152,7 +149,6 @@ def get_cost(input_prompt: Any, output: str, model_name: str = "gpt-4o") -> Dict
     else:
         input_text = str(input_prompt)
     
-    # Estimate token counts
     input_tokens = estimate_token_count(input_text)
     output_tokens = estimate_token_count(output)
     total_tokens = input_tokens + output_tokens

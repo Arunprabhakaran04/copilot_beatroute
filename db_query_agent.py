@@ -236,7 +236,7 @@ class DBQueryAgent(BaseAgent):
                 logger.info(f" EXECUTING MULTI-STEP QUERY - STEP {step_idx}/{step_count}")
                 logger.info(f"Step {step_idx} Question: {step_question}")
                 
-                # NEW: Retrieve SQL examples specific to this step
+                # Retrieve SQL examples specific to this step
                 step_specific_sqls = self._retrieve_step_specific_sqls(step_question)
                 
                 logger.info(f" Retrieved {len(step_specific_sqls)} SQL examples for step {step_idx}")
@@ -308,20 +308,17 @@ class DBQueryAgent(BaseAgent):
             
             final_sql = all_sql_queries[-1]  # Last query is usually the final answer
             
-            # Log comprehensive multi-step completion summary
             logger.info(f" MULTI-STEP QUERY COMPLETED SUCCESSFULLY")
             logger.info(f"Original Question: {state['query']}")
             logger.info(f"Total Steps: {step_count}")
             logger.info(f"="*80)
             
-            # Log all intermediate queries
             logger.info(f" ALL GENERATED SQL QUERIES:")
             for i, (question, sql_query) in enumerate(zip(steps, all_sql_queries), 1):
                 logger.info(f"Step {i} Question: {question}")
                 logger.info(f"Step {i} SQL: {sql_query}")
                 logger.info(f"-" * 60)
             
-            # Log final SQL prominently
             logger.info(f" FINAL SQL QUERY (Step {step_count}):")
             logger.info(f"SQL: {final_sql}")
             logger.info(f"="*80)
@@ -417,7 +414,7 @@ class DBQueryAgent(BaseAgent):
     def _retrieve_step_specific_sqls(self, step_question: str) -> List[str]:
         """Retrieve SQL queries specific to the current step question"""
         try:
-            logger.info(f"🔍 RETRIEVING STEP-SPECIFIC SQL CONTEXT:")
+            logger.info(f" RETRIEVING STEP-SPECIFIC SQL CONTEXT:")
             logger.info(f"Step Question: {step_question}")
             
             if not self.sql_retriever:
@@ -452,7 +449,7 @@ class DBQueryAgent(BaseAgent):
             
             if result_state["status"] == "completed":
                 similar_sqls = result_state["result"].get("similar_sqls", [])
-                logger.info(f"✅ Retrieved {len(similar_sqls)} step-specific SQL examples")
+                logger.info(f"Retrieved {len(similar_sqls)} step-specific SQL examples")
                 return similar_sqls[:10]  # Limit to top 10 for efficiency
             else:
                 logger.warning(f"Step-specific SQL retrieval failed for: {step_question}")
@@ -540,7 +537,7 @@ class DBQueryAgent(BaseAgent):
             Dict with success status, results, and any error information
         """
         try:
-            logger.info(f"🔄 EXECUTING SQL IN CUBE.JS DATABASE:")
+            logger.info(f"EXECUTING SQL IN CUBE.JS DATABASE:")
             logger.info(f"SQL: {sql_query}")
             
             # Execute query using database connection
@@ -594,7 +591,7 @@ class DBQueryAgent(BaseAgent):
         4. Returns the final result or failure after max attempts
         """
         try:
-            logger.info(f"🎯 EXECUTING SQL WITH ERROR HANDLING:")
+            logger.info(f"EXECUTING SQL WITH ERROR HANDLING:")
             logger.info(f"Original Question: {original_question}")
             logger.info(f"SQL to Execute: {sql_query}")
             
@@ -711,12 +708,12 @@ class DBQueryAgent(BaseAgent):
         """Return information about multi-step query capabilities"""
         return {
             "supports_multi_step": True,
-            "max_steps": 5,  # Reasonable limit to prevent infinite loops
+            "max_steps": 5, #max number of nested queries.
             "supported_patterns": [
-                "top_n_then_details",  # "Show trend for top 3 SKUs"
-                "filter_then_analyze",  # "Find degrowth customers, then their purchases"
-                "temporal_comparison",  # "Last month vs this month"
-                "sequential_filtering"  # "Customers who ordered both periods"
+                "top_n_then_details",  
+                "filter_then_analyze", 
+                "temporal_comparison",
+                "sequential_filtering"
             ],
             "decomposer_agent": "SQLQueryDecomposer",
             "generator_agent": "SQLGeneratorAgent",
@@ -732,59 +729,6 @@ class DBQueryAgent(BaseAgent):
                 "automatic_retry": True
             }
         }
-    
-    # def test_multi_step_examples(self) -> List[Dict[str, Any]]:
-    #     """Test the multi-step functionality with example queries"""
-    #     test_queries = [
-    #         "Show me the sales trend of the top 3 SKUs in the last month",
-    #         "Find customers who placed orders both last month and this month",
-    #         "Show me customers who had degrowth in the last 3 months, and their top 3 purchased SKUs",
-    #         "Get the top 5 SKUs by sales this month"  # Should be single-step
-    #     ]
-        
-    #     results = []
-    #     for query in test_queries:
-    #         try:
-    #             test_state = BaseAgentState(
-    #                 query=query,
-    #                 agent_type="db_query",
-    #                 user_id="test_user",
-    #                 status="",
-    #                 error_message="",
-    #                 success_message="",
-    #                 result={},
-    #                 start_time=time.time(),
-    #                 end_time=0.0,
-    #                 execution_time=0.0,
-    #                 classification_confidence=None,
-    #                 redirect_count=0,
-    #                 original_query=query,
-    #                 remaining_tasks=[],
-    #                 completed_steps=[],
-    #                 current_step=0,
-    #                 is_multi_step=False,
-    #                 intermediate_results={}
-    #             )
-                
-    #             result_state = self.process(test_state)
-                
-    #             results.append({
-    #                 "query": query,
-    #                 "is_multi_step": result_state["result"].get("is_multi_step", False),
-    #                 "step_count": result_state["result"].get("step_count", 1),
-    #                 "status": result_state["status"],
-    #                 "final_sql": result_state.get("sql_query", ""),
-    #                 "success": result_state["status"] == "completed"
-    #             })
-                
-    #         except Exception as e:
-    #             results.append({
-    #                 "query": query,
-    #                 "error": str(e),
-    #                 "success": False
-    #             })
-        
-    #     return results
     
     def get_conversation_summary(self) -> Dict[str, Any]:
         """Get a summary of the conversation history"""
@@ -834,7 +778,7 @@ class DBQueryAgent(BaseAgent):
             
             if not query_results or 'data' not in query_results:
                 logger.warning("No data found in query_results for DataFrame conversion")
-                return pd.DataFrame()  # Return empty DataFrame
+                return pd.DataFrame() 
             
             data = query_results['data']
             
@@ -846,7 +790,6 @@ class DBQueryAgent(BaseAgent):
                 logger.warning(f"Data is not a list, type: {type(data)}")
                 return pd.DataFrame()
             
-            # Convert to DataFrame
             df = pd.DataFrame(data)
             logger.info(f"Successfully converted {len(df)} rows to DataFrame with columns: {list(df.columns)}")
             return df

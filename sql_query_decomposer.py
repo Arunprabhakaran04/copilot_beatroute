@@ -80,19 +80,15 @@ class SQLQueryDecomposer(BaseAgent):
             Dict containing analysis results and decomposed questions if needed
         """
         try:
-            # Create the decomposition prompt
             decomposition_prompt = self._create_decomposition_prompt()
             
-            # Add training examples
             message_log = [self._create_system_message(decomposition_prompt)]
             
-            # Add training examples as conversation pairs
             for example in self.decomposition_examples:
                 message_log.append(self._create_user_message(example["original_question"]))
                 response = json.dumps(example["decomposed_questions"])
                 message_log.append(self._create_assistant_message(response))
             
-            # Add single-step examples
             single_step_examples = [
                 {
                     "question": "Show me customer-wise order value for the last 3 months.",
@@ -117,20 +113,16 @@ class SQLQueryDecomposer(BaseAgent):
                 response = json.dumps(example["answer"])
                 message_log.append(self._create_assistant_message(response))
             
-            # Add the actual question
             message_log.append(self._create_user_message(f"User question: '{question}'"))
             
             # Get LLM response
             response = self.llm.invoke(message_log)
             content = response.content.strip()
             
-            # Parse the response
             try:
-                # Try to parse as JSON array
                 if content.startswith('[') and content.endswith(']'):
                     decomposed_questions = json.loads(content)
                 else:
-                    # Try to extract JSON from response
                     json_match = re.search(r'\\[.*\\]', content, re.DOTALL)
                     if json_match:
                         decomposed_questions = json.loads(json_match.group(0))
@@ -138,7 +130,6 @@ class SQLQueryDecomposer(BaseAgent):
                         # Fallback: assume it's a single question
                         decomposed_questions = [question]
                 
-                # Validate the result
                 if not isinstance(decomposed_questions, list):
                     decomposed_questions = [question]
                 
@@ -252,7 +243,6 @@ Examples of correct outputs:
             state["success_message"] = "Query analysis completed successfully"
             state["result"] = analysis_result
             
-            # Add decomposition-specific fields to state
             state["is_multi_step"] = analysis_result["is_multi_step"]
             state["remaining_tasks"] = analysis_result["decomposed_questions"]
             state["current_step"] = 0

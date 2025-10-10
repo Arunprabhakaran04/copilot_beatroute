@@ -81,7 +81,6 @@ class MemoryManager:
     def get_recent(self, n: int = 3) -> List[Dict[str, Any]]:
         """Get recent entries, prioritizing the most recent ones"""
         recent_entries = list(self.history)[-n:]
-        # Sort by timestamp (most recent first) for better context prioritization
         return sorted(recent_entries, key=lambda x: x.get('timestamp', 0), reverse=True)
     
     def clear_memory(self):
@@ -156,7 +155,6 @@ class MemoryManager:
         context_lines = []
         for i, e in enumerate(recent):
             small_result = {k: v for k, v in (e.get("result") or {}).items() if isinstance(v, (str, int, float))}
-            # Add priority indicator for most recent entry
             priority_marker = "[MOST RECENT]" if i == 0 else f"[{len(recent)-i} ago]"
             context_lines.append(f"{priority_marker} User: {e['original']} --> Agent: {e.get('agent_type')} --> Result: {small_result}")
 
@@ -210,7 +208,6 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"LLM enrichment failed: {e}")
 
-        # fallback: return original
         return original_query
 
 
@@ -284,7 +281,6 @@ class EnhancedMemoryManager(MemoryManager):
             logger.warning("Enriched query is empty")
             return False
         
-        # Check for reasonable length expansion
         if len(enriched) > len(original) * 4:  # Allow slightly more expansion
             logger.warning(f"Enriched query too long: {len(enriched)} vs {len(original)}")
             return False
@@ -293,13 +289,11 @@ class EnhancedMemoryManager(MemoryManager):
         original_emails = re.findall(r'\b\w+@[\w.-]+\.\w+\b', original)
         enriched_emails = re.findall(r'\b\w+@[\w.-]+\.\w+\b', enriched)
         
-        # Ensure no original emails are lost
         for email in original_emails:
             if email not in enriched:
                 logger.warning(f"Original email {email} lost in enrichment")
                 return False
         
-        # Check for suspicious pattern mixing (multiple different contexts merged)
         enriched_lower = enriched.lower()
         suspicious_patterns = [
             # Multiple different email subjects mixed together

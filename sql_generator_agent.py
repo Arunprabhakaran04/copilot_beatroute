@@ -83,14 +83,12 @@ class SQLGeneratorAgent(BaseAgent):
             schema_info = self.get_schema_info()
             current_date = datetime.now().strftime('%Y-%m-%d')
             
-            # Process similar SQLs
             sql_examples_text = ""
             if similar_sqls:
                 sql_examples_text = "\n".join([f"Example {i+1}:\n{sql}" for i, sql in enumerate(similar_sqls)])
             else:
                 sql_examples_text = "No SQL examples available."
             
-            # Process previous results if available
             context_from_previous = ""
             if previous_results:
                 context_from_previous = f"""
@@ -202,7 +200,6 @@ class SQLGeneratorAgent(BaseAgent):
             response = self.llm.invoke(message_log)
             content = response.content.strip()
             
-            # Parse JSON response
             try:
                 json_match = re.search(r'\{.*\}', content, re.DOTALL)
                 if json_match:
@@ -275,11 +272,9 @@ class SQLGeneratorAgent(BaseAgent):
         db_state = DBAgentState(**state)
         
         try:
-            # Extract context from state
             similar_sqls = state.get("retrieved_sql_context", [])
             previous_results = state.get("previous_step_results", None)
             
-            # Generate SQL
             result = self.generate_sql(
                 question=state["query"],
                 similar_sqls=similar_sqls,
@@ -293,7 +288,7 @@ class SQLGeneratorAgent(BaseAgent):
                 db_state["success_message"] = "Generated SQL query successfully"
                 db_state["result"] = result
                 
-                logger.info(f"🔧 SQLGeneratorAgent - SQL Generated Successfully:")
+                logger.info(f"SQLGeneratorAgent - SQL Generated Successfully:")
                 logger.info(f"Question: {state['query']}")
                 logger.info(f"Generated SQL: {result['sql']}")
                 logger.info(f"Query Type: {result['query_type']}")

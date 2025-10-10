@@ -201,7 +201,6 @@ class CentralOrchestrator:
     def _thinking_agent(self, state: BaseAgentState) -> BaseAgentState:
         """Central thinking agent that orchestrates multi-step queries"""
         try:
-            # Initialize multi-step fields if this is the first time
             if state.get("current_step", 0) == 0:
                 state["original_query"] = state["query"]
                 state["completed_steps"] = []
@@ -224,10 +223,8 @@ class CentralOrchestrator:
                 state["success_message"] = self._generate_final_message(state)
                 return state
             
-            # Get the next task
             current_task = state["remaining_tasks"].pop(0)
             
-            # Enhance current task with intermediate results if needed
             enhanced_task = self._enhance_task_with_context(current_task, state["intermediate_results"])
             
             # Classify the current task
@@ -461,23 +458,21 @@ class CentralOrchestrator:
             
         except Exception as e:
             logger.error(f"Query decomposition failed: {e}")
-            return [query]  # Fallback to treating as single task
+            return [query]  
     
     def _enhance_task_with_context(self, task: str, intermediate_results: Dict[str, Any]) -> str:
         """Enhance current task with data from previous steps"""
         enhanced_task = task
         
-        # Replace placeholders with actual results
         for step_num, result in intermediate_results.items():
             placeholder = f"{{RESULT_FROM_STEP_{step_num}}}"
             if placeholder in enhanced_task:
-                # Format result for inclusion in task
                 if isinstance(result, dict):
-                    if "sql_query" in result:  # DB query result
+                    if "sql_query" in result: 
                         result_text = f"Database query result: {result.get('explanation', 'Query executed successfully')}"
-                    elif "email_to" in result:  # Email result
+                    elif "email_to" in result:  
                         result_text = f"Email sent to: {result['email_to']}"
-                    elif "user_id" in result:  # Meeting result
+                    elif "user_id" in result: 
                         result_text = f"Meeting scheduled with user {result['user_id']}"
                     else:
                         result_text = str(result)
@@ -492,7 +487,6 @@ class CentralOrchestrator:
         """Classify a single task to determine which agent should handle it"""
         query_lower = task.lower()
         
-        # Pattern-based classification for single tasks
         pattern_scores = self._pattern_classification(query_lower)
         keyword_scores = self._keyword_classification(query_lower)
         
@@ -505,7 +499,7 @@ class CentralOrchestrator:
         max_score = max(combined_scores.values()) if combined_scores else 0
         best_agent = max(combined_scores, key=combined_scores.get) if combined_scores else "db_query"
         
-        if max_score >= 1.5:  # Lower threshold for individual tasks
+        if max_score >= 1.5: 
             return best_agent
         
         # Fallback to LLM classification
@@ -555,14 +549,13 @@ class CentralOrchestrator:
             ("email", [r'^\s*(send|compose|email|mail)\s+', r'^.*email\s+to\s+\w+@'])  # Only if email is the primary action
         ]
         
-        # Find the primary action
         for agent_type, patterns in priority_patterns:
             for pattern in patterns:
                 if re.search(pattern, query):
                     logger.info(f"Multi-step query detected. Primary action: {agent_type}")
                     state["agent_type"] = agent_type
                     state["status"] = "classified"
-                    state["classification_confidence"] = scores.get(agent_type, 1.5)  # Moderate confidence
+                    state["classification_confidence"] = scores.get(agent_type, 1.5) 
                     
                     # Store the full query for potential chaining
                     state["original_multi_step_query"] = state["query"]
@@ -586,7 +579,6 @@ class CentralOrchestrator:
             logger.info(f"Executing step {state['current_step']}: {agent_type} agent")
             agent = self.agents[agent_type]
             
-            # Execute the agent
             if agent_type == "campaign":
                 result_state = self._handle_campaign_routing(state, agent)
             else:
@@ -865,14 +857,12 @@ class CentralOrchestrator:
         if result["status"] == "completed":
             print(f"Success: {result['success_message']}")
             
-            # For multi-step queries, show step details
             if result.get("is_multi_step", False) and result.get("completed_steps"):
                 print("\nStep Details:")
                 for step in result["completed_steps"]:
                     print(f"  Step {step['step']} ({step['agent_type']}): {step['success_message']}")
             
             try:
-                # For memory, use the final agent type or "multi_step" for multi-step queries
                 final_agent_type = "multi_step" if result.get("is_multi_step", False) else result.get("agent_type", "unknown")
                 final_result = {
                     "steps": result.get("completed_steps", []),

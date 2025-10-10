@@ -114,7 +114,7 @@ class SQLExceptionAgent(BaseAgent):
             Dict with analysis results and corrected SQL
         """
         try:
-            logger.info(f"🔧 ANALYZING SQL ERROR:")
+            logger.info(f"ANALYZING SQL ERROR:")
             logger.info(f"Question: {original_question}")
             logger.info(f"Failed SQL: {failed_sql}")
             logger.info(f"Error: {error_message}")
@@ -165,7 +165,6 @@ class SQLExceptionAgent(BaseAgent):
         matched_categories = []
         severity = "low"
         
-        # Check each error pattern
         for error_type, config in self.error_patterns.items():
             for pattern in config["patterns"]:
                 if pattern.lower() in error_lower or pattern.lower() in sql_lower:
@@ -176,7 +175,6 @@ class SQLExceptionAgent(BaseAgent):
                         "confidence": self._calculate_pattern_confidence(pattern, error_message, failed_sql)
                     })
         
-        # Determine severity
         if any("syntax" in cat["category"] for cat in matched_categories):
             severity = "high"
         elif any("schema" in cat["category"] for cat in matched_categories):
@@ -184,7 +182,6 @@ class SQLExceptionAgent(BaseAgent):
         elif any("function" in cat["category"] for cat in matched_categories):
             severity = "medium"
         
-        # Sort by confidence
         matched_categories.sort(key=lambda x: x["confidence"], reverse=True)
         
         primary_category = matched_categories[0]["category"] if matched_categories else "unknown"
@@ -201,10 +198,8 @@ class SQLExceptionAgent(BaseAgent):
         error_matches = error_message.lower().count(pattern.lower())
         sql_matches = failed_sql.lower().count(pattern.lower())
         
-        # Base confidence from exact matches
         base_confidence = min((error_matches + sql_matches) * 0.3, 1.0)
         
-        # Boost for specific patterns
         if pattern in ["syntax error", "column does not exist", "table does not exist"]:
             base_confidence += 0.2
         
@@ -247,7 +242,6 @@ Respond in JSON format:
             response = self.llm.invoke(message_log)
             content = response.content.strip()
             
-            # Parse JSON response
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(0))
@@ -277,7 +271,6 @@ Respond in JSON format:
                 f"Example {i+1}:\n{sql}" for i, sql in enumerate(similar_sqls[:5])
             ])
         
-        # Format previous attempts
         previous_attempts_text = ""
         if previous_attempts:
             previous_attempts_text = "\n".join([
@@ -360,7 +353,6 @@ Respond ONLY in this JSON format:
 If the error cannot be fixed, set success to false and explain why in the explanation field."""
 
         try:
-            # Clear system message to focus on correction task
             system_msg = "You are an expert SQL correction specialist. Your task is to fix the provided SQL query and return a corrected version in JSON format."
             
             message_log = [
@@ -383,9 +375,7 @@ If the error cannot be fixed, set success to false and explain why in the explan
                     parsed_response = json.loads(json_content)
                     logger.debug(f"Parsed JSON response: {parsed_response}")
                     
-                    # Validate the response
                     if "sql" in parsed_response and parsed_response.get("success", False):
-                        # Additional validation of the corrected SQL
                         corrected_sql = parsed_response["sql"]
                         validation_issues = self._validate_corrected_sql(corrected_sql)
                         
@@ -410,7 +400,6 @@ If the error cannot be fixed, set success to false and explain why in the explan
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
         
-        # Fallback response
         logger.warning("Using fallback response for SQL correction")
         return {
             "success": False,
@@ -444,7 +433,6 @@ If the error cannot be fixed, set success to false and explain why in the explan
         
         # Check for MEASURE usage
         if "measure(" in sql_lower:
-            # MEASURE should only be in WITH clauses
             with_clauses = re.findall(r'with\s+\w+\s+as\s*\([^)]*\)', sql_lower, re.DOTALL)
             if not with_clauses:
                 issues.append("MEASURE() used outside WITH clause")
@@ -468,7 +456,6 @@ If the error cannot be fixed, set success to false and explain why in the explan
             logger.info(f" ITERATION {iteration}/{self.max_iterations}")
             logger.info(f"Analyzing error: {current_error[:100]}...")
             
-            # Analyze and fix the current error
             fix_result = self.analyze_and_fix_sql_error(
                 original_question=original_question,
                 failed_sql=current_sql,
@@ -477,7 +464,6 @@ If the error cannot be fixed, set success to false and explain why in the explan
                 previous_attempts=attempts
             )
             
-            # Record this attempt
             attempt_record = {
                 "iteration": iteration,
                 "input_sql": current_sql,
@@ -546,7 +532,6 @@ If the error cannot be fixed, set success to false and explain why in the explan
         db_state = DBAgentState(**state)
         
         try:
-            # Extract error context from state
             original_question = state.get("original_query", state["query"])
             failed_sql = state.get("failed_sql", "")
             error_message = state.get("error_message", "Unknown error")
@@ -589,7 +574,7 @@ If the error cannot be fixed, set success to false and explain why in the explan
         return {
             "max_iterations": self.max_iterations,
             "supported_error_categories": list(self.error_patterns.keys()),
-            "fix_success_rate_estimate": 0.75,  # Estimated success rate
+            "fix_success_rate_estimate": 0.75,  
             "supported_platforms": ["cube.js"],
             "learning_enabled": True,
             "error_pattern_count": len(self.error_patterns)
