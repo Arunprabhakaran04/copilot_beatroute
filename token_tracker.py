@@ -1,11 +1,3 @@
-"""
-Token Usage Tracking Utility
-=============================
-
-This module provides utilities for tracking token usage across all agents in the system.
-It helps monitor LLM costs and provides detailed statistics for each agent call.
-"""
-
 import logging
 import time
 from typing import Dict, List, Any, Optional
