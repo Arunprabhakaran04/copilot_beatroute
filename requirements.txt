@@ -1,9 +1,10 @@
 langgraph
 langchain
-langchain-groq
 langchain-openai
 python-dotenv
 scikit-learn
 psycopg2-binary
 pandas
 plotly
+kaleido
+tabulate

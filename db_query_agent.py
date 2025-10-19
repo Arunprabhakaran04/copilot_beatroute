@@ -30,7 +30,16 @@ class DBQueryAgent(BaseAgent):
         
         self.decomposer = SQLQueryDecomposer(llm)
         self.sql_generator = SQLGeneratorAgent(llm, schema_file_path)
-        self.exception_agent = SQLExceptionAgent(llm, schema_file_path, max_iterations=3)
+        self.exception_agent = SQLExceptionAgent(llm, schema_file_path, max_iterations=5)
+        
+        # Add improved SQL generator
+        try:
+            from improved_sql_generator import ImprovedSQLGenerator
+            self.improved_sql_generator = ImprovedSQLGenerator(llm, schema_file_path)
+            logger.info("  - Improved SQL Generator: ENABLED (for better accuracy)")
+        except ImportError:
+            logger.warning("  - Improved SQL Generator: NOT AVAILABLE (using fallback)")
+            self.improved_sql_generator = None
         
         try:
             from sql_retriever_agent import SQLRetrieverAgent
@@ -77,13 +86,36 @@ class DBQueryAgent(BaseAgent):
         start_time = time.time()
         
         try:
-            logger.info(f"DBQueryAgent processing: {state['query']}")
+            # Use clean logging
+            try:
+                from clean_logging import AgentLogger
+                AgentLogger.query_start("db_query", state['query'])
+            except ImportError:
+                logger.info(f"DB_QUERY | Processing: {state['query']}")
             
-            # Step 1: Analyze query complexity
-            decomposition_result = self._analyze_query_complexity(state)
+            # Step 1: Input validation and sanitization
+            if not state.get('query') or not state['query'].strip():
+                db_state["error_message"] = "Empty or invalid query provided"
+                db_state["status"] = "failed"
+                return db_state
             
-            if not decomposition_result["analysis_successful"]:
-                db_state["error_message"] = decomposition_result.get("error", "Query analysis failed")
+            # Sanitize query
+            sanitized_query = re.sub(r'[^\w\s@.,?!\-:()&]', '', state['query'])
+            if len(sanitized_query) != len(state['query']):
+                logger.warning("Query contained potentially unsafe characters - sanitized")
+                state['query'] = sanitized_query
+            
+            # Step 2: Analyze query complexity with error handling
+            try:
+                decomposition_result = self._analyze_query_complexity(state)
+                
+                if not decomposition_result["analysis_successful"]:
+                    db_state["error_message"] = decomposition_result.get("error", "Query analysis failed")
+                    db_state["status"] = "failed"
+                    return db_state
+            except Exception as e:
+                logger.error(f"Query analysis failed: {e}")
+                db_state["error_message"] = f"Query analysis error: {str(e)}"
                 db_state["status"] = "failed"
                 return db_state
             
@@ -250,7 +282,8 @@ class DBQueryAgent(BaseAgent):
                 step_result = self._execute_single_step(
                     step_question, 
                     step_specific_sqls,  
-                    previous_results
+                    previous_results,
+                    state
                 )
                 
                 if not step_result["success"]:
@@ -346,6 +379,9 @@ class DBQueryAgent(BaseAgent):
             print(f"\n Final SQL Query:")
             print(f"{final_sql}")
             
+            # Get final step results for database data
+            final_step_results = executed_steps[-1] if executed_steps else {}
+            
             # Show final results summary
             if final_step_results.get("query_results"):
                 final_summary = final_step_results["query_results"]["summary"]
@@ -360,9 +396,6 @@ class DBQueryAgent(BaseAgent):
                     print(final_step_results["formatted_output"])
             
             print("="*80)
-            
-            # Get final step results for database data
-            final_step_results = executed_steps[-1] if executed_steps else {}
             
             # Convert final results to DataFrame for summary agent
             final_query_results = final_step_results.get("query_results", {})
@@ -460,7 +493,7 @@ class DBQueryAgent(BaseAgent):
             return []
     
     def _execute_single_step(self, question: str, similar_sqls: List[str], 
-                           previous_results: Dict[str, Any]) -> Dict[str, Any]:
+                           previous_results: Dict[str, Any], state: BaseAgentState = None) -> Dict[str, Any]:
         """Execute a single step in a multi-step query with enhanced context tracking and error handling"""
         try:
             step_start_time = time.time()
@@ -470,12 +503,23 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"Available context examples: {len(similar_sqls)}")
             logger.info(f"Previous results available: {len(previous_results)}")
             
-            # Generate SQL for this step
-            generation_result = self.sql_generator.generate_sql(
-                question=question,
-                similar_sqls=similar_sqls,
-                previous_results=previous_results
-            )
+            # Generate SQL for this step - use improved generator if available
+            if hasattr(self, 'improved_sql_generator') and self.improved_sql_generator:
+                original_query = state.get("original_query", question)
+                generation_result = self.improved_sql_generator.generate_sql(
+                    question=question,
+                    similar_sqls=similar_sqls,
+                    previous_results=previous_results,
+                    original_query=original_query
+                )
+                logger.info(f"Using improved SQL generator (method: {generation_result.get('method', 'unknown')})")
+            else:
+                generation_result = self.sql_generator.generate_sql(
+                    question=question,
+                    similar_sqls=similar_sqls,
+                    previous_results=previous_results
+                )
+                logger.info("Using standard SQL generator")
             
             if not generation_result["success"]:
                 return {

@@ -91,6 +91,8 @@ class SummaryAgent(BaseAgent):
         - Nested result structures
         """
         try:
+            logger.info(f"Extracting DataFrame from result_data. Keys: {list(result_data.keys())}")
+            
             # Case 1: Direct DataFrame
             if 'query_data' in result_data and isinstance(result_data['query_data'], pd.DataFrame):
                 logger.info("Found DataFrame in 'query_data'")
@@ -101,33 +103,64 @@ class SummaryAgent(BaseAgent):
                 logger.info("Found DataFrame in nested 'query_data'")
                 return result_data['query_data']
             
-            # Case 3: List of dictionaries in 'data'
+            # Case 3: List of dictionaries in 'query_data'
+            if 'query_data' in result_data and isinstance(result_data['query_data'], list):
+                logger.info("Converting query_data list to DataFrame")
+                return pd.DataFrame(result_data['query_data'])
+            
+            # Case 4: List of dictionaries in 'data'
             if 'data' in result_data and isinstance(result_data['data'], list):
-                logger.info("Converting list of dicts to DataFrame")
+                logger.info("Converting data list to DataFrame")
                 return pd.DataFrame(result_data['data'])
             
-            # Case 4: Query results structure from DB connection
+            # Case 5: Query results structure from DB connection
             if 'query_results' in result_data:
                 query_results = result_data['query_results']
-                if 'data' in query_results and isinstance(query_results['data'], list):
-                    logger.info("Converting query_results data to DataFrame")
-                    return pd.DataFrame(query_results['data'])
+                if isinstance(query_results, dict):
+                    if 'data' in query_results and isinstance(query_results['data'], list):
+                        logger.info("Converting query_results data to DataFrame")
+                        return pd.DataFrame(query_results['data'])
+                    if 'query_data' in query_results and isinstance(query_results['query_data'], list):
+                        logger.info("Converting query_results query_data to DataFrame")
+                        return pd.DataFrame(query_results['query_data'])
             
-            # Case 5: Direct list of dictionaries
+            # Case 6: Direct list of dictionaries
             if isinstance(result_data, list) and len(result_data) > 0:
                 logger.info("Converting direct list to DataFrame")
                 return pd.DataFrame(result_data)
             
-            # Case 6: Check for any list-like data in nested structures
+            # Case 7: Check for any list-like data in nested structures
             for key, value in result_data.items():
-                if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
-                    logger.info(f"Found data list in key '{key}', converting to DataFrame")
-                    return pd.DataFrame(value)
+                if isinstance(value, list) and len(value) > 0:
+                    # Check if it's a list of dictionaries (tabular data)
+                    if isinstance(value[0], dict):
+                        logger.info(f"Found data list in key '{key}', converting to DataFrame")
+                        return pd.DataFrame(value)
+                    # Check if it's a list of strings that might be formatted data
+                    elif isinstance(value[0], str) and '|' in value[0]:
+                        logger.info(f"Found formatted string data in key '{key}', attempting to parse")
+                        # Try to parse pipe-separated data
+                        lines = [line.strip() for line in value if line.strip() and '|' in line]
+                        if len(lines) > 1:
+                            # First line might be headers
+                            headers = [col.strip() for col in lines[0].split('|')]
+                            data_rows = []
+                            for line in lines[1:]:
+                                if '---' not in line:  # Skip separator lines
+                                    row_data = [col.strip() for col in line.split('|')]
+                                    if len(row_data) == len(headers):
+                                        data_rows.append(dict(zip(headers, row_data)))
+                            if data_rows:
+                                logger.info(f"Parsed {len(data_rows)} rows from formatted string")
+                                return pd.DataFrame(data_rows)
             
             logger.warning(f"Could not extract DataFrame from result_data. Keys: {list(result_data.keys())}")
+            logger.warning(f"Data types: {[(k, type(v)) for k, v in result_data.items()]}")
             return None
             
         except Exception as e:
+            logger.error(f"Error extracting DataFrame: {e}")
+            return None
             logger.error(f"Error extracting DataFrame: {e}")
             return None
     
@@ -174,14 +207,30 @@ class SummaryAgent(BaseAgent):
         try:
             logger.info(f"Generating summary for question: {question}")
             logger.info(f"DataFrame shape: {df.shape}")
+            logger.info(f"DataFrame columns: {list(df.columns)}")
+            logger.info(f"DataFrame head:\n{df.head()}")
             
             # Get response language configuration (defaulting to English)
             response_language = self._get_response_language()
             
+            # Convert DataFrame to markdown safely
+            try:
+                df_markdown = df.to_markdown(index=False)
+                logger.info(f"DataFrame markdown conversion successful, length: {len(df_markdown)}")
+            except Exception as md_error:
+                logger.error(f"Error converting DataFrame to markdown: {md_error}")
+                # Fallback to string representation
+                df_markdown = df.to_string(index=False)
+                logger.info(f"Using string representation instead, length: {len(df_markdown)}")
+            
+            # Escape curly braces to prevent template interpretation issues
+            df_markdown_escaped = df_markdown.replace('{', '{{').replace('}', '}}')
+            question_escaped = question.replace('{', '{{').replace('}', '}}')
+            
             system_message_content = (
-                f"You are a helpful data assistant. The user asked the question: '{question}'\n\n"
+                f"You are a helpful data assistant. The user asked the question: '{question_escaped}'\n\n"
                 f"The following is a pandas DataFrame with the results of the query:\n"
-                f"{df.to_markdown()}\n\n"
+                f"{df_markdown_escaped}\n\n"
             )
             
             # Create user message with detailed instructions
@@ -238,11 +287,12 @@ class SummaryAgent(BaseAgent):
             return summary_html
             
         except Exception as e:
-            logger.error(f"Error generating summary: {e}")
+            logger.error(f"Error generating summary: {str(e)}")
+            logger.error(f"Full exception details:", exc_info=True)
             # Return a basic error summary
             return f"""
             <ul>
-            <li>❌ <strong>Error:</strong> Failed to generate summary</li>
+            <li>❌ <strong>Error:</strong> Failed to generate summary - {str(e)}</li>
             <li>🔍 <strong>Question:</strong> {question}</li>
             <li>📊 <strong>Data Points:</strong> {len(df)} rows available</li>
             <li>💡 <strong>Status:</strong> Please try again or check the data format</li>

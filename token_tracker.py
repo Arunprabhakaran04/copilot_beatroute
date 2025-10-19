@@ -48,9 +48,13 @@ class TokenTracker:
         )
         self.usage_history.append(usage)
         
-        logger.info(f"Token usage recorded - {agent_type}:{operation} - "
-                   f"Input: {input_tokens}, Output: {output_tokens}, "
-                   f"Total: {usage.total_tokens}, Cost: ${cost_estimate:.4f}")
+        # Import here to avoid circular imports
+        try:
+            from clean_logging import TokenLogger
+            TokenLogger.usage(agent_type, operation, usage.total_tokens, cost_estimate)
+        except ImportError:
+            # Fallback to regular logging if clean_logging not available
+            logger.info(f"TOKEN {agent_type}:{operation} - {usage.total_tokens} tokens (${cost_estimate:.4f})")
     
     def get_session_summary(self) -> Dict[str, Any]:
         """Get summary of token usage for current session"""
@@ -142,10 +146,15 @@ def get_cost(input_prompt: Any, output: str, model_name: str = "gpt-4o") -> Dict
         Dictionary with token counts and cost estimate
     """
     if isinstance(input_prompt, list):
-        input_text = " ".join([
-            msg.get("content", "") if isinstance(msg, dict) 
-            else str(msg) for msg in input_prompt
-        ])
+        input_text = ""
+        for msg in input_prompt:
+            if isinstance(msg, dict):
+                input_text += msg.get("content", "") + " "
+            elif hasattr(msg, 'content'):  # LangChain message objects
+                input_text += str(msg.content) + " "
+            else:
+                input_text += str(msg) + " "
+        input_text = input_text.strip()
     else:
         input_text = str(input_prompt)
     
@@ -158,7 +167,6 @@ def get_cost(input_prompt: Any, output: str, model_name: str = "gpt-4o") -> Dict
         "gpt-4o": {"input": 0.0025, "output": 0.010},  # $2.5/$10 per 1M tokens
         "gpt-4": {"input": 0.03, "output": 0.06},
         "gpt-3.5-turbo": {"input": 0.0015, "output": 0.002},
-        "llama-3.1-8b-instant": {"input": 0.0001, "output": 0.0001},  # Groq pricing
     }
     
     model_costs = cost_per_1k_tokens.get(model_name, cost_per_1k_tokens["gpt-4o"])
@@ -189,15 +197,30 @@ def track_llm_call(input_prompt: Any, output: str, agent_type: str = "",
         operation: Specific operation being performed
         model_name: Model used for the call
     """
-    cost_info = get_cost(input_prompt, output, model_name)
-    tracker = get_token_tracker()
-    
-    tracker.add_usage(
-        input_tokens=cost_info["input_tokens"],
-        output_tokens=cost_info["output_tokens"],
-        agent_type=agent_type,
-        operation=operation,
-        cost_estimate=cost_info["total_cost"]
-    )
-    
-    return cost_info
+    try:
+        cost_info = get_cost(input_prompt, output, model_name)
+        tracker = get_token_tracker()
+        
+        tracker.add_usage(
+            input_tokens=cost_info["input_tokens"],
+            output_tokens=cost_info["output_tokens"],
+            agent_type=agent_type,
+            operation=operation,
+            cost_estimate=cost_info["total_cost"]
+        )
+        
+        # Debug logging
+        logger.debug(f"Token tracking recorded: {agent_type}:{operation} - "
+                    f"Input: {cost_info['input_tokens']}, Output: {cost_info['output_tokens']}, "
+                    f"Cost: ${cost_info['total_cost']:.4f}")
+        
+        return cost_info
+    except Exception as e:
+        logger.error(f"Failed to track token usage for {agent_type}:{operation}: {e}")
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0, 
+            "total_tokens": 0,
+            "total_cost": 0.0,
+            "model": model_name
+        }

@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 from base_agent import BaseAgent, BaseAgentState
+from token_tracker import track_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,15 @@ class SQLQueryDecomposer(BaseAgent):
             # Get LLM response
             response = self.llm.invoke(message_log)
             content = response.content.strip()
+            
+            # Track token usage
+            track_llm_call(
+                input_prompt=message_log,
+                output=content,
+                agent_type="sql_decomposer",
+                operation="analyze_query",
+                model_name="gpt-4o"
+            )
             
             try:
                 if content.startswith('[') and content.endswith(']'):

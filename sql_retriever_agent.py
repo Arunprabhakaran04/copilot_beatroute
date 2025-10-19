@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 from openai import OpenAI
 from sklearn.metrics.pairwise import cosine_similarity
 from base_agent import BaseAgent, BaseAgentState
+from token_tracker import track_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -76,14 +77,106 @@ class SQLRetrieverAgent(BaseAgent):
         """Generate embeddings for given texts using OpenAI API"""
         try:
             response = self.openai_client.embeddings.create(model=model, input=texts)
+            
+            # Track token usage for embeddings
+            total_tokens = response.usage.total_tokens if hasattr(response, 'usage') and response.usage else len(' '.join(texts)) // 4
+            track_llm_call(
+                input_prompt=texts,
+                output="",  # Embeddings don't have text output
+                agent_type="sql_retriever",
+                operation="generate_embeddings",
+                model_name=model
+            )
+            
             return np.array([r.embedding for r in response.data])
         except Exception as e:
             logger.error(f"Error generating embeddings: {e}")
             raise
     
-    def retrieve_similar_sql(self, user_query: str, k: int = 20) -> List[str]:
+    def _enhance_similarity_scores(self, user_query: str, similarities: np.ndarray) -> np.ndarray:
         """
-        Retrieve top-k most similar SQL queries for the given user query
+        Enhance similarity scores by boosting relevance for time-based and domain-specific queries
+        
+        Args:
+            user_query (str): The user's query
+            similarities (np.ndarray): Original cosine similarities
+            
+        Returns:
+            np.ndarray: Enhanced similarity scores
+        """
+        enhanced_similarities = similarities.copy()
+        user_query_lower = user_query.lower()
+        
+        # Time-based query keywords that should get priority
+        time_keywords = [
+            'past year', 'last year', 'last 12 months', '12 months',
+            'past 6 months', 'last 6 months', '6 months', 
+            'past 3 months', 'last 3 months', '3 months',
+            'monthly trend', 'monthly sales', 'month wise', 'monthly data',
+            'this month', 'last month', 'this year', 'trend', 'over time',
+            'time series', 'quarterly', 'yearly', 'annual'
+        ]
+        
+        # Sales/revenue keywords
+        sales_keywords = [
+            'sales', 'revenue', 'dispatch', 'invoice', 'value', 'amount',
+            'total sales', 'sales data', 'sales trend', 'revenue trend'
+        ]
+        
+        # Visualization keywords 
+        viz_keywords = [
+            'visualize', 'chart', 'graph', 'plot', 'trend', 'visualization'
+        ]
+        
+        # Check if user query contains time-based terms
+        is_time_query = any(keyword in user_query_lower for keyword in time_keywords)
+        is_sales_query = any(keyword in user_query_lower for keyword in sales_keywords)  
+        is_viz_query = any(keyword in user_query_lower for keyword in viz_keywords)
+        
+        # Boost scores for relevant indexed questions
+        for idx, question_data in enumerate(self.indexed_questions):
+            question = question_data["question"].lower()
+            sql = question_data["sql"].lower()
+            
+            boost_factor = 1.0
+            
+            # Boost time-based queries
+            if is_time_query:
+                if any(keyword in question for keyword in time_keywords):
+                    boost_factor *= 1.3
+                if any(keyword in sql for keyword in ['date_trunc', 'interval', 'month', 'year']):
+                    boost_factor *= 1.2
+            
+            # Boost sales queries
+            if is_sales_query:
+                if any(keyword in question for keyword in sales_keywords):
+                    boost_factor *= 1.2
+                if any(keyword in sql for keyword in ['customerinvoice', 'dispatchedvalue', 'sales']):
+                    boost_factor *= 1.2
+            
+            # Boost visualization-related queries
+            if is_viz_query:
+                if any(keyword in question for keyword in viz_keywords + ['trend', 'analysis']):
+                    boost_factor *= 1.15
+            
+            # Specific boosts for monthly/time series patterns
+            if 'monthly' in user_query_lower and 'monthly' in question:
+                boost_factor *= 1.4
+            
+            if ('past year' in user_query_lower or 'last 12 months' in user_query_lower):
+                if any(term in question for term in ['12 months', 'past year', 'last year', 'annual']):
+                    boost_factor *= 1.5
+                if '12 months' in sql or 'interval' in sql:
+                    boost_factor *= 1.3
+            
+            # Apply the boost
+            enhanced_similarities[idx] = min(similarities[idx] * boost_factor, 1.0)  # Cap at 1.0
+        
+        return enhanced_similarities
+    
+    def retrieve_similar_sql(self, user_query: str, k: int = 6) -> List[str]:
+        """
+        Retrieve top-k most similar SQL queries for the given user query with enhanced relevance scoring
         
         Args:
             user_query (str): The user's natural language query
@@ -102,31 +195,49 @@ class SQLRetrieverAgent(BaseAgent):
             # Compute cosine similarity with all stored embeddings
             similarities = cosine_similarity([current_embedding], self.embeddings)[0]
             
-            # Get top-k indices (sorted by descending similarity)
-            top_indices = np.argsort(similarities)[-k:][::-1]  # Reverse to get descending order
+            # Enhanced relevance scoring for time-based and visualization queries
+            enhanced_similarities = self._enhance_similarity_scores(user_query, similarities)
             
-            # Log retrieval performance details
-            logger.info(f"SQL RETRIEVAL PERFORMANCE LOG")
-            logger.info(f"User Query: '{user_query}'")
-            logger.info(f"Requested top-{k} similar queries")
-            logger.info(f"Max similarity score: {similarities[top_indices[0]]:.4f}")
-            logger.info(f"Min similarity score: {similarities[top_indices[-1]]:.4f}")
-            logger.info(f"Average similarity score: {np.mean(similarities[top_indices]):.4f}")
-            logger.info(f"=" * 80)
+            # Get top-k indices (sorted by descending similarity)
+            top_indices = np.argsort(enhanced_similarities)[-k:][::-1]  # Reverse to get descending order
+            
+            # Clean logging using SQLLogger
+            try:
+                from clean_logging import SQLLogger
+                SQLLogger.retrieval_complete(len(top_indices), enhanced_similarities[top_indices[0]])
+            except ImportError:
+                logger.info(f"Retrieved {len(top_indices)} similar queries (max similarity: {enhanced_similarities[top_indices[0]]:.3f})")
             
             similar_sqls = []
+            similar_queries_detailed = []
+            
             for rank, idx in enumerate(top_indices, 1):
                 sql_query = self.indexed_questions[idx]["sql"]
-                similarity_score = similarities[idx]
+                similarity_score = enhanced_similarities[idx]  # Use enhanced score for logging
+                original_similarity = similarities[idx]  # Keep original for reference
                 question = self.indexed_questions[idx]["question"]
                 
-                similar_sqls.append(sql_query)
-                
-                # Comprehensive logging for each retrieved query
-                logger.info(f"RANK #{rank} (Similarity: {similarity_score:.4f})")
-                logger.info(f"Retrieved Question: {question}")
-                logger.info(f"Question Length: {len(question)} characters")
-                logger.info(f"SQL Length: {len(sql_query)} characters")
+                # Return structured data instead of just SQL strings
+                similar_sqls.append({
+                    'question': question,
+                    'sql': sql_query,
+                    'similarity': similarity_score,
+                    'rank': rank
+                })
+                similar_queries_detailed.append({
+                    'question': question,
+                    'sql': sql_query,
+                    'similarity': similarity_score,
+                    'original_similarity': original_similarity
+                })
+            
+            # Log the retrieved queries using the new method
+            try:
+                SQLLogger.retrieved_queries(similar_queries_detailed, max_display=6)
+            except ImportError:
+                for rank, query_info in enumerate(similar_queries_detailed[:6], 1):
+                    logger.info(f"  {rank}. ({query_info['similarity']:.3f}) {query_info['question'][:80]}...")
+                    logger.info(f"     SQL: {query_info['sql'][:120]}...")
                 
                 # Log SQL type and complexity
                 # sql_lower = sql_query.lower().strip()
@@ -157,8 +268,8 @@ class SQLRetrieverAgent(BaseAgent):
             # Calculate execution time
             execution_time = time.time() - start_time
             
-            similarity_scores = similarities[top_indices]
-            self.log_performance_stats(user_query, similarity_scores.tolist(), execution_time, len(similar_sqls))
+            similarity_scores = enhanced_similarities[top_indices]
+            # self.log_performance_stats(user_query, similarity_scores.tolist(), execution_time, len(similar_sqls))
             
             return similar_sqls
             
@@ -166,7 +277,7 @@ class SQLRetrieverAgent(BaseAgent):
             logger.error(f"Error retrieving similar SQL queries: {e}")
             return []  # Return empty list on error
     
-    def get_top_k_similar_questions(self, current_question: str, k: int = 20) -> List[dict]:
+    def get_top_k_similar_questions(self, current_question: str, k: int = 6) -> List[dict]:
         """
         Get top-k similar questions with their SQL queries and similarity scores
         
@@ -178,16 +289,12 @@ class SQLRetrieverAgent(BaseAgent):
             List[dict]: List of similar question-SQL pairs with similarity scores
         """
         try:
-            # Generate embedding for the current question
             current_embedding = self.get_embeddings([current_question])[0]
             
-            # Compute cosine similarity
             similarities = cosine_similarity([current_embedding], self.embeddings)[0]
             
-            # Get top-k indices (sorted by descending similarity)
             top_indices = np.argsort(similarities)[-k:][::-1]
             
-            # Build result with similarity scores
             results = []
             for idx in top_indices:
                 result = {
@@ -274,42 +381,42 @@ class SQLRetrieverAgent(BaseAgent):
         except Exception as e:
             logger.error(f"Error logging performance stats: {e}")
     
-    def get_performance_summary(self) -> Dict[str, Any]:
-        """Get a summary of recent retrieval performance"""
-        log_file = "sql_retriever_performance.json"
-        if not os.path.exists(log_file):
-            return {"message": "No performance data available"}
+    # def get_performance_summary(self) -> Dict[str, Any]:
+    #     """Get a summary of recent retrieval performance"""
+    #     log_file = "sql_retriever_performance.json"
+    #     if not os.path.exists(log_file):
+    #         return {"message": "No performance data available"}
         
-        try:
-            with open(log_file, 'r') as f:
-                data = json.load(f)
+    #     try:
+    #         with open(log_file, 'r') as f:
+    #             data = json.load(f)
             
-            logs = data.get("performance_logs", [])
-            if not logs:
-                return {"message": "No performance data available"}
+    #         logs = data.get("performance_logs", [])
+    #         if not logs:
+    #             return {"message": "No performance data available"}
             
-            # Calculate summary statistics
-            recent_logs = logs[-50:]  # Last 50 queries
-            avg_times = [log["execution_time_ms"] for log in recent_logs]
-            avg_similarities = [log["avg_similarity"] for log in recent_logs]
+    #         # Calculate summary statistics
+    #         recent_logs = logs[-50:]  # Last 50 queries
+    #         avg_times = [log["execution_time_ms"] for log in recent_logs]
+    #         avg_similarities = [log["avg_similarity"] for log in recent_logs]
             
-            summary = {
-                "total_queries": len(logs),
-                "recent_queries": len(recent_logs),
-                "avg_execution_time_ms": np.mean(avg_times),
-                "avg_similarity_score": np.mean(avg_similarities),
-                "performance_trend": {
-                    "fast_queries": sum(1 for t in avg_times if t < 100),
-                    "medium_queries": sum(1 for t in avg_times if 100 <= t < 500),
-                    "slow_queries": sum(1 for t in avg_times if t >= 500)
-                },
-                "quality_distribution": {
-                    "high_quality": sum(1 for s in avg_similarities if s > 0.7),
-                    "medium_quality": sum(1 for s in avg_similarities if 0.4 <= s <= 0.7),
-                    "low_quality": sum(1 for s in avg_similarities if s < 0.4)
-                }
-            }
+    #         summary = {
+    #             "total_queries": len(logs),
+    #             "recent_queries": len(recent_logs),
+    #             "avg_execution_time_ms": np.mean(avg_times),
+    #             "avg_similarity_score": np.mean(avg_similarities),
+    #             "performance_trend": {
+    #                 "fast_queries": sum(1 for t in avg_times if t < 100),
+    #                 "medium_queries": sum(1 for t in avg_times if 100 <= t < 500),
+    #                 "slow_queries": sum(1 for t in avg_times if t >= 500)
+    #             },
+    #             "quality_distribution": {
+    #                 "high_quality": sum(1 for s in avg_similarities if s > 0.7),
+    #                 "medium_quality": sum(1 for s in avg_similarities if 0.4 <= s <= 0.7),
+    #                 "low_quality": sum(1 for s in avg_similarities if s < 0.4)
+    #             }
+    #         }
             
-            return summary
-        except Exception as e:
-            return {"error": f"Error reading performance data: {e}"}
+    #         return summary
+    #     except Exception as e:
+    #         return {"error": f"Error reading performance data: {e}"}

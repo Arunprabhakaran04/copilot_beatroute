@@ -7,6 +7,7 @@ from email.mime.multipart import MIMEMultipart
 from langchain.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 from base_agent import BaseAgent, BaseAgentState, EmailAgentState
+from token_tracker import track_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,15 @@ class EmailAgent(BaseAgent):
             messages = content_prompt.format_messages(query=state["query"])
             response = self.llm.invoke(messages)
             content = response.content.strip()
+            
+            # Track token usage
+            track_llm_call(
+                input_prompt=messages,
+                output=content,
+                agent_type="email",
+                operation="compose_email",
+                model_name="gpt-4o"
+            )
             
             to_match = re.search(r'TO:\s*(.+)', content)
             cc_match = re.search(r'CC:\s*(.+)', content)

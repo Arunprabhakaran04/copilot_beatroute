@@ -1,0 +1,149 @@
+    def get_sql_prompt_cube(self, initial_prompt: str, question: str, question_sql_list: list, ddl_list: list,
+                            doc_list: list, **kwargs):
+        """
+        Example:
+        ```python
+        vn.get_sql_prompt(
+            question="What are the top 10 customers by sales?",
+            question_sql_list=[{"question": "What are the top 10 customers by sales?", "sql": "SELECT * FROM customers ORDER BY sales DESC LIMIT 10"}],
+            ddl_list=["CREATE TABLE customers (id INT, name TEXT, sales DECIMAL)"],
+            doc_list=["The customers table contains information about customers and their sales."],
+        )
+
+        ```
+
+        This method is used to generate a prompt for the LLM to generate SQL.
+
+        Args:
+            question (str): The question to generate SQL for.
+            question_sql_list (list): A list of questions and their corresponding SQL statements.
+            ddl_list (list): A list of DDL statements.
+            doc_list (list): A list of documentation.
+
+        Returns:
+            any: The prompt for the LLM to generate SQL.
+        """
+        follow_up_history = kwargs["_follow_up_history"]
+        current_date = datetime.now().strftime('%Y-%m-%d')
+
+        if initial_prompt is None:
+            initial_prompt = """You are an AI SQL assistant specialized in Cube.js SQL API. 
+                                Your task is to generate valid SQL queries based on the Cube.js SQL API constraints to answer the question.
+                                Your response should be based on the given context and results of previous chat responses. 
+                                Follow the response guidelines and format instructions.
+                                
+                                STRICTLY follow the rules below and generate SQL in the format:
+                                { "sql": "SQL_QUERY_HERE" }
+                                """
+            initial_prompt += f"""
+                                Failure to follow these rules will result in an invalid response.
+                                
+                                === Additional System Assumptions ===
+                                1. Today's date is {current_date}
+                                2. Assume that the tables provided are **always updated up to and including the current date**.
+                                3. You can safely generate queries for time frames such as **this month**, **this quarter**, **this year**, or **future-looking filters**, assuming the data is available up to the current date.
+                                4. Do NOT ask the user to confirm whether data for a specific timeframe exists (e.g., year 2025); **assume data availability unless explicitly stated otherwise in the question or context**.
+                                """
+
+        initial_prompt = initial_prompt + """
+            ===Response Guidelines 
+            1. If the provided context is sufficient, please generate a valid SQL query without any explanations for the question. Generate the valid SQL STRICTLY in the format {\"sql\" : \"SQL_QUERY_HERE\" }. DON'T generate in any other format like '''sql QUERY''' or as a sql code block.
+            2. If the provided context is insufficient, please explain why it can't be generated.
+            3. If the question seems incomplete refer to the previous follow up questions and user responses and see what the user is trying to ask and answer accordingly. Or you can also urge ask to write the complete question.
+                - Generate the question in STRICTLY in the format {\"follow_up\" : \"FOLLOW_UP_QUESTION_HERE\" }, DON'T generate in any other format like '''json {}''' or as a JSON code block.
+                - STRICTLY DO NOT ASK ABOUT table names.
+            4. Check if the question requires knowledge of previous questions and results provided in the chat history with result dataframes.
+            5. If the question is dependent on the answer of the previous question then use the result data and sql also to generate final sql.
+            6. generate simple queries, refer to chat history for extracting relevant string and keep the query simple.
+            7. Always assume data is up-to-date unless explicitly stated otherwise.
+            8. Please use the most relevant table(s).
+            9. If the question has been asked and answered before, please repeat the answer exactly as it was given before.
+            
+            ===SQL Generation Guidelines
+            - STRICTLY ONLY USE CROSS JOIN for joining two tables 
+            - STRICTLY DO NOT USE ANY JOIN CONDITION EITHER WITH ON CLAUSE OR IN WHERE CLAUSE
+            - ONLY Use **CROSS JOIN** , DO NOT USE INNER JOIN or LEFT JOIN or RIGHT JOIN when joining tables.
+            - DO NOT CREATE TWO TABLES USING WITH CLAUSE AND JOIN THEM. 
+            - IF THERE IS NO DIRECT CROSS JOIN IN THE EXAMPLE BETWEEN TWO TABLES USE UNION ALL INSTEAD WITH PROPER CAST OF TYPE. 
+            - STRICTLY DO NOT USE FUNCTION NOT SUPPORTED IN CUBE JS SQL API
+                - TO_CHAR() IS NOT SUPPORTED
+                - GET_DATE() IS NOT SUPPORTED
+                - EXTRACT() IS NOT SUPPORTED
+                - COALESCE() IS NOT SUPPORTED
+            - Below are a few points to keep in mind when generation a sql query :
+                - DO NOT USE ALIAS IN WHERE CLAUSE
+                - DO NOT USE SELECT *.
+                - Use WITH Clause for sub queries.
+                    - DO NOT USE MEASURE outside WITH CLAUSE Use SUM instead.
+                    - STRICTLY USE MEASURE inside the WITH CLAUSE.
+                    - STRICTLY Always assign alias to select inside the WITH CLAUSE and refer them outside.
+                    - Try to also include GROUP BY CLAUSE inside the WITH CLAUSE
+                    - DO NOT CREATE TWO TABLES USING WITH CLAUSE AND JOIN THEM. 
+                - CROSS JOIN is sufficient there is no need of ON clause.
+                    - WRONG : SELECT ViewCustomer.name AS CustomerName FROM CustomerInvoice JOIN CustomerInvoiceDetail ON CustomerInvoice.id = CustomerInvoiceDetail.invoice_id JOIN Sku ON CustomerInvoiceDetail.sku_id = Sku.id JOIN ViewCustomer ON CustomerInvoice.customer_id = ViewCustomer.id WHERE Sku.name = '365 tire'
+                    - CORRECT : SELECT ViewCustomer.name AS CustomerName FROM CustomerInvoice CROSS JOIN CustomerInvoiceDetail CROSS JOIN ViewCustomer CROSS JOIN Sku WHERE Sku.name = '365 tire'
+                - Refer to the context to see how various tables are joined.
+                - For Sku related information 'Sku' table should be joined with relevant table.
+                - SELECT * should never be used because it does not work. only relevant columns should be selected.
+                - Relationships Between Tables: 
+                    - The **Order** table can be **cross joined** with **ViewCustomer**, **ViewDistributor**, **ViewUser**, and **OrderDetail** table.\n
+                    - The **OrderDetails** table can be **cross joined** with the **Sku** table.\n
+                    - The **Sku** table can be **cross joined** with **Brand** and **Category** tables.\n
+                - For filtering of Sku,Brand,Category CROSS JOIN and Filter by name column is sufficient don't use any other columns for any other table for name. 
+                - STRICTLY There should be no Subquery in a WHERE CLAUSE
+               4. Guidelines for Joins: \n
+                    - Use **CROSS JOIN** ONLY
+                        - DO NOT USE 'ON' CLAUSE 
+                    - DO NOT USE INNER JOIN or LEFT JOIN.\n
+                    - Ensure that joins follow the specified relationships for correct SQL structure.\n
+                    - Do **not** add explicit join conditions when using CROSS JOIN.\n
+               5. Names related queries.\n
+                    - for Customer's name CROSS JOIN 'ViewCustomer' table and get the column ViewCustomer.name.\n
+                    - for User's name CROSS JOIN 'ViewUser' table and get the column ViewUser.name.\n
+                    - for Distributor's name CROSS JOIN 'ViewDistributor' table and get the column ViewDistributor.name.\n
+                    - for SKU's name CROSS JOIN 'Sku' table and get the column Sku.name.\n
+                    - for Category's name CROSS JOIN 'Category' table with 'Sku' table and get the column Category.name.\n
+                    - for Brand's name CROSS JOIN 'Brand' table with 'Sku' table and get the column Brand.name.\n
+               6. Date field related fixes.\n
+                    - for order related question date field is Order.datetime form Order table.\n 
+                    - for sales/revenue/dispatch related question date is CustomerInvoice.dispatchedDate for CustomerInvoice table.\n
+               7. fields not to use and 
+                    - DO NOT USE Order.skuName, CustomerInvoiceDetail.skuName for sku names use Sku.name for Sku table instead with proper CROSS JOIN
+                    - DO NOT use 'id' for count.
+                        - Example:
+                            - DO NOT USE COUNT(DISTINCT ViewCustomer.id)
+                            - INSTEAD USE MEASURE(ViewCustomer.count)
+            """
+
+        initial_prompt = self.add_ddl_to_prompt(
+            initial_prompt, ddl_list, max_tokens=20000
+        )
+
+        if self.static_documentation != "":
+            doc_list.append(self.static_documentation)
+
+        initial_prompt = self.add_documentation_to_prompt(
+            initial_prompt, doc_list, max_tokens=20000
+        )
+
+        if '_chat_history' in kwargs:
+            chat_history = kwargs["_chat_history"]
+            historic_context = self.get_chat_history(chat_history)
+            initial_prompt = initial_prompt + historic_context
+        
+        logger.info("Approx Token count of the schema : " + str(self.str_to_approx_token_count(doc_list))) 
+        logger.info("Approx Token Count Before Training Example:" + str(self.str_to_approx_token_count(initial_prompt)))
+
+        message_log = [self.system_message(initial_prompt)]
+
+        for example in question_sql_list:
+            if example is None:
+                logger.info("Similar Question is None")
+            else:
+                if example is not None and "question" in example and "sql" in example:
+                    message_log.append(self.user_message(example["question"]))
+                    message_log.append(self.assistant_message(json.dumps({"sql": example["sql"]})))
+
+        message_log.append(self.user_message(question))
+
+        return message_log

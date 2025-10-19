@@ -122,7 +122,7 @@ class MemoryManager:
     def enrich_query(self, original_query: str) -> str:
         """Return an enriched query. Try simple heuristics first; if not
         sufficient, build a short context from recent history and ask the LLM
-        (Groq) to rewrite the query filling ambiguous references.
+        (OpenAI) to rewrite the query filling ambiguous references.
         """
         if not self.history:
             return original_query

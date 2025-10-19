@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any
 from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState, MeetingAgentState
+from token_tracker import track_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,15 @@ class MeetingSchedulerAgent(BaseAgent):
             )
             response = self.llm.invoke(messages)
             content = response.content.strip()
+            
+            # Track token usage
+            track_llm_call(
+                input_prompt=messages,
+                output=content,
+                agent_type="meeting",
+                operation="schedule_meeting",
+                model_name="gpt-4o"
+            )
             
             if content.startswith("ERROR:"):
                 return {"success": False, "error": content.replace("ERROR: ", "")}

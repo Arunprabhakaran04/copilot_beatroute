@@ -1,10 +1,17 @@
 import logging
 import pandas as pd
 import json
+import base64
+import os
+from datetime import datetime
 from typing import Dict, Any
 from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState
 from token_tracker import track_llm_call, get_token_tracker
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.io as pio
 
 logger = logging.getLogger(__name__)
 
@@ -12,27 +19,34 @@ class VisualizationAgentState(BaseAgentState):
     """Extended state for Visualization Agent"""
     question: str
     dataframe: pd.DataFrame
-    visualization_html: str
+    image_path: str
+    image_base64: str
     visualization_type: str
     chart_config: Dict[str, Any]
 
 class VisualizationAgent(BaseAgent):
     """
     Visualization Agent that generates interactive charts and plots from query results.
-    Creates HTML-based visualizations using Plotly for web display.
+    Creates static image files stored in the visualizations directory for frontend integration.
     """
     
     def __init__(self, llm, model_name: str = "gpt-4o"):
         super().__init__(llm)
         self.model_name = model_name
+        self.visualizations_dir = os.path.join(os.path.dirname(__file__), "visualizations")
+        
+        # Ensure visualizations directory exists
+        os.makedirs(self.visualizations_dir, exist_ok=True)
+        
         logger.info(f"VisualizationAgent initialized with model: {model_name}")
+        logger.info(f"Visualizations directory: {self.visualizations_dir}")
     
     def get_agent_type(self) -> str:
         return "visualization"
     
     def process(self, state: BaseAgentState) -> BaseAgentState:
         """
-        Process the state and generate a visualization.
+        Process the state and generate a visualization image.
         
         Expected state to contain:
         - query: The original question asked
@@ -51,19 +65,20 @@ class VisualizationAgent(BaseAgent):
             if df is None or df.empty:
                 return self._handle_no_data_case(state)
             
-            # Generate visualization
-            visualization_result = self.generate_visualization(question, df)
+            # Generate visualization image
+            visualization_result = self.generate_visualization_image(question, df)
             
             # Update state with visualization results
             state['status'] = 'completed'
-            state['success_message'] = 'Visualization generated successfully'
+            state['success_message'] = 'Visualization image generated successfully'
             
             # Store visualization in result
             if 'result' not in state:
                 state['result'] = {}
             
             state['result']['visualization'] = {
-                'html': visualization_result['html'],
+                'image_path': visualization_result['image_path'],
+                'image_base64': visualization_result['image_base64'],
                 'type': visualization_result['chart_type'],
                 'config': visualization_result.get('config', {}),
                 'question': question,
@@ -72,7 +87,8 @@ class VisualizationAgent(BaseAgent):
                 'agent_type': 'visualization'
             }
             
-            logger.info(f"Visualization generated successfully for {len(df)} rows - Chart type: {visualization_result['chart_type']}")
+            logger.info(f"Visualization image generated successfully for {len(df)} rows - Chart type: {visualization_result['chart_type']}")
+            logger.info(f"Image saved at: {visualization_result['image_path']}")
             return state
             
         except Exception as e:
@@ -137,13 +153,8 @@ class VisualizationAgent(BaseAgent):
         """Handle case when no data is available for visualization"""
         logger.warning("No data available for visualization")
         
-        no_data_html = """
-        <div style="text-align: center; padding: 20px; border: 2px dashed #ccc; margin: 10px;">
-            <h3>📊 No Data Available for Visualization</h3>
-            <p>The query executed successfully but returned no results to visualize.</p>
-            <p>💡 <strong>Suggestion:</strong> Check if the search criteria match existing data.</p>
-        </div>
-        """
+        # Create a simple "no data" image
+        no_data_image_path, no_data_base64 = self._create_no_data_image()
         
         state['status'] = 'completed'
         state['success_message'] = 'Visualization handled for empty result set'
@@ -152,7 +163,8 @@ class VisualizationAgent(BaseAgent):
             state['result'] = {}
         
         state['result']['visualization'] = {
-            'html': no_data_html.strip(),
+            'image_path': no_data_image_path,
+            'image_base64': no_data_base64,
             'type': 'no_data_chart',
             'config': {},
             'question': state.get('query', ''),
@@ -163,9 +175,72 @@ class VisualizationAgent(BaseAgent):
         
         return state
     
-    def generate_visualization(self, question: str, df: pd.DataFrame, **kwargs) -> Dict[str, Any]:
+    def _create_no_data_image(self) -> tuple[str, str]:
+        """Create a simple 'no data' visualization image"""
+        try:
+            # Create a simple figure with text
+            fig = go.Figure()
+            
+            fig.add_annotation(
+                text="📊 No Data Available<br>for Visualization",
+                x=0.5, y=0.7,
+                xref="paper", yref="paper",
+                font=dict(size=24, color="#666666"),
+                showarrow=False,
+                align="center"
+            )
+            
+            fig.add_annotation(
+                text="The query executed successfully but<br>returned no results to visualize.",
+                x=0.5, y=0.5,
+                xref="paper", yref="paper",
+                font=dict(size=14, color="#888888"),
+                showarrow=False,
+                align="center"
+            )
+            
+            fig.add_annotation(
+                text="💡 Suggestion: Check if the search criteria match existing data.",
+                x=0.5, y=0.3,
+                xref="paper", yref="paper",
+                font=dict(size=12, color="#aaaaaa"),
+                showarrow=False,
+                align="center"
+            )
+            
+            fig.update_layout(
+                width=800,
+                height=600,
+                plot_bgcolor='white',
+                paper_bgcolor='white',
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+                margin=dict(l=50, r=50, t=50, b=50)
+            )
+            
+            # Generate timestamp for unique filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"no_data_{timestamp}.png"
+            image_path = os.path.join(self.visualizations_dir, filename)
+            
+            # Save image
+            fig.write_image(image_path, format="png")
+            
+            # Convert to base64
+            with open(image_path, "rb") as img_file:
+                image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+            
+            logger.info(f"No data image created: {image_path}")
+            return image_path, image_base64
+            
+        except Exception as e:
+            logger.error(f"Error creating no data image: {e}")
+            # Return empty values if image creation fails
+            return "", ""
+    
+    def generate_visualization_image(self, question: str, df: pd.DataFrame, **kwargs) -> Dict[str, Any]:
         """
-        Generate a visualization of the results of a SQL query.
+        Generate a visualization image from the results of a SQL query.
         
         Args:
             question (str): The question that was asked.
@@ -173,148 +248,445 @@ class VisualizationAgent(BaseAgent):
             **kwargs: Additional parameters including _cost for token tracking.
             
         Returns:
-            Dict: Contains HTML visualization, chart type, and configuration.
+            Dict: Contains image path, base64 data, chart type, and configuration.
         """
         try:
-            logger.info(f"Generating visualization for question: {question}")
+            logger.info(f"Generating visualization image for question: {question}")
             logger.info(f"DataFrame shape: {df.shape}")
             logger.info(f"DataFrame columns: {list(df.columns)}")
             
+            # Preprocess data for better visualization
+            processed_df = self._preprocess_data_for_visualization(df, question)
+            logger.info(f"Processed DataFrame shape: {processed_df.shape}")
+            
             # Analyze data to determine best chart type
-            chart_analysis = self._analyze_data_for_chart_type(df, question)
-            
-            # Create visualization prompt
-            visualization_prompt = ChatPromptTemplate.from_template("""
-            You are an expert data visualization assistant. Create an interactive HTML visualization using Plotly.js for the given data and question.
-            
-            Question: {question}
-            Data Analysis: {analysis}
-            DataFrame Info:
-            - Shape: {shape}
-            - Columns: {columns}
-            - Data Types: {dtypes}
-            - Sample Data: {sample}
-            
-            Requirements:
-            1. Generate COMPLETE HTML with embedded Plotly.js CDN
-            2. Choose the most appropriate chart type: {suggested_chart}
-            3. Make it interactive and responsive
-            4. Include proper titles, labels, and formatting
-            5. Use professional color schemes
-            6. Handle data type conversions properly
-            7. Add hover information and tooltips
-            
-            Chart Type Guidelines:
-            - Bar Chart: For categorical comparisons, top N analysis
-            - Line Chart: For time series, trends over time
-            - Pie Chart: For parts of whole (max 10 categories)
-            - Scatter Plot: For correlation analysis
-            - Histogram: For distribution analysis
-            - Box Plot: For statistical summaries
-            
-            Data Processing Notes:
-            - Convert date strings to proper date format if needed
-            - Handle numeric vs categorical data appropriately
-            - Limit pie charts to top 10 categories for readability
-            - Sort data meaningfully (e.g., by value for top N queries)
-            
-            Output a complete HTML page with:
-            - Plotly.js CDN link
-            - Proper div container
-            - Complete JavaScript plot configuration
-            - Responsive design
-            - Professional styling
-            
-            Start with: <!DOCTYPE html>
-            """)
-            
-            # Format data information
-            sample_data = df.head(3).to_dict('records') if len(df) > 0 else []
-            dtypes_info = {col: str(dtype) for col, dtype in df.dtypes.items()}
-            
-            messages = visualization_prompt.format_messages(
-                question=question,
-                analysis=chart_analysis['analysis'],
-                shape=df.shape,
-                columns=list(df.columns),
-                dtypes=dtypes_info,
-                sample=sample_data,
-                suggested_chart=chart_analysis['suggested_chart']
-            )
-            
-            # Generate visualization
-            response = self.llm.invoke(messages)
-            html_content = response.content.strip()
-            
-            # Track token usage
-            track_llm_call(
-                input_prompt=messages,
-                output=html_content,
-                agent_type="visualization",
-                operation="generate_visualization",
-                model_name=self.model_name
-            )
-            
-            # Extract chart type from analysis
+            chart_analysis = self._analyze_data_for_chart_type(processed_df, question)
             chart_type = chart_analysis['suggested_chart']
+            
+            # Generate the plotly figure based on chart type
+            fig = self._create_plotly_figure(processed_df, question, chart_type, chart_analysis)
+            
+            # Generate timestamp for unique filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{chart_type}_{timestamp}.png"
+            image_path = os.path.join(self.visualizations_dir, filename)
+            
+            # Save image with high quality
+            fig.write_image(
+                image_path, 
+                format="png",
+                width=1200,
+                height=800,
+                scale=2  # Higher resolution
+            )
+            
+            # Convert to base64
+            with open(image_path, "rb") as img_file:
+                image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
             
             # Create chart configuration for metadata
             chart_config = {
                 'data_shape': df.shape,
                 'columns': list(df.columns),
                 'chart_type': chart_type,
-                'data_types': dtypes_info,
-                'analysis': chart_analysis['analysis']
+                'data_types': {col: str(dtype) for col, dtype in processed_df.dtypes.items()},
+                'analysis': chart_analysis['analysis'],
+                'image_path': image_path,
+                'timestamp': timestamp
             }
             
-            logger.info("Visualization generated successfully")
+            # Track token usage (for consistency with original implementation)
+            track_llm_call(
+                input_prompt=f"Visualization request: {question}",
+                output=f"Generated {chart_type} chart with {len(processed_df)} data points",
+                agent_type="visualization",
+                operation="generate_visualization_image",
+                model_name=self.model_name
+            )
+            
+            logger.info("Visualization image generated successfully")
             logger.info(f"Chart type: {chart_type}")
-            logger.info(f"HTML length: {len(html_content)} characters")
+            logger.info(f"Image saved at: {image_path}")
             
             return {
-                'html': html_content,
+                'image_path': image_path,
+                'image_base64': image_base64,
                 'chart_type': chart_type,
                 'config': chart_config,
                 'success': True
             }
             
         except Exception as e:
-            logger.error(f"Error generating visualization: {e}")
-            # Return a basic error visualization
-            error_html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Visualization Error</title>
-                <style>
-                    body {{ font-family: Arial, sans-serif; padding: 20px; }}
-                    .error-container {{ 
-                        border: 2px solid #ff6b6b; 
-                        border-radius: 8px; 
-                        padding: 20px; 
-                        background-color: #ffe0e0; 
-                        text-align: center;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="error-container">
-                    <h2> Visualization Generation Failed</h2>
-                    <p><strong>Question:</strong> {question}</p>
-                    <p><strong>Error:</strong> {str(e)}</p>
-                    <p><strong>Data Points:</strong> {len(df)} rows available</p>
-                    <p> Please try again or check the data format</p>
-                </div>
-            </body>
-            </html>
-            """
-            
+            logger.error(f"Error generating visualization image: {e}")
+            # Return error information
             return {
-                'html': error_html,
+                'image_path': '',
+                'image_base64': '',
                 'chart_type': 'error_chart',
                 'config': {'error': str(e)},
                 'success': False
             }
+    
+    def _create_plotly_figure(self, df: pd.DataFrame, question: str, chart_type: str, chart_analysis: Dict[str, Any]) -> go.Figure:
+        """
+        Create a plotly figure based on the chart type and data.
+        
+        Args:
+            df: Preprocessed DataFrame
+            question: Original question
+            chart_type: Determined chart type
+            chart_analysis: Analysis results from _analyze_data_for_chart_type
+            
+        Returns:
+            Plotly Figure object
+        """
+        try:
+            logger.info(f"Creating {chart_type} chart for {len(df)} data points")
+            
+            # Get column information
+            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+            categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+            datetime_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
+            
+            # Create figure based on chart type
+            if chart_type == 'line':
+                fig = self._create_line_chart(df, question, numeric_cols, categorical_cols, datetime_cols)
+            elif chart_type == 'bar':
+                fig = self._create_bar_chart(df, question, numeric_cols, categorical_cols)
+            elif chart_type == 'pie':
+                fig = self._create_pie_chart(df, question, numeric_cols, categorical_cols)
+            elif chart_type == 'scatter':
+                fig = self._create_scatter_chart(df, question, numeric_cols, categorical_cols)
+            elif chart_type == 'histogram':
+                fig = self._create_histogram_chart(df, question, numeric_cols)
+            else:
+                # Default to bar chart
+                fig = self._create_bar_chart(df, question, numeric_cols, categorical_cols)
+            
+            # Apply common styling
+            fig = self._apply_professional_styling(fig, question)
+            
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Error creating plotly figure: {e}")
+            # Return a simple error chart
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"Error creating visualization:<br>{str(e)}",
+                x=0.5, y=0.5,
+                xref="paper", yref="paper",
+                font=dict(size=16, color="red"),
+                showarrow=False,
+                align="center"
+            )
+            fig.update_layout(
+                title="Visualization Error",
+                width=800,
+                height=600
+            )
+            return fig
+    
+    def _create_line_chart(self, df: pd.DataFrame, question: str, numeric_cols: list, categorical_cols: list, datetime_cols: list) -> go.Figure:
+        """Create a line chart"""
+        fig = go.Figure()
+        
+        # Determine x and y axes
+        if datetime_cols:
+            x_col = datetime_cols[0]
+            y_col = numeric_cols[0] if numeric_cols else categorical_cols[0]
+        elif len(df.columns) >= 2:
+            x_col = df.columns[0]
+            y_col = df.columns[1]
+        else:
+            # Single column - create index-based line chart
+            x_col = 'index'
+            y_col = df.columns[0]
+            df = df.reset_index()
+        
+        # Create line trace
+        fig.add_trace(go.Scatter(
+            x=df[x_col],
+            y=df[y_col],
+            mode='lines+markers',
+            name=y_col,
+            line=dict(shape='spline', width=3, color='#1f77b4'),
+            marker=dict(size=8, color='#1f77b4'),
+            hovertemplate=f'<b>{x_col}</b>: %{{x}}<br><b>{y_col}</b>: %{{y}}<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title=f"Line Chart: {question}",
+            xaxis_title=x_col,
+            yaxis_title=y_col
+        )
+        
+        return fig
+    
+    def _create_bar_chart(self, df: pd.DataFrame, question: str, numeric_cols: list, categorical_cols: list) -> go.Figure:
+        """Create a bar chart"""
+        fig = go.Figure()
+        
+        # Determine x and y axes
+        if categorical_cols and numeric_cols:
+            x_col = categorical_cols[0]
+            y_col = numeric_cols[0]
+        elif len(df.columns) >= 2:
+            x_col = df.columns[0]
+            y_col = df.columns[1]
+        else:
+            # Single column - create value counts
+            x_col = df.columns[0]
+            if df[x_col].dtype in ['object', 'category']:
+                value_counts = df[x_col].value_counts()
+                df = pd.DataFrame({'category': value_counts.index, 'count': value_counts.values})
+                x_col, y_col = 'category', 'count'
+            else:
+                y_col = x_col
+                x_col = 'index'
+                df = df.reset_index()
+        
+        # Create bar trace
+        fig.add_trace(go.Bar(
+            x=df[x_col],
+            y=df[y_col],
+            name=y_col,
+            marker=dict(
+                color=df[y_col] if y_col in df.columns else '#1f77b4',
+                colorscale='viridis',
+                showscale=False
+            ),
+            hovertemplate=f'<b>{x_col}</b>: %{{x}}<br><b>{y_col}</b>: %{{y}}<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title=f"Bar Chart: {question}",
+            xaxis_title=x_col,
+            yaxis_title=y_col
+        )
+        
+        return fig
+    
+    def _create_pie_chart(self, df: pd.DataFrame, question: str, numeric_cols: list, categorical_cols: list) -> go.Figure:
+        """Create a pie chart"""
+        fig = go.Figure()
+        
+        # Determine labels and values
+        if categorical_cols and numeric_cols:
+            labels_col = categorical_cols[0]
+            values_col = numeric_cols[0]
+        elif len(df.columns) >= 2:
+            labels_col = df.columns[0]
+            values_col = df.columns[1]
+        else:
+            # Single column - create value counts
+            col = df.columns[0]
+            value_counts = df[col].value_counts()
+            labels_col, values_col = 'category', 'count'
+            df = pd.DataFrame({'category': value_counts.index, 'count': value_counts.values})
+        
+        # Create pie trace
+        fig.add_trace(go.Pie(
+            labels=df[labels_col],
+            values=df[values_col],
+            hole=0.3,  # Donut chart
+            hovertemplate='<b>%{label}</b><br>Value: %{value}<br>Percentage: %{percent}<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title=f"Pie Chart: {question}"
+        )
+        
+        return fig
+    
+    def _create_scatter_chart(self, df: pd.DataFrame, question: str, numeric_cols: list, categorical_cols: list) -> go.Figure:
+        """Create a scatter plot"""
+        fig = go.Figure()
+        
+        # Need at least 2 numeric columns for scatter
+        if len(numeric_cols) >= 2:
+            x_col = numeric_cols[0]
+            y_col = numeric_cols[1]
+        elif len(df.columns) >= 2:
+            x_col = df.columns[0]
+            y_col = df.columns[1]
+        else:
+            # Fallback to index vs single column
+            x_col = 'index'
+            y_col = df.columns[0]
+            df = df.reset_index()
+        
+        # Create scatter trace
+        fig.add_trace(go.Scatter(
+            x=df[x_col],
+            y=df[y_col],
+            mode='markers',
+            marker=dict(
+                size=10,
+                color=df[y_col] if y_col in numeric_cols else '#1f77b4',
+                colorscale='viridis',
+                showscale=True if y_col in numeric_cols else False
+            ),
+            hovertemplate=f'<b>{x_col}</b>: %{{x}}<br><b>{y_col}</b>: %{{y}}<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title=f"Scatter Plot: {question}",
+            xaxis_title=x_col,
+            yaxis_title=y_col
+        )
+        
+        return fig
+    
+    def _create_histogram_chart(self, df: pd.DataFrame, question: str, numeric_cols: list) -> go.Figure:
+        """Create a histogram"""
+        fig = go.Figure()
+        
+        # Use first numeric column or first column
+        col = numeric_cols[0] if numeric_cols else df.columns[0]
+        
+        fig.add_trace(go.Histogram(
+            x=df[col],
+            nbinsx=20,
+            marker=dict(color='#1f77b4', opacity=0.7),
+            hovertemplate=f'<b>{col}</b>: %{{x}}<br><b>Count</b>: %{{y}}<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title=f"Histogram: {question}",
+            xaxis_title=col,
+            yaxis_title="Frequency"
+        )
+        
+        return fig
+    
+    def _apply_professional_styling(self, fig: go.Figure, question: str) -> go.Figure:
+        """Apply professional styling to the figure"""
+        fig.update_layout(
+            # Size and spacing
+            width=1200,
+            height=800,
+            margin=dict(l=80, r=80, t=100, b=80),
+            
+            # Colors and background
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            
+            # Font styling
+            font=dict(
+                family="Inter, Roboto, Arial, sans-serif",
+                size=12,
+                color="#333333"
+            ),
+            
+            # Title styling
+            title=dict(
+                font=dict(size=18, color="#1a1a1a"),
+                x=0.5,
+                xanchor='center'
+            ),
+            
+            # Grid styling
+            xaxis=dict(
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                showgrid=True,
+                zeroline=False,
+                automargin=True
+            ),
+            yaxis=dict(
+                gridcolor='rgba(200, 200, 200, 0.3)',
+                showgrid=True,
+                zeroline=False,
+                automargin=True
+            ),
+            
+            # Legend styling
+            legend=dict(
+                bgcolor='rgba(255, 255, 255, 0.8)',
+                bordercolor='rgba(0, 0, 0, 0.2)',
+                borderwidth=1
+            ),
+            
+            # Hover styling
+            hoverlabel=dict(
+                bgcolor="white",
+                font_size=12,
+                font_family="Inter, Roboto, Arial, sans-serif"
+            )
+        )
+        
+        return fig
+    
+    def _preprocess_data_for_visualization(self, df: pd.DataFrame, question: str) -> pd.DataFrame:
+        """
+        Preprocess data to optimize for visualization.
+        Handles large datasets, sorting, and data type conversion.
+        """
+        try:
+            processed_df = df.copy()
+            question_lower = question.lower()
+            
+            # Handle large datasets (> 20 rows for categorical data, > 50 for time series)
+            max_rows_categorical = 20
+            max_rows_timeseries = 50
+            
+            is_time_series = any(word in question_lower for word in ['trend', 'time', 'series', 'over'])
+            max_rows = max_rows_timeseries if is_time_series else max_rows_categorical
+            
+            if len(processed_df) > max_rows:
+                logger.info(f"Large dataset detected ({len(processed_df)} rows). Applying smart filtering (max: {max_rows}).")
+                
+                # For sales/numerical data, show top performers
+                numeric_cols = processed_df.select_dtypes(include=['number']).columns.tolist()
+                if numeric_cols:
+                    # Find the most relevant numeric column (usually the largest values)
+                    main_numeric_col = None
+                    for col in numeric_cols:
+                        if any(keyword in col.lower() for keyword in ['sales', 'revenue', 'value', 'amount', 'total', 'quantity']):
+                            main_numeric_col = col
+                            break
+                    
+                    if not main_numeric_col:
+                        main_numeric_col = numeric_cols[0]
+                    
+                    # Sort by the main numeric column and take top N
+                    processed_df = processed_df.sort_values(by=main_numeric_col, ascending=False).head(max_rows)
+                    logger.info(f"Filtered to top {max_rows} by {main_numeric_col}")
+                
+                else:
+                    # If no numeric columns, just take first N rows
+                    processed_df = processed_df.head(max_rows)
+                    logger.info(f"No numeric columns found, taking first {max_rows} rows")
+            
+            # Handle time series data - ensure proper sorting
+            datetime_cols = processed_df.select_dtypes(include=['datetime64']).columns.tolist()
+            if datetime_cols and ('trend' in question_lower or 'time' in question_lower or 'over' in question_lower):
+                sort_col = datetime_cols[0]
+                processed_df = processed_df.sort_values(by=sort_col)
+                logger.info(f"Sorted by datetime column: {sort_col}")
+            
+            # Clean data - remove null/None values where possible
+            numeric_cols = processed_df.select_dtypes(include=['number']).columns.tolist()
+            for col in numeric_cols:
+                # Replace None with 0 for visualization
+                processed_df[col] = processed_df[col].fillna(0)
+            
+            # Convert string numbers to numeric if possible
+            for col in processed_df.columns:
+                if processed_df[col].dtype == 'object':
+                    # Try to convert to numeric
+                    try:
+                        converted = pd.to_numeric(processed_df[col], errors='coerce')
+                        if not converted.isna().all():
+                            processed_df[col] = converted.fillna(0)
+                    except:
+                        pass
+            
+            return processed_df
+            
+        except Exception as e:
+            logger.error(f"Error preprocessing data: {e}")
+            return df
     
     def _analyze_data_for_chart_type(self, df: pd.DataFrame, question: str) -> Dict[str, Any]:
         """
@@ -390,7 +762,8 @@ class VisualizationAgent(BaseAgent):
                 'numeric_columns': numeric_cols,
                 'categorical_columns': categorical_cols,
                 'datetime_columns': datetime_cols,
-                'all_suggestions': suggested_charts
+                'all_suggestions': suggested_charts,
+                'styling_hints': self._get_styling_hints(final_chart, question_lower, num_rows)
             }
             
             logger.info(f"Chart analysis completed: {final_chart} - {analysis['analysis']}")
@@ -405,39 +778,86 @@ class VisualizationAgent(BaseAgent):
                 'numeric_columns': [],
                 'categorical_columns': [],
                 'datetime_columns': [],
-                'all_suggestions': ['bar']
+                'all_suggestions': ['bar'],
+                'styling_hints': 'Use modern styling with clean layout'
             }
+    
+    def _get_styling_hints(self, chart_type: str, question_lower: str, num_rows: int) -> str:
+        """Generate specific styling hints based on chart type and data characteristics"""
+        hints = []
+        
+        if chart_type == 'line':
+            hints.append("Use smooth spline curves for elegant line rendering")
+            hints.append("Add gradient fill under the line for visual appeal")
+            hints.append("Use a modern blue-to-teal gradient color scheme")
+            if 'trend' in question_lower or 'time' in question_lower:
+                hints.append("Add subtle animation for line drawing effect")
+                hints.append("Use proper time axis formatting with readable date labels")
+        
+        elif chart_type == 'bar':
+            hints.append("Use rounded corners on bars for modern appearance") 
+            hints.append("Apply subtle shadow effects for depth")
+            hints.append("Use a professional color gradient from light to dark")
+        
+        elif chart_type == 'pie':
+            hints.append("Use distinct, harmonious colors for pie segments")
+            hints.append("Add subtle 3D effect or shadows")
+            hints.append("Show percentages and values in hover tooltips")
+        
+        # General styling hints
+        if num_rows > 20:
+            hints.append("Consider data aggregation for cleaner visualization")
+        
+        if 'sales' in question_lower or 'revenue' in question_lower:
+            hints.append("Format currency values with appropriate units (K, M)")
+            hints.append("Use business-appropriate color scheme (blues, grays)")
+        
+        hints.append("Ensure mobile responsiveness with flexible layout")
+        hints.append("Add professional hover effects and smooth transitions")
+        
+        return "; ".join(hints)
     
     def generate_visualization_from_db_result(self, question: str, db_result: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Convenience method to generate visualization directly from DB agent result.
+        Convenience method to generate visualization image directly from DB agent result.
         
         Args:
             question: The original question
             db_result: Result dictionary from DB agent
             
         Returns:
-            Dictionary containing visualization and metadata
+            Dictionary containing visualization image and metadata
         """
         try:
             # Extract DataFrame from DB result
             df = self._extract_dataframe_from_result(db_result, question)
             
             if df is None or df.empty:
+                image_path, image_base64 = self._create_no_data_image()
                 return {
                     'success': False,
                     'error': 'No data available for visualization',
-                    'visualization': self._handle_no_data_case({'query': question, 'result': {}})['result']['visualization']
+                    'visualization': {
+                        'image_path': image_path,
+                        'image_base64': image_base64,
+                        'type': 'no_data_chart',
+                        'config': {},
+                        'question': question,
+                        'row_count': 0,
+                        'columns': [],
+                        'agent_type': 'visualization'
+                    }
                 }
             
-            # Generate visualization
-            viz_result = self.generate_visualization(question, df)
+            # Generate visualization image
+            viz_result = self.generate_visualization_image(question, df)
             
             if viz_result['success']:
                 return {
                     'success': True,
                     'visualization': {
-                        'html': viz_result['html'],
+                        'image_path': viz_result['image_path'],
+                        'image_base64': viz_result['image_base64'],
                         'type': viz_result['chart_type'],
                         'config': viz_result['config'],
                         'question': question,
@@ -456,7 +876,16 @@ class VisualizationAgent(BaseAgent):
                 return {
                     'success': False,
                     'error': 'Visualization generation failed',
-                    'visualization': viz_result
+                    'visualization': {
+                        'image_path': '',
+                        'image_base64': '',
+                        'type': 'error_chart',
+                        'config': {'error': 'Generation failed'},
+                        'question': question,
+                        'row_count': len(df),
+                        'columns': list(df.columns),
+                        'agent_type': 'visualization'
+                    }
                 }
             
         except Exception as e:
@@ -465,7 +894,8 @@ class VisualizationAgent(BaseAgent):
                 'success': False,
                 'error': str(e),
                 'visualization': {
-                    'html': f"<div>Error generating visualization: {str(e)}</div>",
+                    'image_path': '',
+                    'image_base64': '',
                     'type': 'error_chart',
                     'config': {'error': str(e)},
                     'question': question,
@@ -478,24 +908,33 @@ class VisualizationAgent(BaseAgent):
     def get_visualization_capabilities(self) -> Dict[str, Any]:
         """Return information about visualization capabilities"""
         return {
-            "supports_html_output": True,
-            "visualization_library": "plotly.js",
+            "supports_image_output": True,
+            "supports_base64_encoding": True,
+            "visualization_library": "plotly",
             "supported_chart_types": [
                 "bar_chart", "line_chart", "pie_chart", "scatter_plot", 
-                "histogram", "box_plot", "area_chart", "bubble_chart"
+                "histogram", "no_data_chart", "error_chart"
             ],
             "supported_data_formats": [
                 "pandas_dataframe", "list_of_dictionaries", 
                 "db_agent_result", "query_results_structure"
             ],
-            "output_format": "interactive_html_with_plotly",
+            "output_format": "static_image_png_with_base64",
+            "image_specifications": {
+                "format": "PNG",
+                "width": 1200,
+                "height": 800,
+                "scale": 2,
+                "dpi": 300
+            },
             "features": [
                 "automatic_chart_type_selection",
-                "responsive_design", "interactive_tooltips",
                 "professional_styling", "data_type_handling",
                 "top_n_analysis", "time_series_support",
-                "token_usage_tracking", "error_handling"
+                "token_usage_tracking", "error_handling",
+                "base64_encoding", "file_storage"
             ],
+            "storage_directory": self.visualizations_dir,
             "model": self.model_name,
             "max_data_points": 50000  
         }

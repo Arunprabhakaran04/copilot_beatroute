@@ -4,6 +4,7 @@ import logging
 from typing import Optional, List, Dict
 from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState
+from token_tracker import track_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,15 @@ Question: {question}
             )
             response = self.llm.invoke(messages)
             content = response.content.strip()
+            
+            # Track token usage
+            track_llm_call(
+                input_prompt=messages,
+                output=content,
+                agent_type="campaign",
+                operation="process_campaign_query",
+                model_name="gpt-4o"
+            )
             
             logger.info(f"Campaign LLM response: {content}")
             

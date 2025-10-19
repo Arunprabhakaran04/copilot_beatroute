@@ -2,3 +2,15 @@ venv/
 .env
 __pycache__/
 user_files/
+temp_files/
+to_be_integerated/
+charts/
+visualizations/
+analyze_unanswered_question
+database_structure.json
+intermediate_query
+schema
+embeddings.pkl
+db_connection.py
+logs/
+execute_table_query.py
