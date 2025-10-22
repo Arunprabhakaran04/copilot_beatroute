@@ -115,15 +115,15 @@ class VisualizationAgent(BaseAgent):
             if 'result' not in state:
                 state['result'] = {}
             
-            state['result']['visualization'] = {
-                'image_path': visualization_result['image_path'],
-                'image_base64': visualization_result['image_base64'],
-                'type': visualization_result['chart_type'],
-                'config': visualization_result.get('config', {}),
+            base64_with_prefix = f"data:image/png;base64,{visualization_result['image_base64']}"
+            
+            state['result']['visualization'] = base64_with_prefix
+            
+            state['result']['visualization_metadata'] = {
+                'chart_type': visualization_result['chart_type'],
                 'question': question,
                 'row_count': len(df),
-                'columns': list(df.columns),
-                'agent_type': 'visualization'
+                'columns': list(df.columns)
             }
             
             logger.info(f"Visualization image generated successfully for {len(df)} rows - Chart type: {visualization_result['chart_type']}")
@@ -279,15 +279,15 @@ class VisualizationAgent(BaseAgent):
         if 'result' not in state:
             state['result'] = {}
         
-        state['result']['visualization'] = {
-            'image_path': no_data_image_path,
-            'image_base64': no_data_base64,
-            'type': 'no_data_chart',
-            'config': {},
+        base64_with_prefix = f"data:image/png;base64,{no_data_base64}"
+        
+        state['result']['visualization'] = base64_with_prefix
+        
+        state['result']['visualization_metadata'] = {
+            'chart_type': 'no_data_chart',
             'question': state.get('query', ''),
             'row_count': 0,
-            'columns': [],
-            'agent_type': 'visualization'
+            'columns': []
         }
         
         return state

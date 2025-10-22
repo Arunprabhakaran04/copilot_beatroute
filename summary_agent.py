@@ -102,13 +102,12 @@ class SummaryAgent(BaseAgent):
             if 'result' not in state:
                 state['result'] = {}
             
-            state['result']['summary'] = {
-                'html': summary_html,
-                'type': 'data_summary',
+            state['result']['summary'] = summary_html
+            
+            state['result']['summary_metadata'] = {
                 'question': question,
                 'row_count': len(df),
-                'columns': list(df.columns),
-                'agent_type': 'summary'
+                'columns': list(df.columns)
             }
             
             logger.info(f"Summary generated successfully for {len(df)} rows")
@@ -291,13 +290,12 @@ class SummaryAgent(BaseAgent):
         if 'result' not in state:
             state['result'] = {}
         
-        state['result']['summary'] = {
-            'html': no_data_html.strip(),
-            'type': 'no_data_summary',
+        state['result']['summary'] = no_data_html.strip()
+        
+        state['result']['summary_metadata'] = {
             'question': state.get('query', ''),
             'row_count': 0,
-            'columns': [],
-            'agent_type': 'summary'
+            'columns': []
         }
         
         return state
