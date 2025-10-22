@@ -19,7 +19,6 @@ class ImprovedSQLGenerator(BaseAgent):
         self.schema_file_path = schema_file_path
         self.schema_content = self._load_schema_file()
         
-        # Core query patterns for simple operations
         self.core_patterns = {
             "monthly_sales": """
             SELECT
@@ -68,22 +67,18 @@ class ImprovedSQLGenerator(BaseAgent):
         current_lower = current_question.lower()
         original_lower = original_query.lower()
         
-        # If current question is generic but original was specific, enhance it
         if ("get" in current_lower or "retrieve" in current_lower) and len(original_lower) > len(current_lower):
             # Extract specific details from original query
             preserved_details = []
             
-            # Extract time periods (months)
             time_matches = re.findall(r'(august|september|october|november|december|january|february|march|april|may|june|july)', original_lower)
             if time_matches:
                 preserved_details.extend([f"month: {month}" for month in set(time_matches)])
             
-            # Extract years
             year_matches = re.findall(r'(202[0-9])', original_lower)
             if year_matches:
                 preserved_details.extend([f"year: {year}" for year in set(year_matches)])
             
-            # Extract time ranges
             if 'last 12 months' in original_lower or '12 months' in original_lower:
                 preserved_details.append("time range: last 12 months")
             elif 'last 6 months' in original_lower or '6 months' in original_lower:
@@ -91,7 +86,6 @@ class ImprovedSQLGenerator(BaseAgent):
             elif 'last 3 months' in original_lower or '3 months' in original_lower:
                 preserved_details.append("time range: last 3 months")
             
-            # Extract SKU references
             if 'sku' in original_lower:
                 if 'top 3 sku' in original_lower or 'top 3 sku' in current_lower:
                     preserved_details.append("requirement: top 3 SKUs")
@@ -100,7 +94,6 @@ class ImprovedSQLGenerator(BaseAgent):
                     if top_n:
                         preserved_details.append(f"requirement: top {top_n.group(1)} SKUs")
             
-            # Extract specific terms like "separately", "monthly", "trend", etc.
             specific_terms = re.findall(r'(separately|monthly|total|average|by month|month wise|trend|sales trend)', original_lower)
             if specific_terms:
                 preserved_details.extend([f"grouping: {term}" for term in set(specific_terms)])
@@ -126,7 +119,7 @@ class ImprovedSQLGenerator(BaseAgent):
             "aggregation": "SUM",
             "grouping": None,
             "time_filter": None,
-            "is_simple": False,  # Changed to False - always use LLM
+            "is_simple": False,  
             "requires_sku_join": False,
             "requires_top_n": False,
             "top_n_value": None
@@ -144,28 +137,22 @@ class ImprovedSQLGenerator(BaseAgent):
                     intent["requires_top_n"] = True
                     intent["top_n_value"] = int(top_n_match.group(1))
         
-        # Detect time periods
         if any(month in question_lower for month in ['august', 'september', 'october']):
             months = []
             if 'august' in question_lower:
-                months.append("'2025-08-01'")
+                months.append("august")
             if 'september' in question_lower:
-                months.append("'2025-09-01'")
+                months.append("september")
             if 'october' in question_lower:
-                months.append("'2025-10-01'")
+                months.append("october")
             
             if len(months) > 1 and ('separately' in question_lower or 'each' in question_lower):
-                # Multiple months separately - group by month
                 intent["pattern"] = "monthly_sales"
                 intent["grouping"] = "month"
-                intent["time_filter"] = f"DATE_TRUNC('month', CustomerInvoice.dispatchedDate) IN ({', '.join(months)})"
+                intent["months_requested"] = months
             else:
-                # Single period or combined
                 intent["pattern"] = "total_sales"
-                if len(months) == 1:
-                    intent["time_filter"] = f"DATE_TRUNC('month', CustomerInvoice.dispatchedDate) = {months[0]}"
-                else:
-                    intent["time_filter"] = f"DATE_TRUNC('month', CustomerInvoice.dispatchedDate) IN ({', '.join(months)})"
+                intent["months_requested"] = months
         
         # Detect time ranges (last N months)
         time_range_match = re.search(r'last\s*(\d+)\s*months?', question_lower)
@@ -187,48 +174,6 @@ class ImprovedSQLGenerator(BaseAgent):
         
         return intent
     
-    def _generate_simple_query(self, question: str, intent: Dict[str, Any]) -> str:
-        """
-        Generate a simple, focused SQL query based on detected intent.
-        """
-        if intent["pattern"] and intent["pattern"] in self.core_patterns:
-            template = self.core_patterns[intent["pattern"]]
-            return template.format(date_filter=intent["time_filter"] or "1=1")
-        
-        # Fallback: construct simple query
-        table = intent["table"]
-        date_col = f"{table}.{intent['date_column']}"
-        value_col = f"{table}.{intent['value_column']}"
-        aggregation = intent["aggregation"]
-        
-        if intent["grouping"] == "month":
-            return f"""
-            SELECT
-                DATE_TRUNC('month', {date_col}) AS MonthYear,
-                {aggregation}({value_col}) AS Total{aggregation}
-            FROM {table}
-            WHERE {intent['time_filter'] or '1=1'}
-            GROUP BY DATE_TRUNC('month', {date_col})
-            ORDER BY MonthYear
-            """.strip()
-        else:
-            return f"""
-            SELECT {aggregation}({value_col}) AS Total{aggregation}
-            FROM {table}
-            WHERE {intent['time_filter'] or '1=1'}
-            """.strip()
-    
-    def _should_use_simple_generation(self, question: str, similar_sqls: List[Dict]) -> bool:
-        """
-        Determine if we should use simple pattern-based generation instead of LLM.
-        DISABLED: Simple generation creates incorrect SQL with WHERE 1=1 fallbacks.
-        Always use LLM generation for accuracy.
-        """
-        # DISABLED: Simple generation produces incorrect SQL for multi-step queries
-        # Always return False to force LLM generation
-        logger.info(f"Simple generation DISABLED - using LLM for all queries")
-        return False
-    
     def generate_sql(self, question: str, similar_sqls: List[str] = None, 
                      previous_results: Dict[str, Any] = None, 
                      original_query: str = None) -> Dict[str, Any]:
@@ -237,15 +182,13 @@ class ImprovedSQLGenerator(BaseAgent):
         Always uses LLM generation for accuracy (simple generation disabled).
         """
         try:
-            # Preserve original context for multi-step queries
             enhanced_question = self._preserve_original_context(
                 question, original_query or question
             )
             
-            # Detect query intent
             intent = self._detect_query_intent(enhanced_question)
             
-            # ALWAYS use LLM generation (simple generation disabled due to accuracy issues)
+            # ALWAYS use LLM generation 
             return self._generate_with_llm(enhanced_question, similar_sqls, previous_results, intent)
             
         except Exception as e:
@@ -261,11 +204,22 @@ class ImprovedSQLGenerator(BaseAgent):
         """
         Generate SQL using LLM with focused prompts and better validation.
         """
-        # Build focused examples based on intent
+        if previous_results:
+            logger.info(f" PREVIOUS_RESULTS received: {list(previous_results.keys())}")
+            for key, val in previous_results.items():
+                if isinstance(val, dict):
+                    logger.info(f"   {key}: keys={list(val.keys())}")
+                    if 'data' in val:
+                        logger.info(f"      data type: {type(val['data'])}, sample: {str(val['data'])[:200]}")
+        else:
+            logger.info(" PREVIOUS_RESULTS: None")
+        
+        cleaned_previous_results = self._clean_previous_results(previous_results)
+        
         relevant_examples = self._filter_relevant_examples(similar_sqls, intent)
         
         # Create focused prompt with previous results context
-        prompt = self._create_focused_prompt(question, relevant_examples, intent, previous_results)
+        prompt = self._create_focused_prompt(question, relevant_examples, intent, cleaned_previous_results)
         
         message_log = [{"role": "system", "content": prompt}]
         message_log.append({"role": "user", "content": f"Generate SQL for: {question}"})
@@ -277,7 +231,6 @@ class ImprovedSQLGenerator(BaseAgent):
         response = adaptive_llm.invoke(message_log)
         content = response.content.strip()
         
-        # Track token usage
         track_llm_call(
             input_prompt=message_log,
             output=content,
@@ -286,7 +239,6 @@ class ImprovedSQLGenerator(BaseAgent):
             model_name="gpt-4o"
         )
         
-        # Parse and validate response
         return self._parse_and_validate_response(content, question, intent)
     
     def _get_adaptive_temperature_llm(self, similar_sqls: List[Dict], relevant_examples: List[Dict]):
@@ -312,21 +264,20 @@ class ImprovedSQLGenerator(BaseAgent):
             if similar_sqls and len(similar_sqls) > 0:
                 best_similarity = similar_sqls[0].get('similarity', 0) if isinstance(similar_sqls[0], dict) else 0
             
-            # Determine temperature based on combined factors
             if best_similarity > 0.85 and relevance_ratio > 0.7:
-                temperature = 0.05  # High similarity + high relevance = low temperature
+                temperature = 0.05  #
                 temp_reason = f"high sim ({best_similarity:.3f}) + high rel ({relevance_ratio:.2f}) - follow patterns"
             elif best_similarity > 0.75 and relevance_ratio > 0.5:
-                temperature = 0.1   # Good similarity + decent relevance = low-medium temperature
+                temperature = 0.1   
                 temp_reason = f"good sim ({best_similarity:.3f}) + decent rel ({relevance_ratio:.2f}) - guided creativity"
             elif best_similarity > 0.65 or relevance_ratio > 0.3:
-                temperature = 0.2   # Medium similarity or some relevance = medium temperature
+                temperature = 0.2  
                 temp_reason = f"medium factors (sim: {best_similarity:.3f}, rel: {relevance_ratio:.2f}) - balanced approach"
             elif best_similarity > 0.5:
-                temperature = 0.3   # Low similarity = high temperature
+                temperature = 0.3  
                 temp_reason = f"low similarity ({best_similarity:.3f}) - increased creativity"
             else:
-                temperature = 0.4   # Very low similarity = maximum creativity
+                temperature = 0.4  
                 temp_reason = f"very low similarity ({best_similarity:.3f}) - maximum creativity"
             
             logger.info(f"IMPROVED ADAPTIVE TEMP: {temperature} ({temp_reason})")
@@ -356,7 +307,6 @@ class ImprovedSQLGenerator(BaseAgent):
         for sql_info in similar_sqls[:5]:  # Only top 5
             sql_lower = sql_info.get('sql', '').lower()
             
-            # Check if example matches intent
             matches_table = intent['table'].lower() in sql_lower
             matches_aggregation = intent['aggregation'].lower() in sql_lower
             
@@ -365,62 +315,240 @@ class ImprovedSQLGenerator(BaseAgent):
         
         return relevant[:3]  # Max 3 relevant examples
     
+    def _clean_previous_results(self, previous_results: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Clean previous_results to remove non-serializable objects like DataFrames.
+        Converts DataFrames to list of dicts for LLM consumption.
+        """
+        if not previous_results:
+            return None
+        
+        import pandas as pd
+        cleaned = {}
+        
+        logger.info(f" Cleaning previous_results: {len(previous_results)} step(s)")
+        
+        for step_key, step_data in previous_results.items():
+            if isinstance(step_data, dict):
+                cleaned_step = {}
+                logger.info(f"   Cleaning {step_key}: {list(step_data.keys())}")
+                for key, value in step_data.items():
+                    # Convert DataFrame to list of dicts
+                    if isinstance(value, pd.DataFrame):
+                        converted = value.to_dict('records')
+                        cleaned_step[key] = converted
+                        logger.info(f"       Converted DataFrame '{key}' to {len(converted)} records")
+                    elif isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                        cleaned_step[key] = value
+                    else:
+                        try:
+                            import json
+                            json.dumps(value)
+                            cleaned_step[key] = value
+                        except (TypeError, ValueError):
+                            # If it fails, convert to string representation
+                            cleaned_step[key] = str(value)[:500]  
+                            logger.info(f"      Converted non-serializable '{key}' to string")
+                
+                cleaned[step_key] = cleaned_step
+            else:
+                # If step_data itself is not a dict, try to keep it if serializable
+                try:
+                    import json
+                    json.dumps(step_data)
+                    cleaned[step_key] = step_data
+                except (TypeError, ValueError):
+                    cleaned[step_key] = str(step_data)[:500]
+        
+        logger.info(f" Cleaning complete: {len(cleaned)} step(s) cleaned")
+        return cleaned
+    
+    def _extract_year_from_examples(self, examples: List[Dict]) -> int:
+        """
+        Extract the data year from example SQL queries.
+        Looks for patterns like '2024-09-01' in WHERE clauses.
+        Falls back to current year - 1 if not found.
+        """
+        from datetime import datetime
+        
+        if not examples:
+            # Default to previous year (data is usually from previous year)
+            return datetime.now().year - 1
+        
+        for ex in examples:
+            sql = ex.get('sql', '')
+            year_matches = re.findall(r"'(202[0-9])-\d{2}-\d{2}'", sql)
+            if year_matches:
+                return int(year_matches[0])
+            
+            timestamp_matches = re.findall(r"TIMESTAMP\s+'(202[0-9])-\d{2}-\d{2}'", sql, re.IGNORECASE)
+            if timestamp_matches:
+                return int(timestamp_matches[0])
+        
+        # Default to previous year if no year found in examples
+        logger.warning("No year found in examples, defaulting to previous year")
+        return datetime.now().year - 1
+    
     def _create_focused_prompt(self, question: str, examples: List[Dict], intent: Dict[str, Any], 
                               previous_results: Dict[str, Any] = None) -> str:
         """
         Create a focused prompt that emphasizes accuracy and proper SQL generation.
         """
+        data_year = self._extract_year_from_examples(examples)
+        
         examples_text = ""
         if examples:
-            examples_text = "RELEVANT EXAMPLES:\n"
+            examples_text = "\n🔍 RELEVANT EXAMPLES (Study these patterns - they show correct table choices and YEAR):\n\n"
             for i, ex in enumerate(examples, 1):
-                examples_text += f"Example {i}: {ex['question']}\nSQL: {ex['sql']}\n\n"
+                examples_text += f"Example {i} (Similarity: {ex.get('similarity', 0):.3f}):\n"
+                examples_text += f"Question: {ex['question']}\n"
+                examples_text += f"SQL: {ex['sql'][:400]}...\n\n"
+            
+            examples_text += f" KEY LEARNING: Examples use year {data_year} - this is the DATA YEAR, use it!\n"
+            examples_text += " KEY LEARNING: Notice which tables these examples use (CustomerInvoice vs DistributorSales)\n"
+            examples_text += f" KEY LEARNING: For dates in {data_year}, use WHERE conditions with '{data_year}-MM-DD' format\n\n"
         
-        # Add previous results context for multi-step queries
+        # Get current date for reference only (NOT for queries)
+        from datetime import datetime
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        current_year = datetime.now().year
+        
+        # Extract actual SKU values from previous results
         previous_context = ""
+        extracted_skus = []
         if previous_results:
-            previous_context = "\nPREVIOUS STEP RESULTS (for reference in multi-step queries):\n"
+            previous_context = "\n PREVIOUS STEP RESULTS (MUST USE THESE IN YOUR QUERY):\n"
             for step_key, step_data in previous_results.items():
                 if isinstance(step_data, dict):
-                    previous_context += f"{step_key}: {step_data.get('question', 'N/A')}\n"
-                    previous_context += f"SQL: {step_data.get('sql', 'N/A')[:200]}...\n"
+                    previous_context += f"\n{step_key.upper()}: {step_data.get('question', 'N/A')}\n"
+                    
+                    if 'sql' in step_data:
+                        prev_sql = step_data['sql'][:300]
+                        previous_context += f"SQL: {prev_sql}...\n"
+                    
+                    # Extract SKU values from data if available
+                    # Handle both 'data' (list) and 'query_data' (DataFrame) formats
+                    data = None
+                    if 'data' in step_data:
+                        data = step_data['data']
+                        logger.info(f"      Found 'data' field with type: {type(data)}")
+                    elif 'query_data' in step_data:
+                        # Convert DataFrame to list of dicts
+                        import pandas as pd
+                        query_data = step_data['query_data']
+                        logger.info(f"      Found 'query_data' field with type: {type(query_data)}")
+                        if isinstance(query_data, pd.DataFrame):
+                            data = query_data.to_dict('records')
+                            logger.info(f"      Converted DataFrame to {len(data)} records")
+                        else:
+                            data = query_data
+                    else:
+                        logger.info(f"      No 'data' or 'query_data' found. Available keys: {list(step_data.keys())}")
+                    
+                    if data and isinstance(data, list) and len(data) > 0:
+                        logger.info(f"      Processing {len(data)} rows for SKU extraction")
+                        # Try to find SKU column (skuName, sku_name, SKU, etc.)
+                        for row in data:
+                            if isinstance(row, dict):
+                                for key, value in row.items():
+                                    if 'sku' in key.lower() and value and str(value) not in extracted_skus:
+                                        extracted_skus.append(str(value))
+                                        logger.info(f"      Extracted SKU: {value} from field '{key}'")
+                            
+                            if extracted_skus:
+                                sku_list = "', '".join(extracted_skus)
+                                previous_context += f" EXTRACTED SKUs: {extracted_skus}\n"
+                                previous_context += f"   YOU MUST FILTER: WHERE skuName IN ('{sku_list}')\n"
+                    
+            if extracted_skus:
+                sku_list = "', '".join(extracted_skus)
+                previous_context += f"\n CRITICAL: Filter by these exact SKUs: {extracted_skus}\n"
+                previous_context += f"   Add to your query: WHERE skuName IN ('{sku_list}')\n"
+            else:
+                previous_context += "\n IMPORTANT: If the current question references 'step 1' or 'identified in step X', you MUST use those results.\n"
+                previous_context += "For example: If step 1 identified SKUs ['SKU-A', 'SKU-B', 'SKU-C'], filter WHERE skuName IN ('SKU-A', 'SKU-B', 'SKU-C')\n"
         
         # Add intent-specific guidance
         intent_guidance = ""
+        
         if intent.get("requires_sku_join"):
-            intent_guidance += "\n- This query requires SKU data: JOIN with Sku table and use Sku.name\n"
+            intent_guidance += "\n- Query requires SKU data from CustomerInvoiceDetail table\n"
+            intent_guidance += "- CustomerInvoiceDetail has: skuName, skuAmount, dispatch_date, base_quantity, sellingQuantity\n"
+        
         if intent.get("requires_top_n"):
-            intent_guidance += f"- This query needs top {intent.get('top_n_value', 'N')} results: Use ORDER BY and LIMIT {intent.get('top_n_value', 'N')}\n"
+            intent_guidance += f"- Return top {intent.get('top_n_value', 'N')} results: Use ORDER BY and LIMIT {intent.get('top_n_value', 'N')}\n"
+        
         if intent.get("time_range_months"):
-            intent_guidance += f"- This query needs data for last {intent.get('time_range_months')} months: Use appropriate date range filter\n"
+            intent_guidance += f"- Data needed for last {intent.get('time_range_months')} months from {data_year}\n"
+            intent_guidance += f"- Calculate range: DATE_TRUNC('month', dispatch_date) >= '{data_year}-01-01'\n"
+        
         if intent.get("grouping") == "month":
-            intent_guidance += "- This query needs monthly breakdown: Use DATE_TRUNC('month', ...) in SELECT and GROUP BY\n"
+            intent_guidance += "- Monthly breakdown needed: Use DATE_TRUNC('month', dispatch_date) in SELECT and GROUP BY\n"
+            intent_guidance += f"- For CustomerInvoiceDetail: GROUP BY DATE_TRUNC('month', dispatch_date), skuName\n"
+        
+        if intent.get("months_requested"):
+            months_str = ', '.join(intent['months_requested'])
+            intent_guidance += f"- Specific months requested: {months_str} in year {data_year}\n"
+        
+        # Specific guidance for multi-step monthly trend queries
+        if extracted_skus and intent.get("grouping") == "month":
+            sku_list = "', '".join(extracted_skus)
+            intent_guidance += f"\n🎯 MULTI-STEP MONTHLY TREND PATTERN:\n"
+            intent_guidance += f"   SELECT\n"
+            intent_guidance += f"     DATE_TRUNC('month', dispatch_date) AS month,\n"
+            intent_guidance += f"     skuName,\n"
+            intent_guidance += f"     MEASURE(SUM(skuAmount)) AS total_sales\n"
+            intent_guidance += f"   FROM CustomerInvoiceDetail\n"
+            intent_guidance += f"   WHERE skuName IN ('{sku_list}')\n"
+            intent_guidance += f"     AND DATE_TRUNC('year', dispatch_date) = DATE_TRUNC('year', TIMESTAMP '{data_year}-01-01')\n"
+            intent_guidance += f"   GROUP BY 1, 2\n"
+            intent_guidance += f"   ORDER BY 1, 2\n"
         
         return f"""You are an expert SQL generator for Cube.js. Generate ACCURATE, COMPLETE queries.
 
-CRITICAL RULES:
-1. NEVER generate SQL with WHERE 1=1 unless it's the complete, correct query
-2. For SKU queries, ALWAYS join with Sku table and use Sku.name
-3. For top N queries, use ORDER BY and LIMIT N
-4. For date filtering, use DATE_TRUNC('month', ...) = 'YYYY-MM-01'
-5. For multi-month ranges, use DATE_TRUNC('month', ...) BETWEEN 'start' AND 'end'
-6. Use CROSS JOIN when necessary to connect tables
-7. Use MEASURE() for aggregations in Cube.js
-8. Return JSON format: {{"sql": "SQL_QUERY_HERE"}}
+📅 DATA YEAR: {data_year} (this is the year in your database, NOT current year {current_year})
+📅 USE {data_year} for ALL date filters, NOT {current_year}!
 
-DETECTED INTENT:
-- Primary table: {intent['table']}
-- Aggregation: {intent['aggregation']}
-- Grouping: {intent.get('grouping', 'none')}
-- Requires SKU join: {intent.get('requires_sku_join', False)}
-- Requires top N: {intent.get('requires_top_n', False)}
+CRITICAL RULES FOR CUBE.JS:
+1. 🔍 Study the EXAMPLES carefully - they show correct table patterns and use year {data_year}
+2. 📅 YEAR RULE: Your data is from {data_year}. Use dates like '{data_year}-09-01', NOT '{current_year}-09-01'
+3. 📊 TABLE RULE for SKU queries:
+   - Customer sales/invoices → CustomerInvoice + CustomerInvoiceDetail
+   - Distributor sales → DistributorSales + DistributorSalesDetail
+   - Monthly trends with SKUs → CustomerInvoiceDetail (has dispatch_date + skuName + skuAmount)
+4. 🔗 JOIN RULE: Use CROSS JOIN only (never INNER/LEFT/RIGHT JOIN with ON)
+5. 📐 AGGREGATION RULE: Use MEASURE(SUM(...)) inside WITH clause or direct SELECT
+6. 📝 GROUP BY RULE: Can be inside or outside WITH clause, both work
+
+QUERY REQUIREMENTS:
+- Aggregation type: {intent.get('aggregation', 'N/A')}
+- Time grouping: {intent.get('grouping', 'none')}
+- Top N required: {intent.get('requires_top_n', False)}
 {intent_guidance}
 
 {examples_text}
 {previous_context}
 
-SCHEMA (use relevant tables and columns):
-{self.schema_content[:2000]}
+SCHEMA (relevant tables):
+CustomerInvoiceDetail:
+  - dispatch_date (timestamp) - USE THIS for date grouping
+  - skuName (text) - USE THIS for SKU filtering
+  - skuAmount (numeric) - USE THIS for sales amount
+  - base_quantity, sellingQuantity (numeric)
+  
+CustomerInvoice:
+  - dispatchedDate (timestamp)
+  - dispatchedvalue (numeric)
+  - year, monthYear, quarter
+
+⚠️ CRITICAL CHECKLIST:
+✓ Using year {data_year} in WHERE clause (NOT {current_year})
+✓ Using correct table (CustomerInvoiceDetail for SKU monthly trends)
+✓ If previous steps found SKUs, filtering WHERE skuName IN (...)
+✓ For monthly grouping: DATE_TRUNC('month', dispatch_date)
+✓ NO INNER/LEFT/RIGHT JOIN syntax (use CROSS JOIN if needed)
+
+RETURN FORMAT: {{"sql": "YOUR_QUERY_HERE"}}
 
 IMPORTANT: Generate a COMPLETE, ACCURATE SQL query. Do NOT use WHERE 1=1 as a placeholder."""
     
@@ -429,10 +557,30 @@ IMPORTANT: Generate a COMPLETE, ACCURATE SQL query. Do NOT use WHERE 1=1 as a pl
         Parse LLM response and validate the generated SQL.
         """
         try:
-            # Extract SQL from JSON response
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            # Extract SQL from JSON response - try multiple approaches
+            # Approach 1: Try to find JSON block with proper escaping
+            json_match = re.search(r'\{[^{}]*"sql"[^{}]*\}', content, re.DOTALL)
             if json_match:
-                parsed = json.loads(json_match.group(0))
+                try:
+                    parsed = json.loads(json_match.group(0))
+                except json.JSONDecodeError as e:
+                    # If JSON parsing fails due to escape sequences, try extracting SQL directly
+                    logger.warning(f"JSON parsing failed: {e}, attempting direct SQL extraction")
+                    sql_match = re.search(r'"sql"\s*:\s*"((?:[^"\\]|\\.)*)"', json_match.group(0), re.DOTALL)
+                    if sql_match:
+                        sql = sql_match.group(1)
+                        # Unescape the SQL string
+                        sql = sql.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+                        parsed = {"sql": sql}
+                    else:
+                        # Try markdown code block extraction as fallback
+                        sql_block_match = re.search(r'```(?:sql)?\s*(.*?)\s*```', content, re.DOTALL | re.IGNORECASE)
+                        if sql_block_match:
+                            sql = sql_block_match.group(1).strip()
+                            parsed = {"sql": sql}
+                        else:
+                            raise
+                
                 if "sql" in parsed:
                     sql = parsed["sql"].strip()
                     
@@ -465,11 +613,40 @@ IMPORTANT: Generate a COMPLETE, ACCURATE SQL query. Do NOT use WHERE 1=1 as a pl
                             "invalid_sql": sql
                         }
             
-            # If parsing fails, return error
-            logger.error("Failed to parse LLM response")
+            # Approach 2: Try to extract SQL from markdown code block
+            sql_block_match = re.search(r'```(?:sql)?\s*(.*?)\s*```', content, re.DOTALL | re.IGNORECASE)
+            if sql_block_match:
+                sql = sql_block_match.group(1).strip()
+                logger.info("Extracted SQL from markdown code block")
+                if self._validate_sql_intent(sql, intent):
+                    return {
+                        "success": True,
+                        "sql": sql,
+                        "query_type": "SELECT",
+                        "explanation": "Generated with LLM (extracted from markdown)",
+                        "method": "llm_markdown_extraction",
+                        "intent": intent
+                    }
+            
+            # Approach 3: Check if content itself is raw SQL
+            if content.upper().strip().startswith(('SELECT', 'WITH')):
+                sql = content.strip()
+                logger.info("Content appears to be raw SQL")
+                if self._validate_sql_intent(sql, intent):
+                    return {
+                        "success": True,
+                        "sql": sql,
+                        "query_type": "SELECT",
+                        "explanation": "Generated with LLM (raw SQL)",
+                        "method": "llm_raw_sql",
+                        "intent": intent
+                    }
+            
+            # If all parsing attempts fail, return error
+            logger.error("Failed to parse LLM response using all methods")
             return {
                 "success": False,
-                "error": "Failed to parse LLM response - no valid JSON found",
+                "error": "Failed to parse LLM response - no valid JSON, markdown, or raw SQL found",
                 "type": "parsing_error",
                 "response": content[:200]
             }
@@ -479,7 +656,8 @@ IMPORTANT: Generate a COMPLETE, ACCURATE SQL query. Do NOT use WHERE 1=1 as a pl
             return {
                 "success": False,
                 "error": f"Failed to parse response: {str(e)}",
-                "type": "parsing_error"
+                "type": "parsing_error",
+                "response": content[:300]
             }
     
     def _is_placeholder_sql(self, sql: str) -> bool:
@@ -498,7 +676,6 @@ IMPORTANT: Generate a COMPLETE, ACCURATE SQL query. Do NOT use WHERE 1=1 as a pl
                 logger.warning("Detected placeholder SQL with WHERE 1=1 only")
                 return True
         
-        # Check for generic SUM with no specifics
         if 'sum(' in sql_lower and 'totalsum' in sql_lower and 'where 1=1' in sql_lower:
             logger.warning("Detected generic SUM query placeholder")
             return True

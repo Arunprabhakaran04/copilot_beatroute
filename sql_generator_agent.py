@@ -2,7 +2,7 @@ import re
 import json
 import logging
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from token_tracker import track_llm_call
 
@@ -10,36 +10,71 @@ logger = logging.getLogger(__name__)
 
 class SQLGeneratorAgent(BaseAgent):
     """
-    Dedicated agent for generating individual SQL queries.
-    This agent focuses on creating single, well-formed SQL queries based on schema and context.
+    Production-ready SQL generator for Cube.js API.
+    Generates reliable, error-free SQL queries with strict validation.
     """
     
     def __init__(self, llm, schema_file_path: str = "schema"):
         super().__init__(llm)
         self.schema_file_path = schema_file_path
         self.schema_content = self._load_schema_file()
-        
-        self.query_templates = {
-            "insert": "INSERT INTO {table} ({columns}) VALUES ({values})",
-            "select": "SELECT {columns} FROM {table} WHERE {condition}",
-            "update": "UPDATE {table} SET {updates} WHERE {condition}",
-            "delete": "DELETE FROM {table} WHERE {condition}"
-        }
+        self.structured_schema = self._load_structured_schema()
+        self.cube_js_rules = self._initialize_cube_js_rules()
     
     def get_agent_type(self) -> str:
         return "sql_generator"
     
-    def _create_system_message(self, content: str) -> dict:
-        """Create a system message for chat completions"""
-        return {"role": "system", "content": content}
+    def _load_structured_schema(self) -> Dict[str, Any]:
+        """Load enhanced schema with FK relationships and Cube.js rules."""
+        try:
+            import json
+            with open('enhanced_schema.json', 'r', encoding='utf-8') as file:
+                data = json.load(file)
+                # Count relationships
+                total_relationships = sum(
+                    len(table_data.get('relationships', {})) 
+                    for table_data in data.get('tables', {}).values()
+                )
+                logger.info(f"Enhanced schema loaded: {data['metadata']['total_tables']} tables, {total_relationships} relationships")
+                return data
+        except FileNotFoundError:
+            logger.warning("enhanced_schema.json not found, falling back to database_structure.json")
+            try:
+                with open('database_structure.json', 'r', encoding='utf-8') as file:
+                    data = json.load(file)
+                    logger.info(f"Structured schema loaded: {data['metadata']['total_tables']} tables, {data['metadata']['total_columns']} columns")
+                    return data
+            except FileNotFoundError:
+                logger.warning("database_structure.json not found, using text schema only")
+                return {}
+        except Exception as e:
+            logger.error(f"Error loading structured schema: {e}")
+            return {}
     
-    def _create_user_message(self, content: str) -> dict:
-        """Create a user message for chat completions"""
-        return {"role": "user", "content": content}
-    
-    def _create_assistant_message(self, content: str) -> dict:
-        """Create an assistant message for chat completions"""
-        return {"role": "assistant", "content": content}
+    def _initialize_cube_js_rules(self) -> Dict[str, Any]:
+        """Initialize Cube.js specific validation rules."""
+        return {
+            "forbidden_patterns": [
+                r"GROUP\s+BY.*MEASURE\(",
+                r"MEASURE\(.*\).*GROUP\s+BY",
+                r"INNER\s+JOIN",
+                r"LEFT\s+JOIN",
+                r"RIGHT\s+JOIN",
+                r"FULL\s+JOIN",
+                r"JOIN\s+\w+\s+ON",
+                r"TO_CHAR\(",
+                r"EXTRACT\(",
+                r"COALESCE\(",
+            ],
+            "required_patterns": {
+                "measure_in_with": r"WITH\s+\w+\s+AS\s*\([^)]*MEASURE\(",
+                "cross_join_only": r"CROSS\s+JOIN",
+            },
+            "measure_fields": [
+                "dispatchedvalue", "dispatchedqty", "invoiceamount", 
+                "ordervalue", "quantity", "sku_value", "skuAmount"
+            ]
+        }
     
     def _load_schema_file(self) -> str:
         """Load the database schema from the schema file."""
@@ -50,380 +85,295 @@ class SQLGeneratorAgent(BaseAgent):
                     content = content[1:-1]
                 content = content.replace('\\n', '\n')
                 
-                logger.info(f"Successfully loaded schema file: {self.schema_file_path}")
-                logger.info(f"Schema content length: {len(content)} characters")
-                
+                logger.info(f"Schema loaded: {self.schema_file_path} ({len(content)} chars)")
                 return content
         except FileNotFoundError:
-            error_msg = f"Schema file not found: {self.schema_file_path}"
-            logger.error(error_msg)
+            logger.error(f"Schema file not found: {self.schema_file_path}")
             return "Schema file not found. Unable to load database schema."
         except Exception as e:
-            error_msg = f"Error loading schema file: {e}"
-            logger.error(error_msg)
+            logger.error(f"Error loading schema: {e}")
             return f"Error loading schema: {str(e)}"
     
     def get_schema_info(self) -> str:
         """Return the loaded schema information."""
         return self.schema_content
     
-    def generate_sql(self, question: str, similar_sqls: List[str] = None, 
-                     previous_results: Dict[str, Any] = None) -> Dict[str, Any]:
+    def _clean_previous_results(self, previous_results: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Generate a single SQL query for the given question.
+        Clean previous_results to remove non-serializable objects like DataFrames.
+        Converts DataFrames to list of dicts for JSON serialization.
+        """
+        if not previous_results:
+            return None
+        
+        import pandas as pd
+        cleaned = {}
+        
+        logger.info(f"🧹 SQL Generator cleaning previous_results: {len(previous_results)} step(s)")
+        
+        for step_key, step_data in previous_results.items():
+            if isinstance(step_data, dict):
+                cleaned_step = {}
+                for key, value in step_data.items():
+                    # Convert DataFrame to list of dicts
+                    if isinstance(value, pd.DataFrame):
+                        converted = value.to_dict('records')
+                        cleaned_step[key] = converted
+                        logger.info(f"      ✓ Converted DataFrame '{key}' to {len(converted)} records")
+                    # Keep serializable types
+                    elif isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                        cleaned_step[key] = value
+                    # For everything else, try to serialize or convert to string
+                    else:
+                        try:
+                            json.dumps(value)
+                            cleaned_step[key] = value
+                        except (TypeError, ValueError):
+                            cleaned_step[key] = str(value)[:500]
+                            logger.info(f"      ⚠ Converted non-serializable '{key}' to string")
+                
+                cleaned[step_key] = cleaned_step
+            else:
+                try:
+                    json.dumps(step_data)
+                    cleaned[step_key] = step_data
+                except (TypeError, ValueError):
+                    cleaned[step_key] = str(step_data)[:500]
+        
+        return cleaned
+    
+    def _preserve_original_context(self, current_question: str, original_query: str) -> str:
+        """
+        Preserve context from original query when dealing with multi-step decomposition.
+        Extracts time periods, SKU requirements, and grouping terms to prevent detail loss.
+        Integrated from improved_sql_generator.py for better multi-step handling.
+        """
+        if not original_query or original_query == current_question:
+            return current_question
+        
+        original_lower = original_query.lower()
+        current_lower = current_question.lower()
+        
+        # Extract time period context
+        time_periods = []
+        months = ['january', 'february', 'march', 'april', 'may', 'june',
+                 'july', 'august', 'september', 'october', 'november', 'december']
+        
+        for month in months:
+            if month in original_lower and month not in current_lower:
+                time_periods.append(month)
+        
+        # Extract year context
+        year_pattern = r'20\d{2}'
+        original_years = re.findall(year_pattern, original_query)
+        current_years = re.findall(year_pattern, current_question)
+        missing_years = [y for y in original_years if y not in current_years]
+        
+        # Extract SKU requirements (top N)
+        top_n_pattern = r'top\s+(\d+)'
+        top_n_match = re.search(top_n_pattern, original_lower)
+        current_top_n = re.search(top_n_pattern, current_lower)
+        
+        # Extract grouping requirements
+        grouping_terms = ['separately', 'each month', 'monthly', 'by month', 'per month', 'trend']
+        missing_grouping = [term for term in grouping_terms 
+                           if term in original_lower and term not in current_lower]
+        
+        # Build enhanced question
+        enhancements = []
+        if time_periods:
+            enhancements.append(f"month: {', '.join(time_periods)}")
+        if missing_years:
+            enhancements.append(f"year: {', '.join(missing_years)}")
+        if top_n_match and not current_top_n:
+            enhancements.append(f"requirement: top {top_n_match.group(1)} SKUs")
+        if missing_grouping:
+            enhancements.append(f"grouping: {', '.join(missing_grouping)}")
+        
+        if enhancements:
+            enhanced_question = f"{current_question} ({'; '.join(enhancements)})"
+            logger.info(f"Enhanced question with context: {enhanced_question}")
+            return enhanced_question
+        
+        return current_question
+    
+    def _detect_query_intent(self, question: str) -> Dict[str, Any]:
+        """
+        Detect query intent for better pattern matching and validation.
+        Returns intent dictionary with pattern, table, columns, and requirements.
+        Integrated from improved_sql_generator.py for better pattern recognition.
+        """
+        question_lower = question.lower()
+        
+        intent = {
+            "pattern": "basic",
+            "table": "CustomerInvoice",
+            "columns": [],
+            "aggregation": "",
+            "grouping": None,
+            "requires_sku_join": False,
+            "requires_top_n": False,
+            "top_n_value": None,
+            "time_range_months": None
+        }
+        
+        # Detect SKU-related queries
+        if any(term in question_lower for term in ['sku', 'product', 'item']):
+            intent["requires_sku_join"] = True
+            intent["columns"].append("Sku.name")
+        
+        # Detect top N requirements
+        top_n_match = re.search(r'top\s+(\d+)', question_lower)
+        if top_n_match:
+            intent["requires_top_n"] = True
+            intent["top_n_value"] = int(top_n_match.group(1))
+        
+        # Detect time periods
+        months = ['january', 'february', 'march', 'april', 'may', 'june',
+                 'july', 'august', 'september', 'october', 'november', 'december']
+        for month in months:
+            if month in question_lower:
+                intent["time_period"] = month
+                break
+        
+        # Detect time range
+        if any(term in question_lower for term in ['last', 'past', 'previous']):
+            range_match = re.search(r'(?:last|past|previous)\s+(\d+)\s+months?', question_lower)
+            if range_match:
+                intent["time_range_months"] = int(range_match.group(1))
+        
+        # Detect aggregation type
+        if 'sum' in question_lower or 'total' in question_lower:
+            intent["aggregation"] = "SUM"
+        elif 'average' in question_lower or 'avg' in question_lower:
+            intent["aggregation"] = "AVG"
+        elif 'count' in question_lower or 'number of' in question_lower:
+            intent["aggregation"] = "COUNT"
+        
+        # Detect grouping requirements
+        if any(term in question_lower for term in ['each month', 'monthly', 'by month', 'per month', 'separately']):
+            intent["grouping"] = "month"
+        elif any(term in question_lower for term in ['each year', 'yearly', 'by year', 'per year']):
+            intent["grouping"] = "year"
+        
+        # Determine primary table
+        if 'distributor' in question_lower or 'sales' in question_lower:
+            intent["table"] = "DistributorSales"
+        elif 'invoice' in question_lower or 'customer' in question_lower:
+            intent["table"] = "CustomerInvoice"
+        
+        logger.info(f"Detected intent: {intent}")
+        return intent
+    
+    def generate_sql(self, question: str, similar_sqls: List[str] = None, 
+                     previous_results: Dict[str, Any] = None,
+                     original_query: str = None) -> Dict[str, Any]:
+        """
+        Generate production-ready SQL query for Cube.js.
         
         Args:
-            question: The specific question to generate SQL for
-            similar_sqls: List of similar SQL queries for context (with similarity scores)
-            previous_results: Results from previous steps (for multi-step queries)
+            question: User question to convert to SQL
+            similar_sqls: List of similar SQL examples with similarity scores
+            previous_results: Results from previous steps in multi-step workflow
+            original_query: Original user query for context preservation in multi-step scenarios
             
         Returns:
-            Dict containing the generated SQL and metadata
+            Dict with success status, sql query, and metadata
         """
         try:
-            schema_info = self.get_schema_info()
+            # Preserve context from original query if in multi-step scenario
+            if original_query:
+                question = self._preserve_original_context(question, original_query)
+            
+            # Detect query intent for better pattern matching
+            intent = self._detect_query_intent(question)
+            
             current_date = datetime.now().strftime('%Y-%m-%d')
             
-            # Analyze retrieved examples and determine generation strategy
             generation_strategy = self._determine_generation_strategy(question, similar_sqls)
             
-            # Build context based on strategy
-            sql_examples_text, strategy_instructions = self._build_strategy_context(
-                question, similar_sqls, generation_strategy
+            # Filter examples by relevance to detected intent
+            if similar_sqls and intent:
+                similar_sqls = self._filter_by_intent(similar_sqls, intent)
+            
+            sql_examples_context = self._build_examples_context(similar_sqls, generation_strategy)
+            
+            # Clean previous_results to remove non-serializable objects like DataFrames
+            cleaned_previous_results = self._clean_previous_results(previous_results) if previous_results else None
+            
+            previous_results_context = ""
+            if cleaned_previous_results:
+                previous_results_context = f"\n\nPREVIOUS STEP RESULTS:\n{json.dumps(cleaned_previous_results, indent=2)}\nUse this data to construct WHERE clauses or filters if the question references specific entities."
+            
+            system_prompt = self._build_system_prompt(
+                current_date=current_date,
+                schema_info=self.schema_content,
+                sql_examples=sql_examples_context,
+                previous_results=previous_results_context,
+                strategy=generation_strategy
             )
             
-            context_from_previous = ""
-            if previous_results:
-                context_from_previous = f"""
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Generate SQL for: {question}"}
+            ]
+            
+            # For exact matches (similarity > 0.95), provide the example and instruct to use it
+            if generation_strategy == "exact_match" and similar_sqls:
+                exact_match_sql = similar_sqls[0]['sql']
                 
-                === PREVIOUS STEP RESULTS ===
-                You have access to results from previous SQL executions:
-                {json.dumps(previous_results, indent=2)}
+                # Add instruction to use exact match
+                messages.append({
+                    "role": "system",
+                    "content": """🎯 EXACT MATCH FOUND (similarity > 0.95)!
+
+INSTRUCTION: A nearly identical query exists in the database. Use it DIRECTLY with minimal modifications.
+
+ONLY modify if absolutely necessary:
+- Update date values (e.g., change specific month to current month)
+- Change LIMIT values if user specifies different number
+- Keep all other patterns EXACTLY the same
+
+DO NOT:
+- Add unnecessary complexity (WITH clauses, CASE statements, etc.)
+- Change the aggregation pattern
+- Modify the table joins
+- Alter the WHERE clause logic (except date values)
+
+If the example already matches the user's request perfectly, return it AS IS."""
+                })
                 
-                Use this data to inform your current query. If the question refers to specific entities
-                (like "top 3 SKUs", "these customers", etc.), use the data from previous results
-                to construct appropriate WHERE clauses or filters.
-                """
+                # Provide the exact match as one-shot example
+                messages.append({
+                    "role": "user", 
+                    "content": similar_sqls[0]['question']
+                })
+                messages.append({
+                    "role": "assistant", 
+                    "content": json.dumps({"sql": exact_match_sql})
+                })
             
-            sql_generation_prompt = f"""You are an AI SQL assistant specialized in Cube.js SQL API. 
-                            Your task is to generate a SINGLE, SIMPLE, and FOCUSED SQL query to answer the specific question provided.
-                            
-                            {strategy_instructions}
-                            
-                            === QUERY SIMPLICITY PRINCIPLE ===
-                            **ALWAYS prioritize the simplest possible SQL that answers the question:**
-                            1. For basic aggregations (average, sum, count), use simple SELECT with aggregation functions
-                            2. Only use WITH clauses when complex grouping or multiple aggregations are needed
-                            3. Only join tables when the question explicitly requires data from multiple tables
-                            4. Avoid unnecessary complexity and user-wise breakdowns unless specifically requested
-                            
-                            === INTENT DETECTION RULES ===
-                            **"Average order value for [time period]" = Overall average across all orders, NOT user-wise**
-                            **"Sales for [time period]" = Total sales, NOT broken down by customer unless requested**
-                            **"Orders this month" = Count/sum of orders, NOT per-user analysis**
-                            
-                            IMPORTANT: Generate SQL for THIS SPECIFIC QUESTION ONLY. Do not add extra analysis.
-                            
-                            STRICTLY follow the rules below and generate SQL in the format:
-                            {{ "sql": "SQL_QUERY_HERE" }}
-                            
-                            === CRITICAL DATE AND TIME HANDLING ===
-                            Today's date is {current_date}
-                            
-                            **SPECIFIC MONTH REFERENCES:**
-                            - "September" / "month of September" = WHERE DATE_TRUNC('month', date_column) = '2024-09-01'
-                            - "October" / "month of October" = WHERE DATE_TRUNC('month', date_column) = '2024-10-01'  
-                            - "August" / "month of August" = WHERE DATE_TRUNC('month', date_column) = '2024-08-01'
-                            
-                            **TIME RANGE EXPRESSIONS:**
-                            - "this month" = WHERE DATE_TRUNC('month', date_column) = DATE_TRUNC('month', CURRENT_DATE)
-                            - "last month" = WHERE DATE_TRUNC('month', date_column) = DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')
-                            - "this year" = WHERE DATE_TRUNC('year', date_column) = DATE_TRUNC('year', CURRENT_DATE)
-                            - "last quarter" = WHERE date_column >= DATE_TRUNC('quarter', CURRENT_DATE - INTERVAL '3 months') AND date_column < DATE_TRUNC('quarter', CURRENT_DATE)
-                            
-                            **NEVER use just date_column < CURRENT_DATE for time range queries!**
-                            
-                            === MANDATORY DATA SOURCE SELECTION ===
-                            **FOR ORDER QUERIES:**
-                            - Primary table: Order
-                            - Date field: Order.datetime  
-                            - Value field: Order.value
-                            - Simple average: SELECT AVG(Order.value) FROM Order WHERE [time_filter]
-                            
-                            **FOR SALES QUERIES:**
-                            - Primary table: CustomerInvoice
-                            - Date field: CustomerInvoice.dispatchedDate
-                            - Value field: CustomerInvoice.dispatchedvalue
-                            
-                            === SIMPLE QUERY EXAMPLES ===
-                            
-                            **Example 1 - Average order value for specific month:**
-                            ```sql
-                            SELECT AVG(Order.value) AS AverageOrderValue
-                            FROM Order
-                            WHERE DATE_TRUNC('month', Order.datetime) = '2024-09-01'
-                            ```
-                            
-                            **Example 2 - Total orders this month:**
-                            ```sql
-                            SELECT COUNT(*) AS TotalOrders
-                            FROM Order
-                            WHERE DATE_TRUNC('month', Order.datetime) = DATE_TRUNC('month', CURRENT_DATE)
-                            ```
-                            
-                            **Example 3 - Monthly sales (only when breakdown needed):**
-                            ```sql
-                            SELECT 
-                                DATE_TRUNC('month', CustomerInvoice.dispatchedDate) AS Month,
-                                SUM(CustomerInvoice.dispatchedvalue) AS TotalSales
-                            FROM CustomerInvoice
-                            WHERE CustomerInvoice.dispatchedDate >= DATE_TRUNC('year', CURRENT_DATE)
-                            GROUP BY DATE_TRUNC('month', CustomerInvoice.dispatchedDate)
-                            ORDER BY Month
-                            ```
-                            
-                            === TREND QUERY PATTERNS ===
-                            **For "sales trend over last quarter" or "quarterly trends":**
-                            ```sql
-                            SELECT 
-                                DATE_TRUNC('month', CustomerInvoice.dispatchedDate) AS Month,
-                                SUM(CustomerInvoice.dispatchedvalue) AS TotalSales
-                            FROM CustomerInvoice
-                            WHERE CustomerInvoice.dispatchedDate >= DATE_TRUNC('quarter', CURRENT_DATE - INTERVAL '3 months')
-                                AND CustomerInvoice.dispatchedDate < DATE_TRUNC('quarter', CURRENT_DATE)
-                            GROUP BY DATE_TRUNC('month', CustomerInvoice.dispatchedDate)
-                            ORDER BY Month
-                            ```
-                            
-                            **For "display sales trend" or "show trends":**
-                            - ALWAYS group by time periods (month, quarter, week)
-                            - NEVER return individual SKU breakdowns for trend queries
-                            - Use ORDER BY time_period for proper chronological ordering
-                            - Focus on time-based aggregations, not item-level details
-                            
-                            === MANDATORY DATA SOURCE SELECTION ===
-                            **CRITICAL: For any query about "SALES", "REVENUE", "DISPATCH" or "MONTHLY SALES":**
-                            - MUST use CustomerInvoice as primary table
-                            - MUST use CustomerInvoice.dispatchedDate for date filtering
-                            - MUST use CustomerInvoice.dispatchedvalue for sales values
-                            - NEVER use DistributorSales for general sales queries
-                            - CROSS JOIN with CustomerInvoiceDetail only if item-level details needed
-                            
-                            **FOR ORDER QUERIES (different from sales):**
-                            - Primary table: Order
-                            - Date field: Order.datetime  
-                            - Value field: Order.value
-                            
-                            ===Response Guidelines 
-                            1. If the provided context is sufficient, generate a valid SQL query without explanations. Generate STRICTLY in format {{\"sql\" : \"SQL_QUERY_HERE\" }}.
-                            2. If the provided context is insufficient, explain why it can't be generated in format {{\"error\" : \"ERROR_EXPLANATION_HERE\" }}.
-                            3. If you need clarification, ask a follow-up question in format {{\"follow_up\" : \"FOLLOW_UP_QUESTION_HERE\" }}.
-                            4. Always assume data is up-to-date unless explicitly stated otherwise.
-                            5. Use the most relevant table(s) based on the schema.
-                            6. Keep queries simple and focused on the specific question asked.
-                            7. **MANDATORY**: For any time-based queries, use the precise date filtering rules above.
-                            
-                            ===SQL Generation Guidelines (Cube.js API Compatible)===
-                            
-                            **CUBE.JS SPECIFIC FUNCTIONS:**
-                            - Use MEASURE() inside WITH clauses for aggregations (SUM, COUNT, etc.)
-                            - Use DATE_TRUNC() for date grouping and filtering
-                            - INTERVAL syntax: CURRENT_DATE - INTERVAL '12 months'
-                            - Supported functions: DATE_TRUNC, CURRENT_DATE, INTERVAL, MEASURE
-                            
-                            **JOIN RULES:**
-                            - STRICTLY ONLY USE CROSS JOIN for joining two tables 
-                            - STRICTLY DO NOT USE ANY JOIN CONDITION EITHER WITH ON CLAUSE OR IN WHERE CLAUSE
-                            - ONLY Use **CROSS JOIN** , DO NOT USE INNER JOIN or LEFT JOIN or RIGHT JOIN when joining tables.
-                            - DO NOT CREATE TWO TABLES USING WITH CLAUSE AND JOIN THEM. 
-                            - IF THERE IS NO DIRECT CROSS JOIN IN THE EXAMPLE BETWEEN TWO TABLES USE UNION ALL INSTEAD WITH PROPER CAST OF TYPE. 
-                            
-                            **UNSUPPORTED FUNCTIONS:**
-                            - TO_CHAR() IS NOT SUPPORTED
-                            - GET_DATE() IS NOT SUPPORTED  
-                            - EXTRACT() IS NOT SUPPORTED
-                            - COALESCE() IS NOT SUPPORTED
-                            
-                            === SQL Query Construction Rules ===
-                            - DO NOT USE ALIAS IN WHERE CLAUSE
-                            - DO NOT USE SELECT *.
-                            - Use WITH Clause for sub queries:
-                                - DO NOT USE MEASURE outside WITH CLAUSE Use SUM instead.
-                                - STRICTLY USE MEASURE inside the WITH CLAUSE.
-                                - STRICTLY Always assign alias to select inside the WITH CLAUSE and refer them outside.
-                                - Try to also include GROUP BY CLAUSE inside the WITH CLAUSE
-                                - DO NOT CREATE TWO TABLES USING WITH CLAUSE AND JOIN THEM.
-                            - CROSS JOIN Rules:
-                                - CROSS JOIN is sufficient there is no need of ON clause.
-                                - WRONG: SELECT ViewCustomer.name FROM CustomerInvoice JOIN CustomerInvoiceDetail ON CustomerInvoice.id = CustomerInvoiceDetail.invoice_id
-                                - CORRECT: SELECT ViewCustomer.name FROM CustomerInvoice CROSS JOIN CustomerInvoiceDetail CROSS JOIN ViewCustomer WHERE conditions
-                            - Relationships Between Tables: 
-                                - The **Order** table can be **cross joined** with **ViewCustomer**, **ViewDistributor**, **ViewUser**, and **OrderDetail** table.
-                                - The **OrderDetails** table can be **cross joined** with the **Sku** table.
-                                - The **Sku** table can be **cross joined** with **Brand** and **Category** tables.
-                            - For filtering of Sku,Brand,Category CROSS JOIN and Filter by name column is sufficient.
-                            - STRICTLY There should be no Subquery in a WHERE CLAUSE
-                            - Names related queries:
-                                - Customer's name: CROSS JOIN 'ViewCustomer' table and get ViewCustomer.name.
-                                - User's name: CROSS JOIN 'ViewUser' table and get ViewUser.name.
-                                - Distributor's name: CROSS JOIN 'ViewDistributor' table and get ViewDistributor.name.
-                                - SKU's name: CROSS JOIN 'Sku' table and get Sku.name.
-                                - Category's name: CROSS JOIN 'Category' table with 'Sku' table and get Category.name.
-                                - Brand's name: CROSS JOIN 'Brand' table with 'Sku' table and get Brand.name.
-                            - Date field related:
-                                - Order related questions: use Order.datetime from Order table.
-                                - Sales/revenue/dispatch related questions: use CustomerInvoice.dispatchedDate from CustomerInvoice table.
-                            
-                            **MANDATORY TIME-BASED QUERY EXAMPLES:**
-                            
-                            EXAMPLE 1 - Monthly sales trend for past year:
-                            ```sql
-                            WITH sales_data AS (
-                                SELECT 
-                                    DATE_TRUNC('month', CustomerInvoice.dispatchedDate) AS MonthYear,
-                                    MEASURE(CustomerInvoice.dispatchedvalue) AS TotalSales
-                                FROM CustomerInvoice 
-                                CROSS JOIN CustomerInvoiceDetail
-                                WHERE CustomerInvoice.dispatchedDate >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '12 months')
-                                  AND CustomerInvoice.dispatchedDate < DATE_TRUNC('month', CURRENT_DATE)
-                                GROUP BY DATE_TRUNC('month', CustomerInvoice.dispatchedDate)
-                            )
-                            SELECT MonthYear, TotalSales FROM sales_data ORDER BY MonthYear
-                            ```
-                            
-                            EXAMPLE 2 - Sales for last 3 months:
-                            ```sql
-                            SELECT 
-                                DATE_TRUNC('month', CustomerInvoice.dispatchedDate) AS MonthYear,
-                                MEASURE(CustomerInvoice.dispatchedvalue) AS TotalSales
-                            FROM CustomerInvoice 
-                            CROSS JOIN CustomerInvoiceDetail
-                            WHERE CustomerInvoice.dispatchedDate >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '3 months')
-                              AND CustomerInvoice.dispatchedDate < DATE_TRUNC('month', CURRENT_DATE)
-                            GROUP BY DATE_TRUNC('month', CustomerInvoice.dispatchedDate)
-                            ORDER BY MonthYear
-                            ```
-                            - Fields NOT to use:
-                                - DO NOT USE Order.skuName, CustomerInvoiceDetail.skuName for sku names
-                                - USE Sku.name from Sku table instead with proper CROSS JOIN
-                                - DO NOT use 'id' for count.
-                                - Example: USE MEASURE(ViewCustomer.count) instead of COUNT(DISTINCT ViewCustomer.id)
-                            
-                            DATABASE SCHEMA:
-                            {schema_info}
-                            
-                            RELEVANT SQL EXAMPLES (for reference and pattern matching):
-                            {sql_examples_text}
-                            
-                            {context_from_previous}
-                            
-                            QUESTION TO ANSWER: {question}
-                            
-                            **CRITICAL INSTRUCTIONS FOR THIS SPECIFIC QUESTION:**
-                            1. Focus ONLY on the question asked: "{question}"
-                            2. Do NOT mix patterns from examples unless they directly match the question requirements
-                            3. For "sales trend" or "monthly sales" queries, use CustomerInvoice table, NOT DistributorSales
-                            4. For "past year" queries, use exactly 12 months: INTERVAL '12 months' 
-                            5. Do NOT add filters (like SKU names) that are not mentioned in the question
-                            6. Keep the query simple and directly answer what is asked
-                            
-                            Generate a single SQL query to answer this specific question only."""
+            adaptive_llm = self._get_adaptive_llm(similar_sqls, generation_strategy)
             
-            message_log = [self._create_system_message(sql_generation_prompt)]
-            message_log.append(self._create_user_message(f"Generate SQL for: {question}"))
-            
-            # Build intelligent conversation context based on strategy
-            message_log = self._build_conversation_context(message_log, question, similar_sqls, generation_strategy)
-            
-            # ADAPTIVE TEMPERATURE: Adjust creativity based on similarity score
-            adaptive_llm = self._get_adaptive_temperature_llm(similar_sqls, generation_strategy)
-            
-            # Generate response with adaptive temperature
-            response = adaptive_llm.invoke(message_log)
+            response = adaptive_llm.invoke(messages)
             content = response.content.strip()
             
-            # Validate and potentially simplify the generated SQL
-            content = self._validate_and_simplify_sql(content, question)
-            
-            # Track token usage
             track_llm_call(
-                input_prompt=message_log,
+                input_prompt=messages,
                 output=content,
                 agent_type="sql_generator",
                 operation="generate_sql",
                 model_name="gpt-4o"
             )
             
-            try:
-                # First try JSON format
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    json_content = json_match.group(0)
-                    parsed_response = json.loads(json_content)
-                    
-                    if "sql" in parsed_response:
-                        return {
-                            "success": True,
-                            "sql": parsed_response["sql"],
-                            "query_type": "SELECT",  # Default for Cube.js
-                            "explanation": "Generated SQL query successfully",
-                            "format": "cube_js_api",
-                            "used_examples": len(similar_sqls) > 0 if similar_sqls else False,
-                            "used_previous_results": previous_results is not None
-                        }
-                    
-                    elif "error" in parsed_response:
-                        return {
-                            "success": False,
-                            "error": parsed_response["error"],
-                            "type": "context_insufficient"
-                        }
-                    
-                    elif "follow_up" in parsed_response:
-                        return {
-                            "success": False,
-                            "error": f"Follow-up question needed: {parsed_response['follow_up']}",
-                            "type": "follow_up_required"
-                        }
-                
-                # If JSON parsing fails, try extracting SQL from markdown code blocks
-                sql_block_match = re.search(r'```(?:sql)?\s*(.*?)\s*```', content, re.DOTALL | re.IGNORECASE)
-                if sql_block_match:
-                    sql_content = sql_block_match.group(1).strip()
-                    return {
-                        "success": True,
-                        "sql": sql_content,
-                        "query_type": "SELECT",  # Default for Cube.js
-                        "explanation": "Generated SQL query successfully (extracted from markdown)",
-                        "format": "markdown_extracted",
-                        "used_examples": len(similar_sqls) > 0 if similar_sqls else False,
-                        "used_previous_results": previous_results is not None
-                    }
-                
-            except json.JSONDecodeError:
-                logger.warning("Failed to parse JSON response, attempting fallback parsing")
-                
-                # Fallback parsing for non-JSON format
-                query_type_match = re.search(r'QUERY_TYPE:\s*(\w+)', content)
-                sql_match = re.search(r'SQL:\s*(.+?)(?=\nEXPLANATION:|$)', content, re.DOTALL)
-                
-                if sql_match:
-                    return {
-                        "success": True,
-                        "sql": sql_match.group(1).strip(),
-                        "query_type": query_type_match.group(1).upper() if query_type_match else "SELECT",
-                        "explanation": "Generated SQL query using fallback parsing",
-                        "format": "fallback_format",
-                        "used_examples": len(similar_sqls) > 0 if similar_sqls else False,
-                        "used_previous_results": previous_results is not None
-                    }
+            parsed_result = self._parse_and_validate_sql(content, question)
             
-            return {
-                "success": False,
-                "error": "Could not parse SQL query from response",
-                "type": "parsing_error",
-                "raw_response": content
-            }
+            if parsed_result["success"]:
+                validated_sql = self._validate_cube_js_compliance(parsed_result["sql"])
+                parsed_result["sql"] = validated_sql
+                parsed_result["strategy_used"] = generation_strategy
+            
+            return parsed_result
                 
         except Exception as e:
             logger.error(f"SQL generation error: {e}")
@@ -433,542 +383,555 @@ class SQLGeneratorAgent(BaseAgent):
                 "type": "generation_error"
             }
     
-    def _validate_and_simplify_sql(self, content: str, question: str) -> str:
+    def _filter_by_intent(self, similar_sqls: List[Dict], intent: Dict[str, Any]) -> List[Dict]:
         """
-        Validate generated SQL and suggest simplifications for better performance and clarity.
+        Filter examples to only include those relevant to the detected intent.
+        Integrated from improved_sql_generator.py for better example selection.
         """
-        try:
-            # Extract SQL from response
-            if content.startswith('{'):
-                import json
-                data = json.loads(content)
-                sql = data.get("sql", "")
-            else:
-                sql = content
+        if not similar_sqls:
+            return []
+        
+        relevant = []
+        for sql_info in similar_sqls[:5]:  # Only top 5
+            sql_lower = sql_info.get('sql', '').lower()
             
-            sql_lower = sql.lower()
-            question_lower = question.lower()
+            # Check if example matches intent
+            matches_table = intent['table'].lower() in sql_lower
+            matches_aggregation = intent['aggregation'].lower() in sql_lower if intent['aggregation'] else True
             
-            # Check for unnecessary complexity patterns
-            complexity_issues = []
-            
-            # Check 1: Unnecessary user/customer breakdown for simple aggregations
-            if ("average" in question_lower or "total" in question_lower) and "user" not in question_lower and "customer" not in question_lower:
-                if ("viewuser" in sql_lower or "viewcustomer" in sql_lower) and "group by" in sql_lower:
-                    complexity_issues.append("Unnecessary user/customer breakdown for simple aggregation")
-            
-            # Check 2: Complex WITH clauses for simple operations
-            if "with " in sql_lower and ("avg(" in question_lower or "count(" in question_lower or "sum(" in question_lower):
-                if sql_lower.count("select") > 2:  # WITH clause + main SELECT + potential subqueries
-                    complexity_issues.append("Complex WITH clause for simple aggregation")
-            
-            # Check 3: CASE statements for simple time filtering
-            if "case when" in sql_lower and ("month" in question_lower or "quarter" in question_lower):
-                if question_lower.count("month") == 1 or question_lower.count("quarter") == 1:
-                    complexity_issues.append("Unnecessary CASE statement for single time period")
-            
-            # Check 4: Multiple CROSS JOINs when not needed
-            cross_join_count = sql_lower.count("cross join")
-            if cross_join_count > 1 and not any(breakdown in question_lower for breakdown in ["by customer", "by user", "by sku", "by category"]):
-                complexity_issues.append("Multiple unnecessary table joins")
-            
-            # If issues found, suggest simplification
-            if complexity_issues:
-                logger.warning(f"SQL complexity issues detected: {complexity_issues}")
-                simplified_sql = self._generate_simplified_sql(question, sql)
-                if simplified_sql:
-                    return simplified_sql
-            
-            return content
-            
-        except Exception as e:
-            logger.error(f"SQL validation error: {e}")
-            return content
+            if matches_table and sql_info.get('similarity', 0) > 0.7:
+                relevant.append(sql_info)
+        
+        return relevant[:3]  # Max 3 relevant examples
     
-    def _determine_generation_strategy(self, question: str, similar_sqls: List[Dict]) -> str:
-        """
-        Determine the best strategy for SQL generation based on retrieved examples.
+    def _build_system_prompt(self, current_date: str, schema_info: str, 
+                            sql_examples: str, previous_results: str, strategy: str) -> str:
+        """Build comprehensive system prompt for SQL generation."""
         
-        Returns:
-            str: Strategy type - 'exact_match', 'high_similarity', 'schema_based', 'hybrid'
-        """
-        if not similar_sqls or len(similar_sqls) == 0:
-            logger.info("No similar SQLs found - using schema-based generation")
-            return 'schema_based'
-        
-        # Ensure similar_sqls is in the right format
-        if isinstance(similar_sqls[0], dict) and 'similarity' in similar_sqls[0]:
-            # Check similarity scores and question matching
-            best_match = similar_sqls[0]
-            best_similarity = best_match['similarity']
+        # Use enhanced schema with FK relationships and metadata
+        schema_context = ""
+        if self.structured_schema and 'tables' in self.structured_schema:
+            # Build focused schema for most commonly used tables with relationships
+            important_tables = ['CustomerInvoice', 'CustomerInvoiceDetail', 'DistributorSales', 
+                               'DistributorSalesDetail', 'Sku', 'Order', 'OrderDetail', 'OrderReturn', 'OrderReturnDetail']
             
-            # Exact match: Very high similarity (>0.95) or exact question match
-            if best_similarity > 0.95:
-                logger.info(f"Exact match found (similarity: {best_similarity:.3f}) - using exact match strategy")
-                return 'exact_match'
-            
-            # High similarity: Good match (>0.85) 
-            elif best_similarity > 0.85:
-                logger.info(f"High similarity match found (similarity: {best_similarity:.3f}) - using high similarity strategy")
-                return 'high_similarity'
-            
-            # Medium similarity: Some relevant examples (>0.7)
-            elif best_similarity > 0.7:
-                logger.info(f"Medium similarity match found (similarity: {best_similarity:.3f}) - using hybrid strategy")
-                return 'hybrid'
-            
-            # Low similarity: Examples not very relevant
-            else:
-                logger.info(f"Low similarity match (similarity: {best_similarity:.3f}) - using schema-based generation")
-                return 'schema_based'
-        
-        # Fallback if format is unexpected
-        logger.info("Unexpected similar_sqls format - using hybrid strategy")
-        return 'hybrid'
-    
-    def _build_strategy_context(self, question: str, similar_sqls: List[Dict], strategy: str) -> tuple:
-        """
-        Build context and instructions based on the determined strategy.
-        
-        Returns:
-            tuple: (sql_examples_text, strategy_instructions)
-        """
-        if strategy == 'exact_match':
-            return self._build_exact_match_context(question, similar_sqls)
-        elif strategy == 'high_similarity':
-            return self._build_high_similarity_context(question, similar_sqls)
-        elif strategy == 'hybrid':
-            return self._build_hybrid_context(question, similar_sqls)
-        else:  # schema_based
-            return self._build_schema_based_context(question)
-    
-    def _build_exact_match_context(self, question: str, similar_sqls: List[Dict]) -> tuple:
-        """Build context for exact match strategy."""
-        best_match = similar_sqls[0]
-        
-        sql_examples_text = f"""
-        ⭐ EXACT MATCH FOUND ⭐
-        Question: {best_match['question']}
-        Similarity Score: {best_match['similarity']:.3f}
-        
-        PROVEN SQL QUERY:
-        {best_match['sql']}
-        
-        Additional Reference Examples:
-        """
-        
-        # Add 2-3 more examples for context
-        for i, sql_data in enumerate(similar_sqls[1:4], 2):
-            sql_examples_text += f"""
-        Example {i} (Similarity: {sql_data['similarity']:.3f}):
-        Question: {sql_data['question']}
-        SQL: {sql_data['sql']}
-        """
-        
-        strategy_instructions = f"""
-        === EXACT MATCH STRATEGY ===
-        🎯 PRIORITY: You have found an EXACT or NEAR-EXACT match for this question!
-        
-        **INSTRUCTIONS:**
-        1. **USE THE PROVEN SQL QUERY** from the exact match as your primary reference
-        2. **MAKE MINIMAL MODIFICATIONS** only if absolutely necessary (e.g., different time periods)
-        3. **PRESERVE THE CORE STRUCTURE** and table relationships from the proven query
-        4. **DO NOT DEVIATE** from the established pattern unless the question explicitly requires it
-        5. **TRUST THE PROVEN QUERY** - it has been validated and works correctly
-        
-        **MODIFICATION GUIDELINES:**
-        - Only change date filters if different time periods are mentioned
-        - Only change column names if different fields are requested
-        - Keep the same tables, joins, and general structure
-        - If the question is identical, return the exact same SQL
-        
-        **CRITICAL:** The proven query represents the CORRECT way to answer this type of question.
-        Use it as your template and make only necessary adjustments.
-        """
-        
-        return sql_examples_text, strategy_instructions
-    
-    def _build_high_similarity_context(self, question: str, similar_sqls: List[Dict]) -> tuple:
-        """Build context for high similarity strategy."""
-        sql_examples_text = f"""
-        🔥 HIGH SIMILARITY MATCHES FOUND 🔥
-        Your question has strong similarity to these proven queries:
-        
-        """
-        
-        # Add top 3-4 examples
-        for i, sql_data in enumerate(similar_sqls[:4], 1):
-            sql_examples_text += f"""
-        Example {i} (Similarity: {sql_data['similarity']:.3f}):
-        Question: {sql_data['question']}
-        SQL: {sql_data['sql']}
-        
-        """
-        
-        strategy_instructions = f"""
-        === HIGH SIMILARITY STRATEGY ===
-        🎯 PRIORITY: Leverage the PROVEN PATTERNS from high-similarity matches!
-        
-        **INSTRUCTIONS:**
-        1. **ANALYZE THE PATTERNS** from the high-similarity examples above
-        2. **IDENTIFY COMMON STRUCTURES** across the proven queries
-        3. **ADAPT THE PATTERN** to answer the current question specifically
-        4. **USE SIMILAR TABLES** and join patterns that have been proven to work
-        5. **FOLLOW THE ESTABLISHED CONVENTIONS** from the examples
-        
-        **PATTERN ANALYSIS GUIDELINES:**
-        - Look for common table combinations (e.g., CustomerInvoice + CustomerInvoiceDetail)
-        - Follow similar WHERE clause patterns for time filtering
-        - Use similar GROUP BY and ORDER BY structures
-        - Adopt proven column naming conventions
-        - Maintain the same level of complexity/simplicity
-        
-        **ADAPTATION RULES:**
-        - Modify only what's necessary to answer the current question
-        - Keep the proven table relationships and join patterns
-        - Use similar aggregation functions and date handling
-        - Follow the same Cube.js syntax patterns
-        
-        **CRITICAL:** These examples show PROVEN approaches to similar questions.
-        Adapt their successful patterns rather than creating entirely new structures.
-        """
-        
-        return sql_examples_text, strategy_instructions
-    
-    def _build_hybrid_context(self, question: str, similar_sqls: List[Dict]) -> tuple:
-        """Build context for hybrid strategy (medium similarity)."""
-        sql_examples_text = f"""
-        💡 REFERENCE EXAMPLES AVAILABLE 💡
-        These queries provide some relevant patterns:
-        
-        """
-        
-        # Add top 3 examples
-        for i, sql_data in enumerate(similar_sqls[:3], 1):
-            sql_examples_text += f"""
-        Example {i} (Similarity: {sql_data['similarity']:.3f}):
-        Question: {sql_data['question']}
-        SQL: {sql_data['sql']}
-        
-        """
-        
-        strategy_instructions = f"""
-        === HYBRID STRATEGY ===
-        🎯 PRIORITY: Use SELECTIVE GUIDANCE from examples + Schema-based reasoning!
-        
-        **INSTRUCTIONS:**
-        1. **EXTRACT USEFUL PATTERNS** from the reference examples (table choices, join patterns)
-        2. **APPLY SCHEMA KNOWLEDGE** to determine the best approach for this specific question
-        3. **COMBINE PROVEN TECHNIQUES** with fresh analysis based on the question requirements
-        4. **VALIDATE TABLE RELEVANCE** - only use tables that are actually needed
-        5. **PRIORITIZE SIMPLICITY** - don't over-engineer based on complex examples
-        
-        **SELECTIVE GUIDANCE RULES:**
-        - Adopt proven table combinations IF they're relevant to your question
-        - Use similar date filtering patterns IF time-based queries are involved
-        - Follow Cube.js syntax patterns from examples
-        - Ignore irrelevant complexity from examples
-        
-        **SCHEMA-FIRST APPROACH:**
-        - Start with the most direct tables for your question
-        - Add joins only when necessary for the specific question
-        - Use the simplest query structure that answers the question
-        - Refer to examples for syntax patterns, not query structure
-        
-        **CRITICAL:** Examples provide technique guidance, but your primary goal is to 
-        answer THIS specific question in the most direct and simple way possible.
-        """
-        
-        return sql_examples_text, strategy_instructions
-    
-    def _build_schema_based_context(self, question: str) -> tuple:
-        """Build context for schema-based strategy (no good matches)."""
-        sql_examples_text = """
-        📚 SCHEMA-BASED GENERATION 📚
-        No highly relevant examples found. Generating based on schema and Cube.js best practices.
-        
-        FUNDAMENTAL PATTERNS TO FOLLOW:
-        - Sales queries: Use CustomerInvoice + CustomerInvoiceDetail
-        - Order queries: Use Order + OrderDetail  
-        - Customer info: Use ViewCustomer
-        - SKU info: Use Sku + Category/Brand (if needed)
-        - Time filtering: Use DATE_TRUNC with appropriate intervals
-        - Aggregations: Use MEASURE() inside WITH clauses, SUM/COUNT/AVG outside
-        """
-        
-        strategy_instructions = f"""
-        === SCHEMA-BASED STRATEGY ===
-        🎯 PRIORITY: Generate OPTIMAL SQL based on schema analysis and question requirements!
-        
-        **INSTRUCTIONS:**
-        1. **ANALYZE THE QUESTION** to identify required data elements
-        2. **MAP TO SCHEMA TABLES** to find the most direct data sources
-        3. **USE MINIMAL JOINS** - only include tables that are absolutely necessary
-        4. **FOLLOW CUBE.JS PATTERNS** for syntax and functions
-        5. **PRIORITIZE PERFORMANCE** - simpler queries are better
-        
-        **QUESTION ANALYSIS PROCESS:**
-        1. Identify the main subject (sales, orders, customers, etc.)
-        2. Determine required aggregations (SUM, COUNT, AVG, etc.)
-        3. Identify time constraints (this month, last quarter, etc.)
-        4. Determine grouping requirements (by month, by customer, etc.)
-        5. Map each requirement to appropriate tables and columns
-        
-        **TABLE SELECTION GUIDELINES:**
-        - Sales/Revenue questions → CustomerInvoice (primary)
-        - Order questions → Order (primary)
-        - Customer details → ViewCustomer
-        - Product details → Sku, Category, Brand
-        - Only join additional tables when their data is explicitly needed
-        
-        **CUBE.JS COMPLIANCE:**
-        - Use CROSS JOIN (never INNER/LEFT/RIGHT JOIN)
-        - Use MEASURE() inside WITH clauses for aggregations
-        - Use DATE_TRUNC for date grouping and filtering
-        - Follow the provided syntax patterns exactly
-        
-        **CRITICAL:** Create the SIMPLEST query that correctly answers the question.
-        Avoid unnecessary complexity and focus on direct, efficient data retrieval.
-        """
-        
-        return sql_examples_text, strategy_instructions
-    
-    def _build_conversation_context(self, message_log: List[Dict], question: str, 
-                                   similar_sqls: List[Dict], strategy: str) -> List[Dict]:
-        """
-        Build intelligent conversation context based on the strategy and available examples.
-        """
-        if not similar_sqls or strategy == 'schema_based':
-            # No examples to use, return as-is
-            return message_log
-            
-        if strategy == 'exact_match':
-            # For exact matches, add the proven Q&A pair as conversation history
-            best_match = similar_sqls[0]
-            message_log.append(self._create_user_message(best_match['question']))
-            message_log.append(self._create_assistant_message(json.dumps({"sql": best_match['sql']})))
-            
-        elif strategy == 'high_similarity':
-            # For high similarity, add 2-3 best examples as conversation history
-            for sql_data in similar_sqls[:2]:  # Top 2 for better context
-                if isinstance(sql_data, dict) and "question" in sql_data and "sql" in sql_data:
-                    message_log.append(self._create_user_message(sql_data["question"]))
-                    message_log.append(self._create_assistant_message(json.dumps({"sql": sql_data["sql"]})))
+            schema_parts = []
+            for table_name in important_tables:
+                if table_name in self.structured_schema['tables']:
+                    table_data = self.structured_schema['tables'][table_name]
                     
-        elif strategy == 'hybrid':
-            # For hybrid, add only the best example to avoid confusion
-            if len(similar_sqls) > 0:
-                best_example = similar_sqls[0]
-                if isinstance(best_example, dict) and "question" in best_example and "sql" in best_example:
-                    message_log.append(self._create_user_message(best_example["question"]))
-                    message_log.append(self._create_assistant_message(json.dumps({"sql": best_example["sql"]})))
+                    # Build table section
+                    table_part = f"\nTABLE: {table_name}"
+                    
+                    # Add fields (limit to first 15 most important fields)
+                    if 'fields' in table_data:
+                        fields_list = []
+                        for field_name, field_type in list(table_data['fields'].items())[:15]:
+                            if not field_name.startswith('__'):
+                                fields_list.append(f"  - {field_name}: {field_type}")
+                        if fields_list:
+                            table_part += "\nFields:\n" + "\n".join(fields_list)
+                    
+                    # Add metadata (aggregatable fields, date fields)
+                    if 'metadata' in table_data:
+                        metadata = table_data['metadata']
+                        
+                        if metadata.get('is_detail_table'):
+                            table_part += f"\n  [Detail table, parent: {metadata.get('parent_table')}]"
+                        
+                        if metadata.get('date_fields'):
+                            table_part += f"\n  Date fields: {', '.join(metadata['date_fields'][:3])}"
+                        
+                        if metadata.get('aggregatable_fields'):
+                            table_part += f"\n  Aggregatable (use with MEASURE): {', '.join(metadata['aggregatable_fields'][:5])}"
+                    
+                    # Add relationships
+                    if 'relationships' in table_data and table_data['relationships']:
+                        table_part += "\n  Relationships:"
+                        for related_table, rel_info in list(table_data['relationships'].items())[:3]:
+                            table_part += f"\n    → {related_table} (use {rel_info.get('cube_js_join', 'CROSS JOIN')})"
+                    
+                    schema_parts.append(table_part)
+            
+            schema_context = "\n\nDATABASE SCHEMA (with relationships and field metadata):" + "".join(schema_parts)
+        else:
+            # Fallback to text schema if enhanced JSON not available
+            schema_context = f"\n\nDATABASE SCHEMA:\n{schema_info[:3000]}"
         
-        return message_log
+        # Enhanced previous results context
+        previous_results_formatted = previous_results
+        if previous_results and "PREVIOUS STEP RESULTS:" in previous_results:
+            previous_results_formatted = previous_results + """
+
+⚠️ CRITICAL FOR MULTI-STEP QUERIES:
+- If question mentions "identified in step 1" or "from step X", you MUST filter using those specific results
+- Example: If step 1 found SKUs ['A', 'B', 'C'], use WHERE skuName IN ('A', 'B', 'C')
+- DO NOT ignore previous step results - they are the input for this query"""
+        
+        return f"""You are an expert SQL generator for Cube.js API. Generate reliable, production-ready SQL queries.
+
+TODAY'S DATE: {current_date}
+{schema_context}
+
+CUBE.JS CRITICAL RULES - STRICTLY FOLLOW THESE:
+
+1. AGGREGATION PATTERN - WITH CLAUSE + MEASURE():
+   For aggregation queries (top N, sum, count, avg), you MUST use WITH clause with MEASURE() inside.
+   
+   ✅ CORRECT PATTERN for Top N Aggregation:
+   ```sql
+   WITH aggregated AS (
+       SELECT 
+           CustomerInvoiceDetail.skuName,
+           MEASURE(CustomerInvoiceDetail.skuAmount) AS TotalAmount
+       FROM CustomerInvoice 
+       CROSS JOIN CustomerInvoiceDetail
+       WHERE DATE_TRUNC('month', CustomerInvoice.dispatchedDate) = '2024-09-01'
+       GROUP BY CustomerInvoiceDetail.skuName
+   )
+   SELECT skuName, TotalAmount 
+   FROM aggregated 
+   ORDER BY TotalAmount DESC 
+   LIMIT 3
+   ```
+   
+   ⚠️ CRITICAL RULES:
+   - MEASURE() MUST be inside WITH clause (NEVER outside)
+   - GROUP BY is ALLOWED inside WITH clause (REQUIRED for aggregation)
+   - Assign aliases to all columns in WITH clause
+   - Use those aliases in outer SELECT
+   - DO NOT use SUM/AVG/COUNT outside WITH clause
+
+2. JOIN RULES - CROSS JOIN ONLY, NO CONDITIONS:
+   - ALWAYS use CROSS JOIN (NEVER INNER/LEFT/RIGHT/FULL JOIN)
+   - NEVER use ON clause
+   - STRICTLY NO JOIN CONDITIONS in WHERE clause
+   - ❌ WRONG: WHERE CustomerInvoice.id = CustomerInvoiceDetail.invoice_id
+   - ✅ CORRECT: Just CROSS JOIN tables, Cube.js handles relationships internally
+   
+   Example:
+   ```sql
+   -- WRONG (has WHERE join condition):
+   FROM CustomerInvoice CROSS JOIN CustomerInvoiceDetail 
+   WHERE CustomerInvoice.id = CustomerInvoiceDetail.invoice_id
+   
+   -- CORRECT (no join conditions):
+   FROM CustomerInvoice CROSS JOIN CustomerInvoiceDetail
+   WHERE DATE_TRUNC('month', CustomerInvoice.dispatchedDate) = '2024-09-01'
+   ```
+
+3. WITH CLAUSE RULES:
+   - Use WITH clause for any aggregation or subquery
+   - MEASURE() MUST be inside WITH clause
+   - GROUP BY is ALLOWED and REQUIRED inside WITH clause
+   - DO NOT create two tables with WITH and JOIN them (use UNION ALL instead)
+   - Always assign aliases to columns in WITH clause
+4. DATE HANDLING - LEARN YEAR FROM EXAMPLES:
+   - 🔍 Check the EXAMPLES below to see which YEAR is used (2024 or 2025)
+   - 📅 ALWAYS use the SAME YEAR as shown in examples
+   - Specific months: DATE_TRUNC('month', date_column) = 'YYYY-MM-01'
+   - For September: If examples show '2024-09-01', use 2024 (not current year)
+   - Use dispatchedDate for CustomerInvoice, datetime for Order
+   - For Order table: Order.datetime
+   - For CustomerInvoice: CustomerInvoice.dispatchedDate
+   - For "last N months": Use INTERVAL arithmetic from CURRENT_DATE
+
+5. FORBIDDEN PATTERNS:
+   - NO TO_CHAR(), EXTRACT(), COALESCE(), GET_DATE() (not supported in Cube.js)
+   - NO INNER JOIN, LEFT JOIN, RIGHT JOIN, FULL JOIN (use CROSS JOIN only)
+   - NO ON clause with joins
+   - NO JOIN CONDITIONS in WHERE clause (Cube.js handles relationships)
+   - NO SUM/AVG/COUNT outside WITH clause (use MEASURE inside WITH)
+   - NO SELECT * (always specify columns)
+   - NO subqueries in WHERE clause
+   - NO alias usage in WHERE clause
+
+6. FIELD USAGE NOTES - LEARN FROM EXAMPLES:
+   - 🔍 Check the EXAMPLES below to see correct field naming patterns
+   - For Customer name: CROSS JOIN ViewCustomer, use ViewCustomer.name
+   - For User name: CROSS JOIN ViewUser, use ViewUser.name  
+   - For Distributor name: CROSS JOIN ViewDistributor, use ViewDistributor.name
+   - For SKU name: Follow the pattern from examples (CustomerInvoiceDetail.skuName vs Sku.name)
+   - For Category name: CROSS JOIN Category with Sku, use Category.name
+   - For Brand name: CROSS JOIN Brand with Sku, use Brand.name
+   - For counts: Use MEASURE(table.count), NOT COUNT(DISTINCT table.id)
+
+7. COMMON QUERY PATTERNS:
+
+   Pattern A - Top N with Aggregation (CORRECT for all cubes):
+   ```sql
+   WITH aggregated AS (
+       SELECT 
+           CustomerInvoiceDetail.skuName,
+           MEASURE(CustomerInvoiceDetail.skuAmount) AS TotalAmount
+       FROM CustomerInvoice 
+       CROSS JOIN CustomerInvoiceDetail
+       WHERE DATE_TRUNC('month', CustomerInvoice.dispatchedDate) = '2024-09-01'
+       GROUP BY CustomerInvoiceDetail.skuName
+   )
+   SELECT skuName, TotalAmount 
+   FROM aggregated 
+   ORDER BY TotalAmount DESC 
+   LIMIT 3
+   ```
+   
+   Pattern B - Top N with SKU Names (join Sku table):
+   ```sql
+   WITH aggregated AS (
+       SELECT 
+           Sku.name AS SkuName,
+           MEASURE(DistributorSalesDetail.sku_value) AS TotalValue
+       FROM DistributorSales 
+       CROSS JOIN DistributorSalesDetail 
+       CROSS JOIN Sku
+       WHERE DATE_TRUNC('month', DistributorSales.erp_document_date) = '2024-09-01'
+       GROUP BY Sku.name
+   )
+   SELECT SkuName, TotalValue 
+   FROM aggregated 
+   ORDER BY TotalValue DESC 
+   LIMIT 10
+   ```
+   
+   Pattern C - Time-based Aggregation:
+   ```sql
+   WITH monthly AS (
+       SELECT 
+           DATE_TRUNC('month', CustomerInvoice.dispatchedDate) AS Month,
+           MEASURE(CustomerInvoice.dispatchedvalue) AS TotalSales
+       FROM CustomerInvoice
+       WHERE CustomerInvoice.dispatchedDate >= '2024-01-01'
+       GROUP BY DATE_TRUNC('month', CustomerInvoice.dispatchedDate)
+   )
+   SELECT Month, TotalSales 
+   FROM monthly 
+   ORDER BY Month
+   ```
+   
+   Pattern D - Simple Filter (no aggregation needed):
+   ```sql
+   SELECT 
+       ViewCustomer.name AS CustomerName,
+       CustomerInvoice.dispatchedvalue AS InvoiceValue
+   FROM CustomerInvoice 
+   CROSS JOIN ViewCustomer
+   WHERE DATE_TRUNC('month', CustomerInvoice.dispatchedDate) = '2024-09-01'
+   ORDER BY InvoiceValue DESC
+   LIMIT 10
+   ```
+
+{sql_examples}
+
+{previous_results}
+
+RESPONSE FORMAT:
+Return ONLY valid JSON: {{"sql": "YOUR_SQL_QUERY_HERE"}}
+
+CRITICAL CHECKLIST FOR ALL QUERIES:
+
+✅ **Aggregation**: Use WITH clause + MEASURE() + GROUP BY inside WITH
+✅ **Joins**: CROSS JOIN only (no INNER/LEFT/RIGHT/FULL)
+✅ **No ON clause**: Never use ON with joins
+✅ **No WHERE join conditions**: No table1.id = table2.fk in WHERE
+✅ **MEASURE location**: Inside WITH clause only (not outside)
+✅ **GROUP BY location**: Inside WITH clause only (not outside)
+✅ **Aliases**: Assign to all WITH clause columns, reference in outer SELECT
+✅ **No forbidden functions**: TO_CHAR, EXTRACT, COALESCE, GET_DATE
+✅ **No SELECT ***: Always specify columns explicitly
+✅ **Date fields**: dispatchedDate for CustomerInvoice, datetime for Order
+
+Example for "top 3 SKUs for September" (CORRECT WITH AGGREGATION):
+```sql
+WITH aggregated AS (
+    SELECT 
+        CustomerInvoiceDetail.skuName,
+        MEASURE(CustomerInvoiceDetail.skuAmount) AS TotalAmount
+    FROM CustomerInvoice 
+    CROSS JOIN CustomerInvoiceDetail
+    WHERE DATE_TRUNC('month', CustomerInvoice.dispatchedDate) = '2024-09-01'
+    GROUP BY CustomerInvoiceDetail.skuName
+)
+SELECT skuName, TotalAmount 
+FROM aggregated 
+ORDER BY TotalAmount DESC 
+LIMIT 3
+```"""
     
-    def _generate_simplified_sql(self, question: str, original_sql: str) -> str:
-        """
-        Generate a simplified version of complex SQL for basic aggregation queries.
-        """
-        question_lower = question.lower()
+    def _build_examples_context(self, similar_sqls: Optional[List[Dict]], strategy: str) -> str:
+        """Build SQL examples context based on strategy."""
+        if not similar_sqls or strategy == "schema_based":
+            return "No similar examples available. Generate based on schema and Cube.js best practices."
         
-        # Pattern 1: Simple average order value for time period
-        if "average order value" in question_lower:
-            if "september" in question_lower:
-                return '{"sql": "SELECT AVG(Order.value) AS AverageOrderValue FROM Order WHERE DATE_TRUNC(\'month\', Order.datetime) = \'2024-09-01\'"}'
-            elif "this month" in question_lower:
-                return '{"sql": "SELECT AVG(Order.value) AS AverageOrderValue FROM Order WHERE DATE_TRUNC(\'month\', Order.datetime) = DATE_TRUNC(\'month\', CURRENT_DATE)"}'
-            elif "last month" in question_lower:
-                return '{"sql": "SELECT AVG(Order.value) AS AverageOrderValue FROM Order WHERE DATE_TRUNC(\'month\', Order.datetime) = DATE_TRUNC(\'month\', CURRENT_DATE - INTERVAL \'1 month\')"}'
-            elif "last quarter" in question_lower:
-                return '{"sql": "SELECT AVG(Order.value) AS AverageOrderValue FROM Order WHERE Order.datetime >= DATE_TRUNC(\'quarter\', CURRENT_DATE - INTERVAL \'3 months\') AND Order.datetime < DATE_TRUNC(\'quarter\', CURRENT_DATE)"}'
+        examples_text = f"\nSTRATEGY: {strategy.upper()}\n\nSIMILAR SQL EXAMPLES:\n"
         
-        # Pattern 2: Simple sales totals for time period  
-        if ("total sales" in question_lower or "sales for" in question_lower) and not any(breakdown in question_lower for breakdown in ["by customer", "by user", "customer wise"]):
-            if "this month" in question_lower:
-                return '{"sql": "SELECT SUM(CustomerInvoice.dispatchedvalue) AS TotalSales FROM CustomerInvoice WHERE DATE_TRUNC(\'month\', CustomerInvoice.dispatchedDate) = DATE_TRUNC(\'month\', CURRENT_DATE)"}'
-            elif "last month" in question_lower:
-                return '{"sql": "SELECT SUM(CustomerInvoice.dispatchedvalue) AS TotalSales FROM CustomerInvoice WHERE DATE_TRUNC(\'month\', CustomerInvoice.dispatchedDate) = DATE_TRUNC(\'month\', CURRENT_DATE - INTERVAL \'1 month\')"}'
+        max_examples = 3 if strategy == "exact_match" else 2 if strategy == "high_similarity" else 1
         
-        # Pattern 3: Simple order counts
-        if "total orders" in question_lower or "number of orders" in question_lower:
-            if "this month" in question_lower:
-                return '{"sql": "SELECT COUNT(*) AS TotalOrders FROM Order WHERE DATE_TRUNC(\'month\', Order.datetime) = DATE_TRUNC(\'month\', CURRENT_DATE)"}'
+        for i, sql_data in enumerate(similar_sqls[:max_examples], 1):
+            examples_text += f"\nExample {i} (Similarity: {sql_data.get('similarity', 0):.3f}):\n"
+            examples_text += f"Question: {sql_data.get('question', 'N/A')}\n"
+            examples_text += f"SQL: {sql_data.get('sql', 'N/A')}\n"
         
-        return None
+        return examples_text
     
-    def _parse_sql_response(self, content: str) -> Dict[str, Any]:
-        """Parse the SQL response and return structured result."""
+    def _parse_and_validate_sql(self, content: str, question: str) -> Dict[str, Any]:
+        """Parse LLM response and extract SQL with validation."""
         try:
-            # Clean up the response content
             content = content.strip()
             
-            # Try to parse as JSON first
-            if content.startswith('{') and content.endswith('}'):
-                import json
-                data = json.loads(content)
+            json_match = re.search(r'\{[^{}]*"sql"[^{}]*\}', content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                data = json.loads(json_str)
                 
                 if "sql" in data:
-                    return {
-                        "success": True,
-                        "sql": data["sql"],
-                        "type": "query",
-                        "metadata": {"response_format": "json"}
-                    }
-                elif "error" in data:
+                    sql = data["sql"].strip()
+                    
+                    if sql.upper().startswith(('SELECT', 'WITH')):
+                        return {
+                            "success": True,
+                            "sql": sql,
+                            "query_type": "SELECT",
+                            "explanation": "SQL generated successfully",
+                            "format": "json"
+                        }
+                
+                if "error" in data:
                     return {
                         "success": False,
                         "error": data["error"],
-                        "type": "error_response"
-                    }
-                elif "follow_up" in data:
-                    return {
-                        "success": False,
-                        "error": data["follow_up"],
-                        "type": "follow_up_needed"
+                        "type": "context_insufficient"
                     }
             
-            # If not JSON, try to extract SQL directly
-            if content.upper().strip().startswith(('SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE')):
+            sql_block_match = re.search(r'```(?:sql)?\s*(.*?)\s*```', content, re.DOTALL | re.IGNORECASE)
+            if sql_block_match:
+                sql = sql_block_match.group(1).strip()
+                return {
+                    "success": True,
+                    "sql": sql,
+                    "query_type": "SELECT",
+                    "explanation": "SQL extracted from markdown",
+                    "format": "markdown"
+                }
+            
+            if content.upper().strip().startswith(('SELECT', 'WITH')):
                 return {
                     "success": True,
                     "sql": content,
-                    "type": "query",
-                    "metadata": {"response_format": "raw_sql"}
+                    "query_type": "SELECT",
+                    "explanation": "SQL extracted as raw text",
+                    "format": "raw"
                 }
             
-            # If we can't parse it, return error
             return {
                 "success": False,
-                "error": "Could not parse SQL query from response",
+                "error": "Could not parse SQL from response",
                 "type": "parsing_error",
-                "raw_response": content
+                "raw_response": content[:200]
             }
             
         except Exception as e:
-            logger.error(f"Error parsing SQL response: {e}")
+            logger.error(f"Parse error: {e}")
             return {
                 "success": False,
-                "error": f"Response parsing error: {str(e)}",
-                "type": "parsing_error",
-                "raw_response": content
-            }
-                
-        except Exception as e:
-            logger.error(f"Error parsing SQL response: {e}")
-            return {
-                "success": False,
-                "error": f"Response parsing error: {str(e)}",
-                "type": "parsing_error",
-                "raw_response": content
+                "error": f"Parsing error: {str(e)}",
+                "type": "parsing_error"
             }
     
-    def _get_adaptive_temperature_llm(self, similar_sqls: List[Dict], generation_strategy: str):
-        """
-        Create LLM instance with adaptive temperature based on similarity scores and strategy.
+    def _validate_cube_js_compliance(self, sql: str) -> str:
+        """Validate and fix Cube.js compliance issues based on official guidelines."""
+        try:
+            sql_upper = sql.upper()
+            
+            # Fix 1: Replace INNER/LEFT/RIGHT/FULL JOIN with CROSS JOIN
+            join_keywords = ['INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN', 'LEFT OUTER JOIN', 'RIGHT OUTER JOIN']
+            for keyword in join_keywords:
+                if keyword in sql_upper:
+                    logger.warning(f"🔧 FIX: Replaced {keyword} with CROSS JOIN")
+                    sql = re.sub(
+                        rf'{keyword}',
+                        'CROSS JOIN',
+                        sql,
+                        flags=re.IGNORECASE
+                    )
+            
+            # Fix 2: Remove JOIN...ON clauses (convert to CROSS JOIN without condition)
+            if re.search(r'JOIN\s+\w+\s+ON\s+', sql, re.IGNORECASE):
+                logger.warning("🔧 FIX: Removing ON clause from JOIN (Cube.js doesn't use ON)")
+                sql = re.sub(
+                    r'(CROSS\s+)?JOIN\s+(\w+)\s+ON\s+[^\n]+',
+                    r'CROSS JOIN \2',
+                    sql,
+                    flags=re.IGNORECASE
+                )
+            
+            # Fix 3: Remove WHERE join conditions (e.g., WHERE table1.id = table2.fk)
+            # This is tricky - we need to identify join conditions vs filter conditions
+            # Join conditions typically involve .id = .something_id pattern
+            join_condition_pattern = r'AND\s+\w+\.\w*id\s*=\s*\w+\.\w+|WHERE\s+\w+\.\w*id\s*=\s*\w+\.\w+\s+AND'
+            if re.search(join_condition_pattern, sql, re.IGNORECASE):
+                logger.warning("🔧 FIX: Removing join conditions from WHERE clause (Cube.js handles relationships)")
+                # Remove patterns like: WHERE table1.id = table2.fk AND
+                sql = re.sub(
+                    r'WHERE\s+\w+\.\w*id\s*=\s*\w+\.\w+\s+AND\s+',
+                    'WHERE ',
+                    sql,
+                    flags=re.IGNORECASE
+                )
+                # Remove patterns like: AND table1.id = table2.fk
+                sql = re.sub(
+                    r'\s+AND\s+\w+\.\w*id\s*=\s*\w+\.\w+',
+                    '',
+                    sql,
+                    flags=re.IGNORECASE
+                )
+            
+            # Fix 4: Check if MEASURE() is outside WITH clause (should be inside)
+            if 'MEASURE(' in sql_upper:
+                # Check if MEASURE is in outer SELECT (not in WITH clause)
+                if not re.search(r'WITH\s+\w+\s+AS\s*\([^)]*MEASURE\(', sql, re.IGNORECASE | re.DOTALL):
+                    logger.warning("⚠️ WARNING: MEASURE() found outside WITH clause - should be inside WITH")
+            
+            # Fix 5: Check if GROUP BY is outside WITH clause
+            if 'GROUP BY' in sql_upper and 'WITH' in sql_upper:
+                # GROUP BY should be inside WITH clause
+                # This is hard to fix automatically, so just warn
+                if not re.search(r'WITH\s+\w+\s+AS\s*\([^)]*GROUP\s+BY', sql, re.IGNORECASE | re.DOTALL):
+                    logger.warning("⚠️ WARNING: GROUP BY found outside WITH clause - should be inside WITH")
+            
+            # Fix 6: Replace SUM/AVG/COUNT outside WITH with MEASURE inside WITH
+            # Only log warning - complex to fix automatically
+            if re.search(r'SELECT.*?(SUM|AVG|COUNT)\s*\(', sql, re.IGNORECASE) and 'WITH' not in sql_upper:
+                logger.warning("⚠️ WARNING: Using SUM/AVG/COUNT without WITH clause - should use WITH + MEASURE()")
+            
+            # Fix 7: Double SELECT statement
+            if 'SELECTSELECT' in sql_upper:
+                logger.warning("🔧 FIX: Removed double SELECT statement")
+                sql = re.sub(r'SELECT\s*SELECT', 'SELECT', sql, flags=re.IGNORECASE)
+            
+            return sql
+            
+        except Exception as e:
+            logger.error(f"Validation error: {e}")
+            return sql
+    
+    def _determine_generation_strategy(self, question: str, similar_sqls: Optional[List[Dict]]) -> str:
+        """Determine SQL generation strategy based on similarity scores."""
+        if not similar_sqls or len(similar_sqls) == 0:
+            return "schema_based"
         
-        Temperature Strategy:
-        - High similarity (>0.85): Low temperature (0.05) - stick close to proven patterns
-        - Medium similarity (0.7-0.85): Medium temperature (0.15) - balanced creativity  
-        - Low similarity (<0.7): High temperature (0.3-0.4) - more creative and exploratory
-        - Schema-based: Highest temperature (0.4) - maximum creativity for novel queries
+        best_similarity = similar_sqls[0].get('similarity', 0.0)
+        
+        if best_similarity > 0.95:
+            return "exact_match"
+        elif best_similarity > 0.80:
+            return "high_similarity"
+        elif best_similarity > 0.65:
+            return "hybrid"
+        else:
+            return "schema_based"
+    
+    def _get_adaptive_llm(self, similar_sqls: Optional[List[Dict]], strategy: str):
+        """
+        Create LLM with adaptive temperature based on strategy and relevance.
+        Enhanced with 5-level temperature strategy considering both similarity and relevance.
+        Integrated from improved_sql_generator.py for more nuanced temperature control.
         """
         try:
             from langchain_openai import ChatOpenAI
             import os
             
-            # Determine optimal temperature based on similarity and strategy
-            if generation_strategy == 'exact_match':
-                temperature = 0.02  # Very low - almost deterministic for exact matches
-                temp_reason = "exact match - deterministic"
-            elif generation_strategy == 'high_similarity':
-                temperature = 0.05  # Low - stay close to proven patterns
-                temp_reason = "high similarity - follow patterns"
-            elif generation_strategy == 'hybrid':
-                # Check actual similarity score for fine-tuning
-                if similar_sqls and len(similar_sqls) > 0:
-                    similarity = similar_sqls[0].get('similarity', 0.7)
-                    if similarity > 0.75:
-                        temperature = 0.15  # Medium-low
-                        temp_reason = f"hybrid with good similarity ({similarity:.3f}) - moderate creativity"
-                    else:
-                        temperature = 0.25  # Medium-high  
-                        temp_reason = f"hybrid with lower similarity ({similarity:.3f}) - increased creativity"
-                else:
-                    temperature = 0.2  # Default medium
-                    temp_reason = "hybrid - balanced approach"
-            else:  # schema_based
-                # Low similarity - need maximum creativity
-                if similar_sqls and len(similar_sqls) > 0:
-                    similarity = similar_sqls[0].get('similarity', 0.5)
-                    if similarity < 0.5:
-                        temperature = 0.4  # High creativity for very low similarity
-                        temp_reason = f"very low similarity ({similarity:.3f}) - maximum creativity"
-                    elif similarity < 0.65:
-                        temperature = 0.3  # High creativity for low similarity
-                        temp_reason = f"low similarity ({similarity:.3f}) - high creativity"
-                    else:
-                        temperature = 0.25  # Medium-high for borderline cases
-                        temp_reason = f"borderline similarity ({similarity:.3f}) - enhanced creativity"
-                else:
-                    temperature = 0.35  # High creativity when no context
-                    temp_reason = "no similar context - high creativity"
+            # Calculate both similarity and relevance ratio
+            similarity = 0.0
+            relevance_ratio = 0.0
             
-            logger.info(f"🌡️  ADAPTIVE TEMPERATURE: {temperature} ({temp_reason})")
+            if similar_sqls and len(similar_sqls) > 0:
+                similarity = similar_sqls[0].get('similarity', 0.0)
+                
+                # Calculate relevance ratio (relevant examples / total examples)
+                relevant_count = sum(1 for sql in similar_sqls[:5] if sql.get('similarity', 0) > 0.7)
+                total_count = min(len(similar_sqls), 5)
+                relevance_ratio = relevant_count / total_count if total_count > 0 else 0
             
-            # Create new LLM instance with adaptive temperature
-            adaptive_llm = ChatOpenAI(
+            # 5-level temperature strategy with relevance consideration
+            if similarity > 0.95:
+                # Exact match: use very low temperature for direct copying
+                temp = 0.05
+                reason = "exact match (>0.95) - use example directly"
+            elif similarity > 0.85 and relevance_ratio > 0.7:
+                # Very high similarity + high relevance: conservative but not too rigid
+                temp = 0.1
+                reason = "very high similarity + high relevance"
+            elif similarity > 0.75 and relevance_ratio > 0.5:
+                # Good similarity + decent relevance: moderate-conservative
+                temp = 0.15
+                reason = "good similarity + decent relevance"
+            elif similarity > 0.65 or relevance_ratio > 0.3:
+                # Medium similarity OR some relevance: moderate
+                temp = 0.2
+                reason = "medium similarity or some relevance"
+            elif similarity > 0.5:
+                # Low similarity: allow more creativity
+                temp = 0.3
+                reason = "low similarity"
+            else:
+                # Very low similarity: maximum creativity
+                temp = 0.4
+                reason = "very low similarity"
+            
+            logger.info(f"Adaptive temp: {temp} ({reason}, sim: {similarity:.3f}, rel_ratio: {relevance_ratio:.2f})")
+            
+            return ChatOpenAI(
                 model="gpt-4o",
                 api_key=os.getenv("OPENAI_API_KEY"),
-                temperature=temperature,
+                temperature=temp,
                 max_tokens=2000
             )
             
-            return adaptive_llm
-            
         except Exception as e:
-            logger.warning(f"Failed to create adaptive LLM: {e}, using original LLM")
+            logger.warning(f"Failed to create adaptive LLM: {e}, using original")
             return self.llm
     
     def process(self, state: BaseAgentState) -> DBAgentState:
-        """
-        Process method required by BaseAgent interface.
-        Generates a single SQL query for the given question.
-        """
+        """Process method required by BaseAgent interface."""
         db_state = DBAgentState(**state)
         
         try:
             similar_sqls = state.get("retrieved_sql_context", [])
-            previous_results = state.get("previous_step_results", None)
+            # Check for intermediate_results from multi-step workflow
+            previous_results = state.get("previous_step_results", None) or state.get("intermediate_results", None)
+            original_query = state.get("original_query", state["query"])
+            
+            # Log if we have previous results
+            if previous_results:
+                logger.info(f"🔗 SQL Generator received {len(previous_results)} previous step(s)")
             
             result = self.generate_sql(
                 question=state["query"],
                 similar_sqls=similar_sqls,
-                previous_results=previous_results
+                previous_results=previous_results,
+                original_query=original_query
             )
             
             if result["success"]:
                 db_state["query_type"] = result["query_type"]
                 db_state["sql_query"] = result["sql"]
                 db_state["status"] = "completed"
-                db_state["success_message"] = "Generated SQL query successfully"
+                db_state["success_message"] = "SQL generated successfully"
                 db_state["result"] = result
                 
-                # Use clean logging
                 try:
                     from clean_logging import SQLLogger
                     SQLLogger.generation_complete(result['sql'], result['query_type'])
                 except ImportError:
-                    logger.info(f"📝 SQL Generated ({result['query_type']}): {len(result['sql'])} chars")
-                
+                    logger.info(f"SQL Generated ({result['query_type']}): {len(result['sql'])} chars)")
             else:
                 db_state["error_message"] = result["error"]
                 db_state["status"] = "failed"
                 db_state["result"] = result
                 
-                logger.error(f"🔧 SQLGeneratorAgent - Generation Failed:")
+                logger.error(f"SQL generation failed:")
                 logger.error(f"Question: {state['query']}")
                 logger.error(f"Error: {result['error']}")
-                logger.error(f"Error Type: {result.get('type', 'unknown')}")
                 
         except Exception as e:
             db_state["error_message"] = f"SQL generator error: {str(e)}"

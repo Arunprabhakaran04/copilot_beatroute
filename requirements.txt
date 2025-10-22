@@ -8,3 +8,8 @@ pandas
 plotly
 kaleido
 tabulate
+redis
+fastapi
+uvicorn[standard]
+websockets
+loguru

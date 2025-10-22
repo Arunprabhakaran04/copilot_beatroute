@@ -86,7 +86,6 @@ class DBQueryAgent(BaseAgent):
         start_time = time.time()
         
         try:
-            # Use clean logging
             try:
                 from clean_logging import AgentLogger
                 AgentLogger.query_start("db_query", state['query'])
@@ -169,8 +168,18 @@ class DBQueryAgent(BaseAgent):
         try:
             logger.info("Processing single-step query")
             
-            # Prepare state for SQL generator
-            generator_state = BaseAgentState(**state)
+            # Check if this is part of a multi-step workflow (has intermediate_results from previous steps)
+            intermediate_results = state.get("intermediate_results", {})
+            if intermediate_results:
+                logger.info(f" Single-step query has {len(intermediate_results)} previous step(s) - will pass to generator")
+                # Explicitly add to generator state to ensure it's passed through
+                generator_state = BaseAgentState(**state)
+                generator_state["previous_step_results"] = intermediate_results
+                logger.info(f"   Added intermediate_results as previous_step_results to generator state")
+            else:
+                # Prepare state for SQL generator
+                generator_state = BaseAgentState(**state)
+            
             result_state = self.sql_generator.process(generator_state)
             
             if result_state["status"] == "completed":
@@ -213,7 +222,6 @@ class DBQueryAgent(BaseAgent):
                 logger.info(f"Query Type: {result_state['query_type']}")
                 logger.info(f"="*80)
                 
-                # Also print to console for user visibility with database results
                 print(f"\n SINGLE-STEP QUERY EXECUTION:")
                 print(f"Query: {state['query']}")
                 print(f"Generated SQL: {result_state['sql_query']}")
@@ -227,7 +235,6 @@ class DBQueryAgent(BaseAgent):
                     print(f"Columns: {results_summary['columns']}")
                     print(f"Execution Time: {results_summary['execution_time']}")
                     
-                    # Show formatted results (first few rows)
                     if execution_result.get("formatted_output"):
                         print(f"\n SAMPLE RESULTS:")
                         print(execution_result["formatted_output"])
@@ -273,7 +280,7 @@ class DBQueryAgent(BaseAgent):
                 
                 logger.info(f" Retrieved {len(step_specific_sqls)} SQL examples for step {step_idx}")
                 if step_specific_sqls:
-                    for i, sql_example in enumerate(step_specific_sqls[:3], 1):  # Log first 3
+                    for i, sql_example in enumerate(step_specific_sqls[:3], 1): 
                         if isinstance(sql_example, dict) and "question" in sql_example:
                             logger.info(f"  Example {i}: {sql_example['question'][:60]}...")
                         else:
@@ -356,7 +363,6 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"SQL: {final_sql}")
             logger.info(f"="*80)
             
-            # Enhanced console output with retrieval information and database results
             print(f"\n MULTI-STEP QUERY EXECUTION SUMMARY:")
             print(f"Query: {state['query']}")
             print(f"Steps Executed: {step_count}")
@@ -379,10 +385,8 @@ class DBQueryAgent(BaseAgent):
             print(f"\n Final SQL Query:")
             print(f"{final_sql}")
             
-            # Get final step results for database data
             final_step_results = executed_steps[-1] if executed_steps else {}
             
-            # Show final results summary
             if final_step_results.get("query_results"):
                 final_summary = final_step_results["query_results"]["summary"]
                 print(f"\n FINAL QUERY RESULTS:")
@@ -390,7 +394,6 @@ class DBQueryAgent(BaseAgent):
                 print(f"Columns: {final_summary['columns']}")
                 print(f"Execution Time: {final_summary['execution_time']}")
                 
-                # Show sample of final results
                 if final_step_results.get("formatted_output"):
                     print(f"\nSAMPLE RESULTS:")
                     print(final_step_results["formatted_output"])

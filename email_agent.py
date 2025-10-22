@@ -36,10 +36,57 @@ class EmailAgent(BaseAgent):
         try:
             all_emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', state["query"])
             
+            # Check for intermediate results from previous steps (e.g., meeting scheduling)
+            previous_context = ""
+            intermediate_results = state.get("intermediate_results", {})
+            if intermediate_results:
+                logger.info(f"📧 Email agent found {len(intermediate_results)} previous step(s)")
+                previous_context = self._format_intermediate_results(intermediate_results)
+            
+            # Check if query references previous data/query results
+            cached_data_context = ""
+            query_lower = state["query"].lower()
+            data_reference_phrases = [
+                "that data", "this data", "the data", "those results", 
+                "previous query", "database results", "query results",
+                "send the results", "send data", "send that", "send this",
+                "regarding the meet", "about the meeting", "for the meeting"
+            ]
+            
+            references_data = any(phrase in query_lower for phrase in data_reference_phrases)
+            
+            if references_data and state.get("session_id") and state.get("user_id"):
+                try:
+                    # Import the standalone function for getting cached results
+                    import sys
+                    import os
+                    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                    from redis_memory_manager import get_last_db_query_result
+                    
+                    # Get the last database query result
+                    cached_result = get_last_db_query_result(
+                        state["session_id"], 
+                        state.get("user_id")
+                    )
+                    
+                    if cached_result:
+                        # Format the cached data for email
+                        cached_data_context = self._format_cached_data_for_email(cached_result)
+                        logger.info(f"Retrieved cached data for email: {len(cached_data_context)} chars")
+                    else:
+                        logger.warning("No cached database results found for this session")
+                        
+                except Exception as cache_error:
+                    logger.error(f"Error retrieving cached data: {str(cache_error)}")
+            
             content_prompt = ChatPromptTemplate.from_template("""
             You are an email content and recipient parser. Analyze the user's request and extract email details.
             
             User Request: {query}
+            
+            {previous_context}
+            
+            {cached_data}
             
             Respond in this EXACT format:
             TO: [primary recipient email addresses, comma-separated]
@@ -58,10 +105,16 @@ class EmailAgent(BaseAgent):
             - Keep the email professional, relevant, and concise
             - Make the subject line clear and specific
             - Structure the content with proper paragraphs
+            - If previous context is provided (meeting details, etc.), INCLUDE the relevant information in the email body
+            - If cached data is provided, INCLUDE IT in the email body in a clear, formatted way
             - End with appropriate closing
             """)
             
-            messages = content_prompt.format_messages(query=state["query"])
+            messages = content_prompt.format_messages(
+                query=state["query"],
+                previous_context=previous_context if previous_context else "No previous context available.",
+                cached_data=cached_data_context if cached_data_context else "No cached data available."
+            )
             response = self.llm.invoke(messages)
             content = response.content.strip()
             
@@ -193,3 +246,191 @@ class EmailAgent(BaseAgent):
         print(f"Content: {content}")
         print("Note: SMTP credentials not configured. Email was simulated.")
         return True
+    
+    def _format_cached_data_for_email(self, cached_result: dict) -> str:
+        """
+        Format cached database query results for inclusion in email content.
+        
+        Args:
+            cached_result: Dict containing query results, may include DataFrames
+            
+        Returns:
+            Formatted string representation of the data
+        """
+        try:
+            # Look for query results in various field names
+            result_fields = ["query_results", "query_data", "data", "rows_returned"]
+            query_data = None
+            
+            for field in result_fields:
+                if field in cached_result:
+                    query_data = cached_result[field]
+                    break
+            
+            if query_data is None:
+                return "Cached Data:\nNo query results found in cached data."
+            
+            # Check if it's a serialized DataFrame (from our _serialize_result method)
+            if isinstance(query_data, dict) and query_data.get("_type") == "dataframe":
+                return self._format_dataframe_dict(query_data)
+            
+            # Handle pandas DataFrame directly (in case it wasn't serialized)
+            try:
+                import pandas as pd
+                if isinstance(query_data, pd.DataFrame):
+                    return self._format_dataframe_direct(query_data)
+            except ImportError:
+                pass
+            
+            # Handle list of dicts
+            if isinstance(query_data, list) and query_data and isinstance(query_data[0], dict):
+                return self._format_list_of_dicts(query_data)
+            
+            # Fallback to string representation
+            return f"Cached Data:\n{str(query_data)}"
+            
+        except Exception as e:
+            logger.error(f"Error formatting cached data: {str(e)}")
+            return f"Cached Data: (Error formatting data: {str(e)})"
+    
+    def _format_dataframe_dict(self, df_dict: dict) -> str:
+        """Format a serialized DataFrame dictionary into a readable table."""
+        try:
+            columns = df_dict.get("columns", [])
+            data = df_dict.get("data", [])
+            
+            if not columns or not data:
+                return "Cached Data:\nEmpty dataset"
+            
+            # Create table header
+            header = " | ".join(columns)
+            separator = "-+-".join(["-" * len(col) for col in columns])
+            
+            # Create table rows
+            rows = []
+            for row in data:
+                formatted_row = " | ".join([str(row.get(col, "")) for col in columns])
+                rows.append(formatted_row)
+            
+            table = f"\nCached Database Query Results ({len(data)} rows):\n\n{header}\n{separator}\n" + "\n".join(rows)
+            return table
+            
+        except Exception as e:
+            logger.error(f"Error formatting DataFrame dict: {str(e)}")
+            return f"Cached Data: (Error formatting: {str(e)})"
+    
+    def _format_dataframe_direct(self, df) -> str:
+        """Format a pandas DataFrame directly into a readable table."""
+        try:
+            # Convert to string with nice formatting
+            table_str = df.to_string(index=False)
+            return f"\nCached Database Query Results ({len(df)} rows):\n\n{table_str}"
+        except Exception as e:
+            logger.error(f"Error formatting DataFrame: {str(e)}")
+            return f"Cached Data: (Error formatting: {str(e)})"
+    
+    def _format_list_of_dicts(self, data_list: list) -> str:
+        """Format a list of dictionaries into a readable table."""
+        try:
+            if not data_list:
+                return "Cached Data:\nEmpty dataset"
+            
+            # Get column names from first dict
+            columns = list(data_list[0].keys())
+            
+            # Create table header
+            header = " | ".join(columns)
+            separator = "-+-".join(["-" * len(col) for col in columns])
+            
+            # Create table rows
+            rows = []
+            for item in data_list:
+                formatted_row = " | ".join([str(item.get(col, "")) for col in columns])
+                rows.append(formatted_row)
+            
+            table = f"\nCached Database Query Results ({len(data_list)} rows):\n\n{header}\n{separator}\n" + "\n".join(rows)
+            return table
+            
+        except Exception as e:
+            logger.error(f"Error formatting list of dicts: {str(e)}")
+            return f"Cached Data: (Error formatting: {str(e)})"
+    
+    def _format_intermediate_results(self, intermediate_results: dict) -> str:
+        """
+        Format intermediate results from previous workflow steps for email context.
+        Extracts meeting details, query results, or other relevant context.
+        
+        Args:
+            intermediate_results: Dict mapping step keys to their results
+            
+        Returns:
+            Formatted string with context from previous steps
+        """
+        try:
+            context_parts = []
+            
+            for step_key, step_data in intermediate_results.items():
+                if not isinstance(step_data, dict):
+                    continue
+                
+                # Check for meeting-related data
+                if step_data.get("agent_type") == "meeting" or "meeting" in step_key.lower():
+                    meeting_info = []
+                    meeting_info.append("\n=== Meeting Details ===")
+                    
+                    # Extract meeting participant
+                    if step_data.get("user_name"):
+                        meeting_info.append(f"Participant: {step_data['user_name']}")
+                    elif step_data.get("user_id"):
+                        meeting_info.append(f"Participant: User {step_data['user_id']}")
+                    
+                    # Extract meeting date/time
+                    if step_data.get("meeting_date"):
+                        meeting_info.append(f"Date: {step_data['meeting_date']}")
+                    elif step_data.get("scheduled_date"):
+                        meeting_info.append(f"Date: {step_data['scheduled_date']}")
+                    
+                    # Extract meeting topic/agenda
+                    if step_data.get("meeting_topic"):
+                        meeting_info.append(f"Topic: {step_data['meeting_topic']}")
+                    elif step_data.get("agenda"):
+                        meeting_info.append(f"Agenda: {step_data['agenda']}")
+                    elif step_data.get("description"):
+                        meeting_info.append(f"Description: {step_data['description']}")
+                    
+                    # Extract meeting location if available
+                    if step_data.get("location"):
+                        meeting_info.append(f"Location: {step_data['location']}")
+                    
+                    # Extract any success message or result details
+                    if step_data.get("success_message"):
+                        meeting_info.append(f"Status: {step_data['success_message']}")
+                    
+                    if len(meeting_info) > 1:  # More than just the header
+                        context_parts.append("\n".join(meeting_info))
+                
+                # Check for database query results
+                elif step_data.get("agent_type") == "db_query" or "query" in step_key.lower():
+                    if step_data.get("query_data") or step_data.get("query_results"):
+                        context_parts.append("\n=== Previous Query Results Available ===")
+                        context_parts.append("(Database results from previous step)")
+                
+                # Check for campaign or other agent results
+                elif step_data.get("result"):
+                    result = step_data["result"]
+                    if isinstance(result, dict):
+                        result_info = [f"\n=== {step_data.get('agent_type', 'Previous Step').title()} Results ==="]
+                        for key, value in result.items():
+                            if key not in ["query_data", "raw_data"]:  # Skip large data fields
+                                result_info.append(f"{key}: {value}")
+                        if len(result_info) > 1:
+                            context_parts.append("\n".join(result_info))
+            
+            if context_parts:
+                return "\n\n".join(context_parts)
+            else:
+                return ""
+                
+        except Exception as e:
+            logger.error(f"Error formatting intermediate results: {str(e)}")
+            return ""

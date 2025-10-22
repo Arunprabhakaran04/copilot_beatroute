@@ -19,7 +19,7 @@ from meeting_scheduler_agent import MeetingSchedulerAgent
 from sql_retriever_agent import SQLRetrieverAgent
 from summary_agent import SummaryAgent
 from visualization_agent import VisualizationAgent
-from memory_manager import ClassificationValidator, EnhancedMemoryManager
+from redis_memory_manager import RedisMemoryManager, RedisClassificationValidator, initialize_session, get_last_db_query_result, DEFAULT_SESSION_ID, DEFAULT_USER_ID
 from token_tracker import get_token_tracker, track_llm_call
 from improved_sql_generator import ImprovedSQLGenerator
 from temp_files.improved_multi_step_handler import create_improved_decomposition
@@ -158,30 +158,34 @@ class CentralOrchestrator:
             ]
         }
         
-        self.classification_validator = ClassificationValidator()
+        self.memory = RedisMemoryManager(self.llm, max_history=3)
+        self.classification_validator = RedisClassificationValidator(self.memory.session_manager)
         self.enhanced_multi_step_handler = EnhancedMultiStepHandler(self.db_llm)
         self.enhanced_ultra_analyzer = EnhancedUltraAnalyzer(self.db_llm)
         self.agent_aware_decomposer = AgentAwareDecomposer(self.db_llm)
         self.graph = self._build_orchestrator_graph()
-        self.memory = EnhancedMemoryManager(self.llm, max_history=3)
     
-    def clear_session_memory(self):
+    def clear_session_memory(self, session_id: str = DEFAULT_SESSION_ID, user_id: str = DEFAULT_USER_ID):
         """Clear memory and reset session state"""
-        self.memory.clear_memory()
-        self.classification_validator = ClassificationValidator()  # Reset validation history
+        self.memory.clear_memory(session_id, user_id)
         
-        # Clear token tracking session
+        session_manager = self.memory.session_manager
+        session_manager.set_data(user_id, session_id, "classification_history", [])
+        session_manager.set_data(user_id, session_id, "error_patterns", {})
+        
         token_tracker = get_token_tracker()
         token_tracker.clear_session()
         
-        logger.info("Session memory, validation history, and token tracking cleared")
+        logger.info(f"Session memory, validation history, and token tracking cleared for session {session_id}")
     
-    def get_session_stats(self) -> Dict[str, Any]:
+    def get_session_stats(self, session_id: str = DEFAULT_SESSION_ID, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
         """Get current session statistics"""
+        history = self.memory.session_manager.get_data(user_id, session_id, "conversation_history") or []
+        
         return {
-            "memory_entries": len(self.memory.history),
-            "classification_accuracy": self.classification_validator.get_classification_accuracy(),
-            "memory_summary": self.memory.get_memory_summary()
+            "memory_entries": len(history),
+            "classification_accuracy": self.classification_validator.get_classification_accuracy(user_id, session_id),
+            "memory_summary": self.memory.get_memory_summary(session_id, user_id)
         }
     
     def _build_orchestrator_graph(self) -> StateGraph:
@@ -225,9 +229,68 @@ class CentralOrchestrator:
                 state["intermediate_results"] = {}
                 state["current_step"] = 1
                 
+                # ============================================================
+                # EARLY CACHE CHECK: Before decomposition or LLM analysis
+                # ============================================================
+                try:
+                    session_id = state.get("session_id", "default_session")
+                    user_id = state.get("user_id", "default_user")
+                    
+                    # Check if we have cached result for this exact query
+                    cached_result = self.memory.get_cached_result_for_query(
+                        session_id=session_id,
+                        query=state["query"],
+                        user_id=user_id
+                    )
+                    
+                    if cached_result:
+                        logger.info(f"🎯 CACHE HIT: Found cached result for query before orchestration")
+                        logger.info(f"⚡ Skipping decomposition and agent execution - using cached data")
+                        
+                        # Extract the actual result from cache structure
+                        # cached_result has: {"final_result": {...}, "steps": [...], "is_multi_step": bool}
+                        actual_result = cached_result.get("final_result", {})
+                        is_multi_step = cached_result.get("is_multi_step", False)
+                        
+                        # Build successful state from cache
+                        state["status"] = "completed"
+                        state["is_multi_step"] = is_multi_step
+                        state["result"] = actual_result  # Use the final_result which has formatted_output
+                        state["agent_type"] = "db_query" if not is_multi_step else "multi_step"
+                        state["success_message"] = "Retrieved result from cache (query already executed previously)"
+                        state["classification_confidence"] = 1.0
+                        
+                        # If multi-step, also include completed_steps
+                        if is_multi_step and "steps" in cached_result:
+                            state["completed_steps"] = cached_result["steps"]
+                        
+                        # Log cache hit
+                        logger.info(f"✅ Cache hit saved ~3000 tokens and 2-5 seconds of processing")
+                        
+                        return state
+                    else:
+                        logger.debug(f"💾 No cache hit - proceeding with normal orchestration")
+                        
+                except Exception as cache_err:
+                    logger.warning(f"Early cache check failed: {cache_err}. Continuing normally.")
+                
+                # ============================================================
+                # NORMAL FLOW: Decomposition and Analysis
+                # ============================================================
+                
                 # Use NEW Agent-Aware Decomposer with full knowledge of agent capabilities
                 try:
-                    analysis_result = self.agent_aware_decomposer.analyze_and_decompose(state["query"])
+                    # Pass conversation history for follow-up query optimization
+                    recent_history = self.memory.get_recent(
+                        session_id=state.get("session_id", "default_session"),
+                        n=5,
+                        user_id=state.get("user_id", "default_user")
+                    )
+                    
+                    analysis_result = self.agent_aware_decomposer.analyze_and_decompose(
+                        state["query"],
+                        conversation_history=recent_history
+                    )
                     
                     if analysis_result.get("is_multi_step", False):
                         state["is_multi_step"] = True
@@ -1176,6 +1239,56 @@ class CentralOrchestrator:
             if agent_type not in self.agents:
                 return self._handle_routing_error(state, f"Unknown agent type: {agent_type}")
             
+            # CACHE CHECK: Before executing agent, check if we already have a cached result
+            # This prevents redundant agent execution for follow-up queries
+            try:
+                session_id = state.get("session_id", DEFAULT_SESSION_ID)
+                user_id = state.get("user_id", DEFAULT_USER_ID)
+                current_query = state.get("query", "")
+                
+                # Compute signature for current query/task
+                cached_result = self.memory.get_cached_result_for_query(
+                    session_id=session_id,
+                    query=current_query,
+                    user_id=user_id,
+                    params={"agent_type": agent_type}  # Include agent type in signature
+                )
+                
+                if cached_result:
+                    logger.info(f"✅ CACHE HIT: Skipping {agent_type} agent - using cached result")
+                    
+                    # Build a successful state using cached result
+                    cached_state = state.copy()
+                    cached_state["status"] = "completed"
+                    cached_state["result"] = cached_result
+                    cached_state["success_message"] = f"Retrieved cached result for {agent_type} agent"
+                    
+                    # Store the cached result for multi-step processing
+                    step_key = str(state["current_step"])
+                    cached_state["intermediate_results"][step_key] = cached_result
+                    
+                    # Record completed step
+                    completed_step = {
+                        "step": state["current_step"],
+                        "agent_type": agent_type,
+                        "task": current_query,
+                        "result": cached_result,
+                        "success_message": "Used cached result (no re-execution)",
+                        "cached": True
+                    }
+                    cached_state["completed_steps"].append(completed_step)
+                    cached_state["current_step"] = state["current_step"] + 1
+                    cached_state["status"] = "step_completed"
+                    
+                    OrchestrationLogger.step_complete(state['current_step'], f"{agent_type} (cached)")
+                    
+                    return cached_state
+                else:
+                    logger.debug(f"Cache miss for {agent_type} agent - will execute normally")
+                    
+            except Exception as cache_error:
+                logger.warning(f"Cache lookup failed: {cache_error}. Proceeding with normal execution.")
+            
             logger.info(f"Executing step {state['current_step']}: {agent_type} agent")
             agent = self.agents[agent_type]
             
@@ -1272,11 +1385,14 @@ class CentralOrchestrator:
             
             result_state = agent.process(state)
             
-            self.classification_validator.validate_classification(
-                state["query"], 
-                state["agent_type"], 
-                result_state["status"]
-            )
+            if "session_id" in state and "user_id" in state:
+                self.classification_validator.validate_classification(
+                    state["user_id"],
+                    state["session_id"],
+                    state["query"], 
+                    state["agent_type"], 
+                    result_state["status"]
+                )
             
             return result_state
         except Exception as e:
@@ -1805,8 +1921,10 @@ class CentralOrchestrator:
         self.classification_keywords[agent_type] = keywords
         print(f"Added new agent: {agent_type}")
     
-    def process_query(self, query: str) -> Dict[str, Any]:
+    def process_query(self, query: str, session_id: str = DEFAULT_SESSION_ID, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
         """Production-grade query processing with comprehensive error handling"""
+        initialize_session(user_id, session_id)
+        
         # Input validation
         if not query or not query.strip():
             return {
@@ -1819,7 +1937,7 @@ class CentralOrchestrator:
         
         # Sanitize query
         query = query.strip()
-        if len(query) > 10000:  # Prevent extremely long queries
+        if len(query) > 10000:
             return {
                 "success": False,
                 "error": "Query too long (maximum 10,000 characters)",
@@ -1833,15 +1951,27 @@ class CentralOrchestrator:
         try:
             # Memory enrichment with error handling
             try:
-                enriched_query = self.memory.enrich_query(query)
+                enriched_query = self.memory.enrich_query(session_id, query, user_id)
             except Exception as e:
                 logger.warning(f"Memory enrichment failed: {e}. Using original query.")
                 enriched_query = query
 
+            # Retrieve intermediate_results from previous query in this session
+            # This allows agents to access results from the immediately preceding query
+            previous_intermediate_results = {}
+            try:
+                previous_intermediate_results = self.memory.session_manager.get_data(
+                    user_id, session_id, "intermediate_results"
+                ) or {}
+                if previous_intermediate_results:
+                    logger.info(f"📦 Loaded {len(previous_intermediate_results)} intermediate result(s) from previous query")
+            except Exception as e:
+                logger.warning(f"Failed to load previous intermediate_results: {e}")
+
             initial_state = BaseAgentState(
                 query=enriched_query,
                 agent_type="",
-                user_id="",
+                user_id=user_id,
                 status="",
                 error_message="",
                 success_message="",
@@ -1857,7 +1987,9 @@ class CentralOrchestrator:
                 completed_steps=[],
                 current_step=0,
                 is_multi_step=False,
-                intermediate_results={}
+                intermediate_results=previous_intermediate_results,  # Load from previous query
+                # Session management fields
+                session_id=session_id
             )
             
             logger.info(f"PROCESSING QUERY: {query}")
@@ -1898,7 +2030,7 @@ class CentralOrchestrator:
         if result.get("classification_confidence"):
             print(f"Classification Confidence: {result['classification_confidence']:.2f}")
         
-        accuracy = self.classification_validator.get_classification_accuracy()
+        accuracy = self.classification_validator.get_classification_accuracy(user_id, session_id)
         if accuracy > 0:
             print(f"Recent Classification Accuracy: {accuracy:.1%}")
         
@@ -1923,7 +2055,32 @@ class CentralOrchestrator:
                     "final_result": result.get("result", {}),
                     "is_multi_step": result.get("is_multi_step", False)
                 }
-                self.memory.add_entry(query, enriched_query, final_agent_type, final_result)
+                self.memory.add_entry(session_id, query, enriched_query, final_agent_type, final_result, user_id)
+                
+                # Save intermediate_results for next query in session
+                # This allows subsequent queries to access results from this query
+                if result.get("intermediate_results") or result.get("result"):
+                    intermediate_to_save = result.get("intermediate_results", {})
+                    
+                    # If single-step query, add its result to intermediate_results
+                    if not result.get("is_multi_step", False):
+                        step_key = f"step_{result.get('agent_type', 'unknown')}_1"
+                        intermediate_to_save[step_key] = {
+                            "agent_type": result.get("agent_type"),
+                            "result": result.get("result", {}),
+                            "success_message": result.get("success_message", ""),
+                            "query": query
+                        }
+                        # Copy key fields to top level for easier access
+                        for key in ["user_id", "user_name", "meeting_date", "meeting_topic", "query_data"]:
+                            if key in result.get("result", {}):
+                                intermediate_to_save[step_key][key] = result["result"][key]
+                    
+                    self.memory.session_manager.set_data(
+                        user_id, session_id, "intermediate_results", intermediate_to_save
+                    )
+                    logger.info(f"💾 Saved {len(intermediate_to_save)} intermediate result(s) for next query")
+                    
             except Exception as e:
                 logger.warning(f"Failed to add memory entry: {e}")
             
@@ -1953,6 +2110,8 @@ class CentralOrchestrator:
 
 
 def main():
+    import uuid
+    
     try:
         orchestrator = CentralOrchestrator(files_directory="./user_files", schema_file_path="schema")
         
@@ -1961,12 +2120,17 @@ def main():
         print("Please check your OPENAI_API_KEY configuration.")
         return
     
+    session_id = f"cli_{uuid.uuid4().hex[:8]}"
+    user_id = DEFAULT_USER_ID
+    
     print("Multi-Agent Orchestrator System")
     print("=" * 70)
+    print(f"Session ID: {session_id}")
     print("Commands:")
     print("  - 'quit'/'exit' - Exit the system and clear memory")
     print("  - 'clear' - Clear session memory")
     print("  - 'stats' - Show session statistics")
+    print("  - 'new session' - Start a new session")
     print("=" * 70)
     print("Example queries:")
     print("  - 'Show all brands'")
@@ -1987,18 +2151,24 @@ def main():
         query = input("\nEnter your query: ").strip()
         
         if query.lower() in ['quit', 'exit', 'q']:
-            orchestrator.clear_session_memory()
+            orchestrator.clear_session_memory(session_id, user_id)
             print("Session memory cleared. Goodbye!")
             break
         
         if query.lower() == 'clear':
-            orchestrator.clear_session_memory()
+            orchestrator.clear_session_memory(session_id, user_id)
             print("Session memory cleared.")
+            continue
+        
+        if query.lower() == 'new session':
+            session_id = f"cli_{uuid.uuid4().hex[:8]}"
+            print(f"New session started: {session_id}")
             continue
             
         if query.lower() == 'stats':
-            stats = orchestrator.get_session_stats()
+            stats = orchestrator.get_session_stats(session_id, user_id)
             print(f"\nSession Statistics:")
+            print(f"Session ID: {session_id}")
             print(f"Memory Entries: {stats['memory_entries']}")
             print(f"Classification Accuracy: {stats['classification_accuracy']:.1%}")
             print(stats['memory_summary'])
@@ -2007,7 +2177,7 @@ def main():
         if query == '':
             continue
         
-        result = orchestrator.process_query(query)
+        result = orchestrator.process_query(query, session_id, user_id)
         
         if not result["success"]:
             print(f"Status: {result.get('status', 'unknown')}")

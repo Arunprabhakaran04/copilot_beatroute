@@ -28,15 +28,30 @@ class AgentAwareDecomposer:
         self.llm = llm
         self.agent_context = format_agent_context_for_llm()
     
-    def analyze_and_decompose(self, query: str) -> Dict[str, Any]:
+    def analyze_and_decompose(self, query: str, conversation_history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """
         Analyze query with full knowledge of agent capabilities
+        Strategy: Fast heuristics first → LLM analysis if no match
         """
         try:
-            # Quick check: suggest optimal sequence
-            suggested_sequence = get_optimal_agent_sequence(query)
+            # STEP 1: Fast heuristic optimization with conversation history
+            logger.debug(f" Query: {query}")
+            logger.debug(f" History entries: {len(conversation_history) if conversation_history else 0}")
             
-            # Comprehensive LLM analysis with agent context
+            if conversation_history:
+                heuristic_result = self._optimize_with_history(query, conversation_history)
+                if heuristic_result:
+                    logger.info(f" Heuristic match: {heuristic_result.get('reasoning')}")
+                    logger.info(f" Method: {heuristic_result.get('decomposition_method')} (fast, no LLM)")
+                    return heuristic_result
+                else:
+                    logger.debug(f" No heuristic pattern matched, falling back to LLM analysis")
+            else:
+                logger.debug(f" No conversation history available, skipping heuristics")
+            
+            # STEP 2: LLM-based analysis (if heuristics didn't match)
+            logger.debug(f" Using LLM for query decomposition")
+            suggested_sequence = get_optimal_agent_sequence(query)
             analysis = self._agent_aware_llm_analysis(query, suggested_sequence)
             
             return analysis
@@ -44,6 +59,175 @@ class AgentAwareDecomposer:
         except Exception as e:
             logger.error(f"Agent-aware decomposition failed: {e}")
             return self._create_fallback(query, str(e))
+    
+    def _optimize_with_history(self, query: str, history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Fast heuristic patterns for common followup queries
+        Returns optimized decomposition if pattern matched, None otherwise (triggers LLM)
+        
+        Common patterns:
+        1. "send that/this/the [data/list/results] to [email]" → Use cached result + email
+        2. "show me that data/result" → Return cached result
+        3. "visualize that/this" → Use cached data + visualization
+        4. "summarize that/this" → Use cached data + summary
+        """
+        if not history:
+            logger.debug(" Heuristic check: No history provided")
+            return None
+            
+        lowered = query.lower()
+        logger.debug(f" Checking heuristic patterns for: '{query}'")
+        logger.debug(f" History has {len(history)} entries")
+        
+        # PATTERN 1: Email followup (send/email + cached data)
+
+        send_patterns = [
+            "send that", "send this", "send it", "send the",
+            "email that", "email this", "email it", "email the",
+            "forward that", "forward this", "forward it",
+            "share that", "share this", "share it"
+        ]
+        
+        pattern_matched = any(pattern in lowered for pattern in send_patterns)
+        logger.debug(f"Email pattern match: {pattern_matched}")
+        
+        if pattern_matched:
+            email_match = re.search(r'\b[\w.+-]+@[\w-]+\.[\w.-]+\b', query)
+            logger.debug(f" Email address found: {email_match.group(0) if email_match else 'None'}")
+            
+            if email_match:
+                logger.debug(f" Searching {len(history)} history entries for cached data...")
+                for i, entry in enumerate(reversed(history)):
+                    agent_type = entry.get("agent_type")
+                    result = entry.get("result", {})
+                    logger.debug(f"  Entry {i+1}: agent_type={agent_type}, result_keys={list(result.keys()) if result else 'None'}")
+                    
+                    # Check if result has data (handle nested structure)
+                    actual_result = result.get("final_result", result)  # Handle nested result structure
+                    has_data = (
+                        actual_result.get("query_data") is not None or
+                        actual_result.get("data") is not None or
+                        actual_result.get("rows") is not None or
+                        actual_result.get("meeting_date") is not None
+                    )
+                    logger.debug(f"    → has_data={has_data}, actual_result_keys={list(actual_result.keys()) if actual_result else 'None'}")
+                    
+                    if agent_type in ["db_query", "meeting", "summary", "visualization"] and has_data:
+                        logger.info(f" Heuristic: Email followup detected (previous {agent_type})")
+                        return {
+                            "is_multi_step": False,
+                            "confidence": 0.95,
+                            "reasoning": f"{agent_type} already completed in previous query. Only email agent needed.",
+                            "task_count": 1,
+                            "tasks": [{
+                                "step": 1,
+                                "agent": "email",
+                                "description": f"Send email to {email_match.group(0)} with results from previous {agent_type} task",
+                                "reasoning": f"{agent_type} agent already completed. Using cached results."
+                            }],
+                            "decomposed_tasks": [f"Send email with {agent_type} results to {email_match.group(0)}"],
+                            "original_query": query,
+                            "decomposition_method": "heuristic_email_followup",
+                            "optimization_notes": f"Detected email followup. Using cached {agent_type} result."
+                        }
+                logger.debug(f" No cached data found in history for email followup")
+        
+        # PATTERN 2: Show/display followup (return cached data)
+        show_patterns = [
+            "show me that", "show that", "show it", "show the",
+            "display that", "display it", "display the",
+            "give me that", "give me the",
+            "what was that", "what were the"
+        ]
+        
+        if any(pattern in lowered for pattern in show_patterns):
+            # Find most recent db_query or summary result
+            for entry in reversed(history):
+                agent_type = entry.get("agent_type")
+                result = entry.get("result", {})
+                
+                if agent_type in ["db_query", "summary"] and result:
+                    logger.info(f"🎯 Heuristic: Display followup detected (previous {agent_type})")
+                    return {
+                        "is_multi_step": False,
+                        "confidence": 0.90,
+                        "reasoning": f"Returning cached {agent_type} result from previous query.",
+                        "task_count": 1,
+                        "tasks": [{
+                            "step": 1,
+                            "agent": agent_type,
+                            "description": f"Return cached {agent_type} result",
+                            "reasoning": "User wants to see previous result again."
+                        }],
+                        "decomposed_tasks": [f"Display previous {agent_type} result"],
+                        "original_query": query,
+                        "decomposition_method": "heuristic_display_followup",
+                        "optimization_notes": f"User requesting previous data. Returning cached {agent_type} result."
+                    }
+        
+        # PATTERN 3: Visualize followup (cached data + visualization)
+        viz_patterns = [
+            "visualize that", "visualize this", "visualize it",
+            "chart that", "chart this", "graph that", "graph this",
+            "plot that", "plot this", "create a chart", "create a graph"
+        ]
+        
+        if any(pattern in lowered for pattern in viz_patterns):
+            # Find most recent db_query result
+            for entry in reversed(history):
+                if entry.get("agent_type") == "db_query" and entry.get("result"):
+                    logger.info(f" Heuristic: Visualization followup detected")
+                    return {
+                        "is_multi_step": False,
+                        "confidence": 0.90,
+                        "reasoning": "Using cached db_query result for visualization.",
+                        "task_count": 1,
+                        "tasks": [{
+                            "step": 1,
+                            "agent": "visualization",
+                            "description": "Create visualization from previous query result",
+                            "reasoning": "db_query already completed. Using cached data."
+                        }],
+                        "decomposed_tasks": ["Create visualization from cached db_query result"],
+                        "original_query": query,
+                        "decomposition_method": "heuristic_viz_followup",
+                        "optimization_notes": "Using cached data for visualization."
+                    }
+        
+        # PATTERN 4: Summarize followup (cached data + summary)
+        summary_patterns = [
+            "summarize that", "summarize this", "summarize it",
+            "explain that", "explain this", "what does that mean",
+            "tell me about that",
+            "prepare a summary", "prepare summary", "create a summary", "create summary",
+            "make a summary", "make summary", "generate a summary", "generate summary"
+        ]
+        
+        if any(pattern in lowered for pattern in summary_patterns):
+            # Find most recent db_query result
+            for entry in reversed(history):
+                if entry.get("agent_type") == "db_query" and entry.get("result"):
+                    logger.info(f" Heuristic: Summary followup detected")
+                    return {
+                        "is_multi_step": False,
+                        "confidence": 0.85,
+                        "reasoning": "Using cached db_query result for summary.",
+                        "task_count": 1,
+                        "tasks": [{
+                            "step": 1,
+                            "agent": "summary",
+                            "description": "Summarize previous query result",
+                            "reasoning": "db_query already completed. Using cached data."
+                        }],
+                        "decomposed_tasks": ["Summarize cached db_query result"],
+                        "original_query": query,
+                        "decomposition_method": "heuristic_summary_followup",
+                        "optimization_notes": "Using cached data for summary."
+                    }
+        
+        # No heuristic pattern matched - return None to trigger LLM
+        logger.debug(f"No heuristic pattern matched for query: {query[:50]}...")
+        return None
     
     def _agent_aware_llm_analysis(self, query: str, suggested_sequence: List[str]) -> Dict[str, Any]:
         """
@@ -210,7 +394,6 @@ Respond with this EXACT JSON structure:
             response = self.llm.invoke(messages)
             content = response.content.strip()
             
-            # Track tokens
             track_llm_call(
                 input_prompt=messages,
                 output=content,
@@ -219,13 +402,11 @@ Respond with this EXACT JSON structure:
                 model_name="gpt-4o"
             )
             
-            # Parse JSON
             analysis = self._safe_json_parse(content)
             
             if not analysis:
                 raise ValueError("Failed to parse LLM response")
             
-            # Validate and enhance
             analysis = self._validate_and_enhance_analysis(query, analysis)
             
             return analysis
@@ -244,7 +425,6 @@ Respond with this EXACT JSON structure:
         analysis.setdefault("task_count", 1)
         analysis.setdefault("reasoning", "Analysis completed")
         
-        # Extract task descriptions for backward compatibility
         if "tasks" in analysis:
             task_descriptions = []
             for task in analysis["tasks"]:

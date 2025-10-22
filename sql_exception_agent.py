@@ -22,6 +22,7 @@ class SQLExceptionAgent(BaseAgent):
         self.schema_file_path = schema_file_path
         self.max_iterations = max_iterations
         self.schema_content = self._load_schema_file()
+        self.structured_schema = self._load_structured_schema()
         self.table_relationships = self._analyze_table_relationships()
         self.cube_js_rules = self._load_cube_js_rules()
         
@@ -167,6 +168,32 @@ class SQLExceptionAgent(BaseAgent):
         except Exception as e:
             logger.error(f"Error loading schema file: {e}")
             return f"Error loading schema: {str(e)}"
+    
+    def _load_structured_schema(self) -> Dict[str, Any]:
+        """Load enhanced schema with FK relationships for better error correction."""
+        try:
+            import json
+            with open('enhanced_schema.json', 'r', encoding='utf-8') as file:
+                data = json.load(file)
+                total_relationships = sum(
+                    len(table_data.get('relationships', {})) 
+                    for table_data in data.get('tables', {}).values()
+                )
+                logger.info(f"Exception handler: Enhanced schema loaded: {data['metadata']['total_tables']} tables, {total_relationships} relationships")
+                return data
+        except FileNotFoundError:
+            logger.warning("enhanced_schema.json not found in exception handler, falling back to database_structure.json")
+            try:
+                with open('database_structure.json', 'r', encoding='utf-8') as file:
+                    data = json.load(file)
+                    logger.info(f"Exception handler: Structured schema loaded: {data['metadata']['total_tables']} tables")
+                    return data
+            except FileNotFoundError:
+                logger.warning("database_structure.json not found, using text schema only")
+                return {}
+        except Exception as e:
+            logger.error(f"Error loading structured schema in exception handler: {e}")
+            return {}
     
     def analyze_and_fix_sql_error(self, original_question: str, failed_sql: str, 
                                   error_message: str, similar_sqls: List[str] = None,
@@ -381,6 +408,33 @@ Respond in JSON format:
         # Determine fix strategy based on error analysis
         fix_strategy = error_analysis.get("recommended_strategy", "general_fix")
         
+        # Build enhanced schema context for relevant tables
+        schema_context = ""
+        if self.structured_schema and 'tables' in self.structured_schema:
+            important_tables = ['CustomerInvoice', 'CustomerInvoiceDetail', 'DistributorSales', 
+                               'DistributorSalesDetail', 'Sku', 'Order', 'OrderDetail']
+            
+            schema_parts = []
+            for table_name in important_tables:
+                if table_name in self.structured_schema['tables']:
+                    table_data = self.structured_schema['tables'][table_name]
+                    
+                    table_part = f"\nTABLE: {table_name}"
+                    
+                    # Add exact field names (first 10 fields)
+                    if 'fields' in table_data:
+                        fields_list = []
+                        for field_name, field_type in list(table_data['fields'].items())[:10]:
+                            if not field_name.startswith('__'):
+                                fields_list.append(f"  - {field_name}: {field_type}")
+                        if fields_list:
+                            table_part += "\n" + "\n".join(fields_list)
+                    
+                    schema_parts.append(table_part)
+            
+            if schema_parts:
+                schema_context = "\n\nEXACT FIELD NAMES FROM DATABASE (USE THESE EXACT NAMES):" + "".join(schema_parts)
+        
         correction_prompt = f"""You are an expert SQL correction specialist for Cube.js SQL API with deep understanding of its constraints and requirements.
 
 ERROR ANALYSIS:
@@ -392,6 +446,7 @@ ERROR ANALYSIS:
 - Cube.js Specific: {error_analysis['cube_js_specific']}
 - Fix Strategy: {fix_strategy}
 - Root Cause: {root_cause.get('root_cause', 'Unknown')}
+{schema_context}
 
 PREVIOUS FAILED ATTEMPTS:
 {previous_attempts_text if previous_attempts_text else "This is the first attempt"}
@@ -403,12 +458,12 @@ CUBE.JS CRITICAL INSIGHT:
 The error "Can't find join path" is VERY common in Cube.js. It means the system cannot establish 
 relationships between tables. The ONLY solution is to use fewer tables - often just ONE table.
 
-FOR SALES QUERIES - USE ONLY CustomerInvoice:
-- CustomerInvoice has: dispatchedvalue, dispatchedDate, discount, netvalue
-- This is sufficient for most sales trend analysis
-- DO NOT add other tables unless absolutely critical
+FOR SALES QUERIES - FIELD NAMES (CRITICAL - Use EXACT names from schema):
+- CustomerInvoice (invoice level): dispatchedvalue, netvalue, discount, dispatchedDate (date), item_discount
+- CustomerInvoiceDetail (item level): skuAmount, taxAmount, sellingQuantity, base_quantity, dispatch_date (date)
+- CRITICAL: Note the difference - CustomerInvoice uses 'dispatchedDate' but CustomerInvoiceDetail uses 'dispatch_date'
 
-WORKING PATTERN FOR SALES TRENDS:
+WORKING PATTERN FOR SALES TRENDS (Invoice Level):
 ```sql
 SELECT 
     CustomerInvoice.dispatchedDate,
@@ -437,15 +492,15 @@ CRITICAL FOR THIS QUERY "{original_question}":
 - Analyze the question to determine if it requires aggregation
 - If question mentions "monthly", "quarterly", "yearly" → MUST use GROUP BY
 - If question mentions "trend", "over time", "by period" → MUST use GROUP BY
-- For sales data: CustomerInvoice.dispatchedvalue = sales amount
-- For sales data: CustomerInvoice.dispatchedDate = transaction date  
-- Use minimal tables (preferably ONLY CustomerInvoice for simple sales queries)
-- Filter by appropriate date range
+- For sales data (invoice level): CustomerInvoice.dispatchedvalue, CustomerInvoice.dispatchedDate
+- For sales data (item level): CustomerInvoiceDetail.skuAmount, CustomerInvoiceDetail.dispatch_date (note: dispatch_date not dispatchedDate!)
+- If query involves SKUs → Must use CustomerInvoiceDetail table
+- Use minimal tables but ensure correct field names from schema
 
-TIME-BASED AGGREGATION PATTERNS:
-- Monthly: SELECT DATE_TRUNC('month', dispatchedDate), SUM(dispatchedvalue) GROUP BY DATE_TRUNC('month', dispatchedDate)
-- Quarterly: SELECT DATE_TRUNC('quarter', dispatchedDate), SUM(dispatchedvalue) GROUP BY DATE_TRUNC('quarter', dispatchedDate)
-- If using MEASURE(): Use in WITH clause with proper GROUP BY
+TIME-BASED AGGREGATION PATTERNS (FIELD NAMES MUST MATCH SCHEMA):
+- Monthly (Invoice): SELECT DATE_TRUNC('month', CustomerInvoice.dispatchedDate), SUM(dispatchedvalue) GROUP BY DATE_TRUNC('month', CustomerInvoice.dispatchedDate)
+- Monthly (Detail/SKU): SELECT DATE_TRUNC('month', CustomerInvoiceDetail.dispatch_date), SUM(skuAmount) GROUP BY DATE_TRUNC('month', CustomerInvoiceDetail.dispatch_date)
+- MEASURE() Rules: NEVER use MEASURE(SUM(...)) - use either MEASURE(...) OR SUM(...), not both!
 
 Generate a corrected SQL that:
 - Uses minimal tables (ONLY CustomerInvoice if possible)
@@ -556,23 +611,25 @@ Always return valid JSON with the corrected SQL or failure explanation."""
 CRITICAL - This is a Cube.js join path error. Use MINIMAL tables:
 
 For SALES QUERIES:
-- Use ONLY CustomerInvoice table (sufficient for most sales data)
-- Add CustomerInvoiceDetail ONLY if you need item-level details
+- Use ONLY CustomerInvoice table (sufficient for invoice-level sales data)
+- Add CustomerInvoiceDetail if you need item/SKU-level details (CRITICAL: uses dispatch_date not dispatchedDate)
 - NEVER add ViewCustomer, ViewDistributor, ViewUser, Sku, Brand, Category unless absolutely essential
-- For quarterly sales, CustomerInvoice.dispatchedvalue and dispatchedDate are sufficient
+- Invoice level: CustomerInvoice.dispatchedvalue and CustomerInvoice.dispatchedDate
+- Item/SKU level: CustomerInvoiceDetail.skuAmount and CustomerInvoiceDetail.dispatch_date
 
-MINIMAL QUERY PATTERN:
+MINIMAL QUERY PATTERNS:
+-- Invoice Level:
 SELECT 
     CustomerInvoice.dispatchedDate,
     CustomerInvoice.dispatchedvalue 
 FROM CustomerInvoice 
 WHERE [date conditions]
 
-If customer info is essential, try:
+-- Item/SKU Level (note dispatch_date):
 SELECT 
-    CustomerInvoice.dispatchedDate,
-    CustomerInvoice.dispatchedvalue
-FROM CustomerInvoice
+    CustomerInvoiceDetail.dispatch_date,
+    CustomerInvoiceDetail.skuAmount
+FROM CustomerInvoiceDetail 
 WHERE [date conditions]""",
             
             "general_fix": """
@@ -583,9 +640,10 @@ WHERE [date conditions]""",
             "cube_js_relationship": """
 CUBE.JS JOIN PATH ERROR - ULTRA MINIMAL APPROACH:
 1. Use ONLY the primary table that contains the core data
-2. For sales data: CustomerInvoice has dispatchedvalue and dispatchedDate
-3. Do NOT join other tables unless absolutely necessary
-4. CustomerInvoice alone can answer most sales questions""",
+2. For invoice-level sales: CustomerInvoice has dispatchedvalue and dispatchedDate
+3. For SKU/item-level sales: CustomerInvoiceDetail has skuAmount and dispatch_date (not dispatchedDate!)
+4. Do NOT join other tables unless absolutely necessary
+5. Choose the right table for your query (Invoice vs InvoiceDetail)""",
             
             "measure_fix": """
 - Move any MEASURE() calls to WITH clauses

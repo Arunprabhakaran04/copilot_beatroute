@@ -51,6 +51,10 @@ class VisualizationAgent(BaseAgent):
         Expected state to contain:
         - query: The original question asked
         - result: Dictionary containing 'query_data' with pandas DataFrame or list of dicts
+        - intermediate_results: Results from previous workflow steps (checked first)
+        
+        If query references previous data (e.g., "visualize that"), will attempt to 
+        retrieve from intermediate_results first, then fall back to cached database results.
         """
         try:
             logger.info(f"VisualizationAgent processing query: {state['query']}")
@@ -58,6 +62,41 @@ class VisualizationAgent(BaseAgent):
             # Extract data from state
             question = state.get('query', '')
             result_data = state.get('result', {})
+            
+            # Check if query references previous data
+            if self.should_use_cached_data(question):
+                logger.info("Query references previous data - checking sources...")
+                
+                # PRIORITY 1: Check intermediate_results from current workflow
+                intermediate_results = state.get('intermediate_results', {})
+                if intermediate_results:
+                    logger.info(f"📊 Found {len(intermediate_results)} step(s) in intermediate_results")
+                    intermediate_data = self._extract_data_from_intermediate_results(intermediate_results)
+                    
+                    if intermediate_data:
+                        logger.info("✅ Using data from intermediate_results (current workflow)")
+                        result_data = {**result_data, **intermediate_data}
+                        state['result'] = result_data
+                    else:
+                        logger.info("No query data found in intermediate_results, checking cache...")
+                        # PRIORITY 2: Fall back to Redis cache
+                        cached_result = self.get_cached_db_result(state)
+                        if cached_result:
+                            logger.info("Using cached database result for visualization")
+                            result_data = {**result_data, **cached_result}
+                            state['result'] = result_data
+                        else:
+                            logger.warning("No data found in intermediate_results or cache")
+                else:
+                    logger.info("No intermediate_results, checking cache...")
+                    # PRIORITY 2: Fall back to Redis cache
+                    cached_result = self.get_cached_db_result(state)
+                    if cached_result:
+                        logger.info("Using cached database result for visualization")
+                        result_data = {**result_data, **cached_result}
+                        state['result'] = result_data
+                    else:
+                        logger.warning("Query references previous data but no cached result found")
             
             # Get DataFrame from various possible sources
             df = self._extract_dataframe_from_result(result_data, question)
@@ -97,46 +136,97 @@ class VisualizationAgent(BaseAgent):
             state['error_message'] = f"Visualization generation error: {str(e)}"
             return state
     
+    def _extract_data_from_intermediate_results(self, intermediate_results: dict) -> dict:
+        """
+        Extract query data from intermediate_results of previous workflow steps.
+        
+        Args:
+            intermediate_results: Dict mapping step keys to their results
+            
+        Returns:
+            Dict containing query_data if found, empty dict otherwise
+        """
+        try:
+            for step_key, step_data in intermediate_results.items():
+                if not isinstance(step_data, dict):
+                    continue
+                
+                # Look for database query results
+                if step_data.get("agent_type") in ["db_query", "sql"] or "query" in step_key.lower():
+                    # Check for query_data field
+                    if "query_data" in step_data:
+                        logger.info(f"📊 Found query_data in intermediate step: {step_key}")
+                        return {"query_data": step_data["query_data"]}
+                    
+                    # Check for query_results field
+                    if "query_results" in step_data:
+                        logger.info(f"📊 Found query_results in intermediate step: {step_key}")
+                        return {"query_data": step_data["query_results"]}
+                    
+                    # Check in nested result dict
+                    if "result" in step_data and isinstance(step_data["result"], dict):
+                        result_dict = step_data["result"]
+                        if "query_data" in result_dict:
+                            logger.info(f"📊 Found query_data in intermediate step result: {step_key}")
+                            return {"query_data": result_dict["query_data"]}
+                        if "query_results" in result_dict:
+                            logger.info(f"📊 Found query_results in intermediate step result: {step_key}")
+                            return {"query_data": result_dict["query_results"]}
+            
+            logger.info("No query data found in intermediate_results")
+            return {}
+            
+        except Exception as e:
+            logger.error(f"Error extracting data from intermediate_results: {str(e)}")
+            return {}
+    
     def _extract_dataframe_from_result(self, result_data: Dict[str, Any], question: str) -> pd.DataFrame:
         """
         Extract pandas DataFrame from various result formats.
         
         Handles multiple data formats from DB Agent:
         - Direct DataFrame in 'query_data'
+        - Serialized DataFrame from Redis cache (with _type: "dataframe")
         - List of dictionaries in 'data'
         - Nested result structures
         """
         try:
             import pandas as pd
             
-            # Case 1: Direct DataFrame
-            if 'query_data' in result_data and isinstance(result_data['query_data'], pd.DataFrame):
-                logger.info("Found DataFrame in 'query_data'")
-                return result_data['query_data']
+            # Case 1: Direct DataFrame in various keys
+            for key in ['query_data', 'query_results', 'data', 'rows_returned']:
+                if key in result_data:
+                    value = result_data[key]
+                    
+                    # Check if it's a direct DataFrame
+                    if isinstance(value, pd.DataFrame):
+                        logger.info(f"Found DataFrame in '{key}'")
+                        return value
+                    
+                    # Check if it's a serialized DataFrame from cache
+                    if isinstance(value, dict) and value.get("_type") == "dataframe":
+                        logger.info(f"Found serialized DataFrame in '{key}' - deserializing...")
+                        return self._deserialize_dataframe(value)
             
-            # Case 2: DataFrame in nested structure
-            if isinstance(result_data.get('query_data'), pd.DataFrame):
-                logger.info("Found DataFrame in nested 'query_data'")
-                return result_data['query_data']
-            
-            # Case 3: List of dictionaries in 'data'
+            # Case 2: List of dictionaries in 'data'
             if 'data' in result_data and isinstance(result_data['data'], list):
                 logger.info("Converting list of dicts to DataFrame")
                 return pd.DataFrame(result_data['data'])
             
-            # Case 4: Query results structure from DB connection
+            # Case 3: Query results structure from DB connection
             if 'query_results' in result_data:
                 query_results = result_data['query_results']
-                if 'data' in query_results and isinstance(query_results['data'], list):
-                    logger.info("Converting query_results data to DataFrame")
-                    return pd.DataFrame(query_results['data'])
+                if isinstance(query_results, dict):
+                    if 'data' in query_results and isinstance(query_results['data'], list):
+                        logger.info("Converting query_results data to DataFrame")
+                        return pd.DataFrame(query_results['data'])
             
-            # Case 5: Direct list of dictionaries
+            # Case 4: Direct list of dictionaries
             if isinstance(result_data, list) and len(result_data) > 0:
                 logger.info("Converting direct list to DataFrame")
                 return pd.DataFrame(result_data)
             
-            # Case 6: Check for any list-like data in nested structures
+            # Case 5: Check for any list-like data in nested structures
             for key, value in result_data.items():
                 if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
                     logger.info(f"Found data list in key '{key}', converting to DataFrame")
@@ -148,6 +238,33 @@ class VisualizationAgent(BaseAgent):
         except Exception as e:
             logger.error(f"Error extracting DataFrame: {e}")
             return None
+    
+    def _deserialize_dataframe(self, serialized_df: Dict[str, Any]) -> pd.DataFrame:
+        """
+        Deserialize a DataFrame that was serialized by redis_memory_manager._serialize_result()
+        
+        Args:
+            serialized_df: Dict with {"_type": "dataframe", "data": [...], "columns": [...]}
+            
+        Returns:
+            pandas DataFrame
+        """
+        try:
+            columns = serialized_df.get("columns", [])
+            data = serialized_df.get("data", [])
+            
+            if not data:
+                logger.warning("Serialized DataFrame has no data")
+                return pd.DataFrame()
+            
+            # Convert list of dicts back to DataFrame
+            df = pd.DataFrame(data, columns=columns)
+            logger.info(f"Deserialized DataFrame: {len(df)} rows, {len(df.columns)} columns")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error deserializing DataFrame: {str(e)}")
+            return pd.DataFrame()
     
     def _handle_no_data_case(self, state: BaseAgentState) -> BaseAgentState:
         """Handle case when no data is available for visualization"""

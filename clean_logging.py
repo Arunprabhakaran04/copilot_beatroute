@@ -1,16 +1,10 @@
-"""
-Clean logging configuration using Loguru
-"""
-
 from loguru import logger
 import sys
 
 def setup_logging():
     """Setup clean logging configuration"""
-    # Remove default handler
     logger.remove()
     
-    # Add console handler with clean format
     logger.add(
         sys.stdout,
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> | <level>{message}</level>",
@@ -27,7 +21,6 @@ def setup_logging():
         retention="7 days"
     )
 
-# Specific loggers for different components
 class AgentLogger:
     @staticmethod
     def query_start(agent_type: str, query: str):
@@ -62,7 +55,6 @@ class SQLLogger:
                 logger.info(f"  {i}. ({similarity:.3f}) {question}{'...' if len(query_info.get('question', '')) > 80 else ''}")
                 logger.info(f"     SQL: {sql}{'...' if len(query_info.get('sql', '')) > 120 else ''}")
             else:
-                # If it's just a string (SQL query)
                 logger.info(f"  {i}. {str(query_info)[:120]}{'...' if len(str(query_info)) > 120 else ''}")
     
     @staticmethod
