@@ -1,16 +1,13 @@
 from enum import Enum
 
 
-class MessageType(Enum):
-    STATUS = "status"
-    TEXT = "text"
-    TABLE = "table"
-    GRAPH = "graph"
-    SUMMARY = "summary"
-    ERROR = "error"
-    PING = "ping"
-    PONG = "pong"
-    SUGGESTED_QUESTIONS = "suggested_questions"
-    WORKFLOW_START = "workflow_start"
-    WORKFLOW_STEP = "workflow_step"
-    WORKFLOW_COMPLETE = "workflow_complete"
+class MessageType(str, Enum):
+    TEXT = "TYPE_TEXT"
+    TABLE = "TYPE_TABLE"
+    GRAPH = "TYPE_GRAPH"
+    SUMMARY = "TYPE_SUMMARY"
+    STATUS = "TYPE_STATUS"
+    ERROR = "TYPE_ERROR"
+    PING = "TYPE_PING"
+    PONG = "TYPE_PONG"
+    SUGGESTED_QUESTIONS = "TYPE_SUGGESTED_QUESTIONS"
