@@ -376,9 +376,31 @@ class CentralOrchestrator:
             
             # Check if we have more tasks to process
             if not state["remaining_tasks"]:
-                state["status"] = "completed"
-                state["success_message"] = self._generate_final_message(state)
-                return state
+                # AUTO-SUMMARY INJECTION: Check if any db_query was executed
+                # If yes, automatically add a summary task (only once)
+                has_db_query = any(
+                    step.get("agent_type") == "db_query" 
+                    for step in state.get("completed_steps", [])
+                )
+                
+                # Check if summary was already added (to prevent duplicate summaries)
+                has_summary = any(
+                    step.get("agent_type") == "summary" 
+                    for step in state.get("completed_steps", [])
+                )
+                
+                # Only add summary if db_query executed and summary not already present
+                if has_db_query and not has_summary:
+                    logger.info("🔄 AUTO-SUMMARY: DB query detected, automatically adding summary task")
+                    state["remaining_tasks"] = ["Generate a summary of the query results"]
+                    # Mark as multi-step since we're adding a summary step
+                    state["is_multi_step"] = True
+                    # Don't mark as completed yet - let the summary task execute
+                else:
+                    # No db_query or summary already exists - mark as completed
+                    state["status"] = "completed"
+                    state["success_message"] = self._generate_final_message(state)
+                    return state
             
             current_task = state["remaining_tasks"].pop(0)
             
