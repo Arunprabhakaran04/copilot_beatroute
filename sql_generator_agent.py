@@ -266,8 +266,9 @@ class SQLGeneratorAgent(BaseAgent):
         return intent
     
     def generate_sql(self, question: str, similar_sqls: List[str] = None, 
-                     previous_results: Dict[str, Any] = None,
-                     original_query: str = None) -> Dict[str, Any]:
+                     previous_results: Dict[str, Any] = None, 
+                     original_query: str = None,
+                     entity_info: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Generate production-ready SQL query for Cube.js.
         
@@ -305,17 +306,107 @@ class SQLGeneratorAgent(BaseAgent):
             if cleaned_previous_results:
                 previous_results_context = f"\n\nPREVIOUS STEP RESULTS:\n{json.dumps(cleaned_previous_results, indent=2)}\nUse this data to construct WHERE clauses or filters if the question references specific entities."
             
+            # Build entity context if available
+            entity_context = ""
+            if entity_info and entity_info.get("entity_mapping"):
+                entity_context = "\n\n" + "="*80 + "\n"
+                entity_context += "🏷️ ENTITY VERIFICATION RESULTS - THESE ARE MANDATORY CONSTRAINTS:\n"
+                entity_context += "="*80 + "\n"
+                
+                for entity_name, table_type in entity_info.get("entity_mapping", {}).items():
+                    entity_context += f"✓ Entity '{entity_name}' was verified in table '{table_type}'\n"
+                
+                # Determine which main table to use based on entities
+                if "ViewCustomer" in entity_info.get("entity_types", []):
+                    entity_context += "\n🚨 CRITICAL REQUIREMENT - CUSTOMER QUERY:\n"
+                    entity_context += "   • You MUST use ViewCustomer table for filtering the customer\n"
+                    entity_context += "   • You MUST use CustomerInvoice for sales data\n"
+                    entity_context += "   • Use EXACT entity name as verified (case-sensitive match)\n"
+                    entity_context += "   • DO NOT change the case of entity names - use exactly as provided below\n"
+                    entity_context += "   • DO NOT use CustomerInvoice.externalCode for filtering customers\n"
+                    entity_context += "   • DO NOT use DistributorSales table - this is a CUSTOMER query!\n"
+                    entity_context += "   • CROSS JOIN ViewCustomer with CustomerInvoice\n"
+                    
+                    # Add specific entity names for WHERE clause (using exact verified names)
+                    entity_names = entity_info.get("entities", [])
+                    if entity_names:
+                        if len(entity_names) == 1:
+                            # Single entity - use exact match with verified name
+                            entity_exact = entity_names[0]  # Use exact name from verification
+                            entity_context += f"\n   • WHERE clause MUST be: WHERE ViewCustomer.name = '{entity_exact}'\n"
+                            entity_context += f"   • IMPORTANT: Use EXACT value '{entity_exact}' (from entity verification)\n"
+                            entity_context += f"   • DO NOT capitalize or change case - database stores it as '{entity_exact}'\n"
+                        else:
+                            # Multiple entities - use IN with exact names
+                            entity_list = ', '.join([f"'{e}'" for e in entity_names])
+                            entity_context += f"\n   • WHERE clause MUST be: WHERE ViewCustomer.name IN ({entity_list})\n"
+                            entity_context += f"   • Use EXACT values from entity verification (case-sensitive)\n"
+                
+                elif "ViewDistributor" in entity_info.get("entity_types", []):
+                    entity_context += "\n🚨 CRITICAL REQUIREMENT - DISTRIBUTOR QUERY:\n"
+                    entity_context += "   • You MUST use ViewDistributor table for filtering\n"
+                    entity_context += "   • You MUST use DistributorSales for sales data\n"
+                    entity_context += "   • Use EXACT entity name as verified (case-sensitive match)\n"
+                    entity_context += "   • DO NOT change the case of entity names\n"
+                    entity_context += "   • DO NOT use CustomerInvoice table - this is a DISTRIBUTOR query!\n"
+                    
+                    # Add specific entity names for WHERE clause (using exact verified names)
+                    entity_names = entity_info.get("entities", [])
+                    if entity_names:
+                        if len(entity_names) == 1:
+                            entity_exact = entity_names[0]  # Use exact name from verification
+                            entity_context += f"\n   • WHERE clause: WHERE ViewDistributor.name = '{entity_exact}'\n"
+                            entity_context += f"   • Use EXACT value '{entity_exact}' from verification\n"
+                        else:
+                            entity_list = ', '.join([f"'{e}'" for e in entity_names])
+                            entity_context += f"\n   • WHERE clause: WHERE ViewDistributor.name IN ({entity_list})\n"
+                    
+                elif "Sku" in entity_info.get("entity_types", []):
+                    entity_context += "\n🚨 CRITICAL REQUIREMENT - SKU QUERY:\n"
+                    entity_context += "   • You MUST join with Sku table for filtering\n"
+                    entity_context += "   • Use EXACT entity name as verified (case-sensitive match)\n"
+                    entity_context += "   • DO NOT change the case of entity names\n"
+                    
+                    # Add specific entity names for WHERE clause (using exact verified names)
+                    entity_names = entity_info.get("entities", [])
+                    if entity_names:
+                        if len(entity_names) == 1:
+                            entity_exact = entity_names[0]  # Use exact name from verification
+                            entity_context += f"\n   • WHERE clause: WHERE Sku.name = '{entity_exact}'\n"
+                            entity_context += f"   • Use EXACT value '{entity_exact}' from verification\n"
+                        else:
+                            entity_list = ', '.join([f"'{e}'" for e in entity_names])
+                            entity_context += f"\n   • WHERE clause: WHERE Sku.name IN ({entity_list})\n"
+                
+                entity_context += "\n" + "="*80 + "\n"
+            
             system_prompt = self._build_system_prompt(
                 current_date=current_date,
                 schema_info=self.schema_content,
                 sql_examples=sql_examples_context,
                 previous_results=previous_results_context,
+                entity_context=entity_context,
                 strategy=generation_strategy
             )
             
+            # Build user message with explicit entity names if available
+            user_message = f"Generate SQL for: {question}"
+            
+            # Add EXPLICIT entity name reminder in user message for maximum visibility
+            if entity_info and entity_info.get("entities"):
+                entity_names = entity_info.get("entities", [])
+                entity_types = entity_info.get("entity_types", [])
+                
+                user_message += "\n\n🚨 VERIFIED ENTITY NAMES (USE THESE EXACT VALUES):\n"
+                for entity_name, entity_type in zip(entity_names, entity_types):
+                    user_message += f"   • {entity_type}: '{entity_name}' (EXACT - do not change case or spelling)\n"
+                
+                user_message += "\n⚠️ CRITICAL: Use the EXACT entity names shown above in your WHERE clause."
+                user_message += "\n   DO NOT capitalize, lowercase, or modify these names in any way!"
+            
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Generate SQL for: {question}"}
+                {"role": "user", "content": user_message}
             ]
             
             # For exact matches (similarity > 0.95), provide the example and instruct to use it
@@ -405,7 +496,7 @@ If the example already matches the user's request perfectly, return it AS IS."""
         return relevant[:3]  # Max 3 relevant examples
     
     def _build_system_prompt(self, current_date: str, schema_info: str, 
-                            sql_examples: str, previous_results: str, strategy: str) -> str:
+                            sql_examples: str, previous_results: str, entity_context: str, strategy: str) -> str:
         """Build comprehensive system prompt for SQL generation."""
         
         # Use enhanced schema with FK relationships and metadata
@@ -472,6 +563,7 @@ If the example already matches the user's request perfectly, return it AS IS."""
 
 TODAY'S DATE: {current_date}
 {schema_context}
+{entity_context}
 
 CUBE.JS CRITICAL RULES - STRICTLY FOLLOW THESE:
 
@@ -900,16 +992,22 @@ LIMIT 3
             # Check for intermediate_results from multi-step workflow
             previous_results = state.get("previous_step_results", None) or state.get("intermediate_results", None)
             original_query = state.get("original_query", state["query"])
+            entity_info = state.get("entity_info", None)
             
             # Log if we have previous results
             if previous_results:
                 logger.info(f"🔗 SQL Generator received {len(previous_results)} previous step(s)")
             
+            # Log if we have entity information
+            if entity_info:
+                logger.info(f"🏷️ SQL Generator received entity info: {entity_info}")
+            
             result = self.generate_sql(
                 question=state["query"],
                 similar_sqls=similar_sqls,
                 previous_results=previous_results,
-                original_query=original_query
+                original_query=original_query,
+                entity_info=entity_info
             )
             
             if result["success"]:

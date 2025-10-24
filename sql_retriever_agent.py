@@ -93,90 +93,9 @@ class SQLRetrieverAgent(BaseAgent):
             logger.error(f"Error generating embeddings: {e}")
             raise
     
-    def _enhance_similarity_scores(self, user_query: str, similarities: np.ndarray) -> np.ndarray:
-        """
-        Enhance similarity scores by boosting relevance for time-based and domain-specific queries
-        
-        Args:
-            user_query (str): The user's query
-            similarities (np.ndarray): Original cosine similarities
-            
-        Returns:
-            np.ndarray: Enhanced similarity scores
-        """
-        enhanced_similarities = similarities.copy()
-        user_query_lower = user_query.lower()
-        
-        # Time-based query keywords that should get priority
-        time_keywords = [
-            'past year', 'last year', 'last 12 months', '12 months',
-            'past 6 months', 'last 6 months', '6 months', 
-            'past 3 months', 'last 3 months', '3 months',
-            'monthly trend', 'monthly sales', 'month wise', 'monthly data',
-            'this month', 'last month', 'this year', 'trend', 'over time',
-            'time series', 'quarterly', 'yearly', 'annual'
-        ]
-        
-        # Sales/revenue keywords
-        sales_keywords = [
-            'sales', 'revenue', 'dispatch', 'invoice', 'value', 'amount',
-            'total sales', 'sales data', 'sales trend', 'revenue trend'
-        ]
-        
-        # Visualization keywords 
-        viz_keywords = [
-            'visualize', 'chart', 'graph', 'plot', 'trend', 'visualization'
-        ]
-        
-        # Check if user query contains time-based terms
-        is_time_query = any(keyword in user_query_lower for keyword in time_keywords)
-        is_sales_query = any(keyword in user_query_lower for keyword in sales_keywords)  
-        is_viz_query = any(keyword in user_query_lower for keyword in viz_keywords)
-        
-        # Boost scores for relevant indexed questions
-        for idx, question_data in enumerate(self.indexed_questions):
-            question = question_data["question"].lower()
-            sql = question_data["sql"].lower()
-            
-            boost_factor = 1.0
-            
-            # Boost time-based queries
-            if is_time_query:
-                if any(keyword in question for keyword in time_keywords):
-                    boost_factor *= 1.3
-                if any(keyword in sql for keyword in ['date_trunc', 'interval', 'month', 'year']):
-                    boost_factor *= 1.2
-            
-            # Boost sales queries
-            if is_sales_query:
-                if any(keyword in question for keyword in sales_keywords):
-                    boost_factor *= 1.2
-                if any(keyword in sql for keyword in ['customerinvoice', 'dispatchedvalue', 'sales']):
-                    boost_factor *= 1.2
-            
-            # Boost visualization-related queries
-            if is_viz_query:
-                if any(keyword in question for keyword in viz_keywords + ['trend', 'analysis']):
-                    boost_factor *= 1.15
-            
-            # Specific boosts for monthly/time series patterns
-            if 'monthly' in user_query_lower and 'monthly' in question:
-                boost_factor *= 1.4
-            
-            if ('past year' in user_query_lower or 'last 12 months' in user_query_lower):
-                if any(term in question for term in ['12 months', 'past year', 'last year', 'annual']):
-                    boost_factor *= 1.5
-                if '12 months' in sql or 'interval' in sql:
-                    boost_factor *= 1.3
-            
-            # Apply the boost
-            enhanced_similarities[idx] = min(similarities[idx] * boost_factor, 1.0)  # Cap at 1.0
-        
-        return enhanced_similarities
-    
     def retrieve_similar_sql(self, user_query: str, k: int = 6) -> List[str]:
         """
-        Retrieve top-k most similar SQL queries for the given user query with enhanced relevance scoring
+        Retrieve top-k most similar SQL queries for the given user query using cosine similarity
         
         Args:
             user_query (str): The user's natural language query
@@ -195,26 +114,22 @@ class SQLRetrieverAgent(BaseAgent):
             # Compute cosine similarity with all stored embeddings
             similarities = cosine_similarity([current_embedding], self.embeddings)[0]
             
-            # Enhanced relevance scoring for time-based and visualization queries
-            enhanced_similarities = self._enhance_similarity_scores(user_query, similarities)
-            
             # Get top-k indices (sorted by descending similarity)
-            top_indices = np.argsort(enhanced_similarities)[-k:][::-1]  # Reverse to get descending order
+            top_indices = np.argsort(similarities)[-k:][::-1]  # Reverse to get descending order
             
             # Clean logging using SQLLogger
             try:
                 from clean_logging import SQLLogger
-                SQLLogger.retrieval_complete(len(top_indices), enhanced_similarities[top_indices[0]])
+                SQLLogger.retrieval_complete(len(top_indices), similarities[top_indices[0]])
             except ImportError:
-                logger.info(f"Retrieved {len(top_indices)} similar queries (max similarity: {enhanced_similarities[top_indices[0]]:.3f})")
+                logger.info(f"Retrieved {len(top_indices)} similar queries (max similarity: {similarities[top_indices[0]]:.3f})")
             
             similar_sqls = []
             similar_queries_detailed = []
             
             for rank, idx in enumerate(top_indices, 1):
                 sql_query = self.indexed_questions[idx]["sql"]
-                similarity_score = enhanced_similarities[idx]  # Use enhanced score for logging
-                original_similarity = similarities[idx]  # Keep original for reference
+                similarity_score = similarities[idx]  # Use raw cosine similarity
                 question = self.indexed_questions[idx]["question"]
                 
                 # Return structured data instead of just SQL strings
@@ -227,15 +142,16 @@ class SQLRetrieverAgent(BaseAgent):
                 similar_queries_detailed.append({
                     'question': question,
                     'sql': sql_query,
-                    'similarity': similarity_score,
-                    'original_similarity': original_similarity
+                    'similarity': similarity_score
                 })
             
             # Log the retrieved queries using the new method
             try:
-                SQLLogger.retrieved_queries(similar_queries_detailed, max_display=6)
+                logger.info(f"📊 About to log {len(similar_queries_detailed)} retrieved SQL queries (displaying all)")
+                SQLLogger.retrieved_queries(similar_queries_detailed, max_display=20)
             except ImportError:
-                for rank, query_info in enumerate(similar_queries_detailed[:6], 1):
+                logger.info(f"📊 Logging {len(similar_queries_detailed)} retrieved SQL queries (fallback mode)")
+                for rank, query_info in enumerate(similar_queries_detailed[:20], 1):
                     logger.info(f"  {rank}. ({query_info['similarity']:.3f}) {query_info['question'][:80]}...")
                     logger.info(f"     SQL: {query_info['sql'][:120]}...")
                 
@@ -268,7 +184,7 @@ class SQLRetrieverAgent(BaseAgent):
             # Calculate execution time
             execution_time = time.time() - start_time
             
-            similarity_scores = enhanced_similarities[top_indices]
+            similarity_scores = similarities[top_indices]
             # self.log_performance_stats(user_query, similarity_scores.tolist(), execution_time, len(similar_sqls))
             
             return similar_sqls

@@ -44,18 +44,15 @@ class SQLLogger:
         logger.info(f"SQL RETRIEVAL | Found {count} examples (max similarity: {max_similarity:.3f})")
     
     @staticmethod
-    def retrieved_queries(similar_queries: list, max_display: int = 6):
-        """Log the retrieved SQL queries"""
+    def retrieved_queries(similar_queries: list, max_display: int = 20):
+        """Log the retrieved SQL queries - simplified to question + similarity only"""
         logger.info(f"SQL RETRIEVAL | Retrieved queries (top {min(len(similar_queries), max_display)}):")
         for i, query_info in enumerate(similar_queries[:max_display], 1):
             if isinstance(query_info, dict):
-                question = query_info.get('question', 'N/A')[:80]
-                sql = query_info.get('sql', 'N/A')[:120]
+                question = query_info.get('question', 'N/A')
                 similarity = query_info.get('similarity', 0)
-                logger.info(f"  {i}. ({similarity:.3f}) {question}{'...' if len(query_info.get('question', '')) > 80 else ''}")
-                logger.info(f"     SQL: {sql}{'...' if len(query_info.get('sql', '')) > 120 else ''}")
-            else:
-                logger.info(f"  {i}. {str(query_info)[:120]}{'...' if len(str(query_info)) > 120 else ''}")
+                # Only log question + similarity, no SQL text
+                logger.info(f"  [{i}] sim={similarity:.3f} | {question}")
     
     @staticmethod
     def generation_start(question: str):
@@ -64,6 +61,12 @@ class SQLLogger:
     @staticmethod
     def generation_complete(sql: str, query_type: str):
         logger.info(f"SQL GENERATION | Generated {query_type} query ({len(sql)} chars)")
+    
+    @staticmethod
+    def generated_sql(sql: str):
+        """Log the final generated SQL query that will be executed"""
+        logger.info(f"SQL GENERATION | Final SQL to execute:")
+        logger.info(f"{sql}")
     
     @staticmethod
     def execution_start(sql: str):

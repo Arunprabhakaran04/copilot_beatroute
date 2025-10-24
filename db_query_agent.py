@@ -1,12 +1,10 @@
 import re
-import logging
 import json
 import time
 from datetime import datetime
 from typing import List, Dict, Any
 import pandas as pd
-import time
-import logging
+from loguru import logger
 from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from sql_query_decomposer import SQLQueryDecomposer
@@ -14,8 +12,6 @@ from sql_generator_agent import SQLGeneratorAgent
 from sql_exception_agent import SQLExceptionAgent
 from db_connection import get_database_connection, execute_sql
 from token_tracker import track_llm_call, get_token_tracker
-
-logger = logging.getLogger(__name__)
 
 class DBQueryAgent(BaseAgent):
     """
@@ -104,7 +100,43 @@ class DBQueryAgent(BaseAgent):
                 logger.warning("Query contained potentially unsafe characters - sanitized")
                 state['query'] = sanitized_query
             
-            # Step 2: Analyze query complexity with error handling
+            # ✅ IMPROVED: Check if agent-aware decomposer already determined single-step
+            # The AgentAwareDecomposer runs BEFORE routing to db_query agent
+            # If it says single-step with high confidence, trust it and skip redundant decomposition
+            is_multi_step_flag = state.get("is_multi_step")
+            confidence = state.get("classification_confidence")
+            
+            logger.info(f"🔍 DECOMPOSITION CHECK:")
+            logger.info(f"   is_multi_step flag: {is_multi_step_flag}")
+            logger.info(f"   confidence: {confidence}")
+            logger.info(f"   State has is_multi_step: {'is_multi_step' in state}")
+            
+            is_confirmed_single_step = (
+                is_multi_step_flag == False and  # Explicitly check == False (not just falsy)
+                confidence is not None and
+                confidence >= 0.85
+            )
+            
+            if is_confirmed_single_step:
+                logger.info("✅ Agent-aware decomposer confirmed single-step (skipping redundant analysis)")
+                logger.info(f"   Confidence: {confidence:.2f}")
+                
+                # Treat as single-step directly
+                result = self._handle_single_step_query(state, db_state)
+                
+                # Add timing
+                execution_time = time.time() - start_time
+                result["execution_time"] = execution_time
+                
+                try:
+                    from clean_logging import AgentLogger
+                    AgentLogger.query_complete("db_query", execution_time)
+                except ImportError:
+                    logger.success(f"DB_QUERY | Completed in {execution_time:.2f}s")
+                
+                return result
+            
+            # Step 2: Analyze query complexity with error handling (only if not already analyzed)
             try:
                 decomposition_result = self._analyze_query_complexity(state)
                 
@@ -129,11 +161,35 @@ class DBQueryAgent(BaseAgent):
                 for i, question in enumerate(decomposition_result["decomposed_questions"], 1):
                     logger.info(f"  {i}. {question}")
                 logger.info(f"="*80)
-                return self._handle_multi_step_query(state, decomposition_result, db_state)
+                result = self._handle_multi_step_query(state, decomposition_result, db_state)
+                
+                # Add timing
+                execution_time = time.time() - start_time
+                result["execution_time"] = execution_time
+                
+                try:
+                    from clean_logging import AgentLogger
+                    AgentLogger.query_complete("db_query", execution_time)
+                except ImportError:
+                    logger.success(f"DB_QUERY | Completed in {execution_time:.2f}s")
+                
+                return result
             else:
                 logger.info(f"Single-step query - proceeding directly to SQL generation")
                 logger.info(f"="*80)
-                return self._handle_single_step_query(state, db_state)
+                result = self._handle_single_step_query(state, db_state)
+                
+                # Add timing
+                execution_time = time.time() - start_time
+                result["execution_time"] = execution_time
+                
+                try:
+                    from clean_logging import AgentLogger
+                    AgentLogger.query_complete("db_query", execution_time)
+                except ImportError:
+                    logger.success(f"DB_QUERY | Completed in {execution_time:.2f}s")
+                
+                return result
                 
         except Exception as e:
             logger.error(f"DBQueryAgent orchestration error: {e}")
@@ -168,6 +224,11 @@ class DBQueryAgent(BaseAgent):
         try:
             logger.info("Processing single-step query")
             
+            # ✅ FIX: Retrieve SQL examples for single-step queries too!
+            # Previously only multi-step queries retrieved examples, causing single-step to generate wrong SQL
+            logger.info("🔍 Retrieving SQL examples for single-step query...")
+            retrieved_sqls = self._retrieve_step_specific_sqls(state["query"])
+            
             # Check if this is part of a multi-step workflow (has intermediate_results from previous steps)
             intermediate_results = state.get("intermediate_results", {})
             if intermediate_results:
@@ -175,10 +236,14 @@ class DBQueryAgent(BaseAgent):
                 # Explicitly add to generator state to ensure it's passed through
                 generator_state = BaseAgentState(**state)
                 generator_state["previous_step_results"] = intermediate_results
+                generator_state["retrieved_sql_context"] = retrieved_sqls  # Add SQL examples
                 logger.info(f"   Added intermediate_results as previous_step_results to generator state")
             else:
                 # Prepare state for SQL generator
                 generator_state = BaseAgentState(**state)
+                generator_state["retrieved_sql_context"] = retrieved_sqls  # Add SQL examples
+            
+            logger.info(f"📚 Passing {len(retrieved_sqls)} SQL examples to generator")
             
             result_state = self.sql_generator.process(generator_state)
             
@@ -506,21 +571,63 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"Available context examples: {len(similar_sqls)}")
             logger.info(f"Previous results available: {len(previous_results)}")
             
+            # Get conversation history from state (if available)
+            conversation_history = state.get("conversation_history", []) if state else []
+            
             # Generate SQL for this step - use improved generator if available
             if hasattr(self, 'improved_sql_generator') and self.improved_sql_generator:
                 original_query = state.get("original_query", question)
+                entity_info = state.get("entity_info", None)  # Get entity info from state
+                
+                # ✅ FIXED: Better entity_info validation and fallback
+                if entity_info is None:
+                    # Try alternative state keys where entity info might be stored
+                    entity_info = state.get("verified_entities", None)
+                    if entity_info:
+                        logger.info(f"✅ Found entity_info under 'verified_entities' key")
+                    else:
+                        logger.warning(f"⚠️ No entity_info in state. Available keys: {list(state.keys())}")
+                        # Create empty entity_info structure to prevent downstream errors
+                        entity_info = {
+                            "entities": [],
+                            "entity_types": [],
+                            "entity_mapping": {},
+                            "verified_entities": {}
+                        }
+                else:
+                    logger.info(f"✅ Entity info available: {len(entity_info.get('entities', []))} entities")
+                
                 generation_result = self.improved_sql_generator.generate_sql(
                     question=question,
                     similar_sqls=similar_sqls,
                     previous_results=previous_results,
-                    original_query=original_query
+                    original_query=original_query,
+                    entity_info=entity_info,  # Pass entity info to SQL generator
+                    conversation_history=conversation_history  # Pass conversation history
                 )
                 logger.info(f"Using improved SQL generator (method: {generation_result.get('method', 'unknown')})")
             else:
+                entity_info = state.get("entity_info", None)
+                
+                # ✅ FIXED: Same validation for standard generator
+                if entity_info is None:
+                    entity_info = state.get("verified_entities", None)
+                    if entity_info:
+                        logger.info(f"✅ Found entity_info under 'verified_entities' key (standard gen)")
+                    else:
+                        logger.warning(f"⚠️ No entity_info in state (standard gen)")
+                        entity_info = {
+                            "entities": [],
+                            "entity_types": [],
+                            "entity_mapping": {},
+                            "verified_entities": {}
+                        }
+                
                 generation_result = self.sql_generator.generate_sql(
                     question=question,
                     similar_sqls=similar_sqls,
-                    previous_results=previous_results
+                    previous_results=previous_results,
+                    entity_info=entity_info  # Pass entity info here too
                 )
                 logger.info("Using standard SQL generator")
             
@@ -531,6 +638,13 @@ class DBQueryAgent(BaseAgent):
                     "type": "sql_generation_error"
                 }
             
+            # Log the generated SQL
+            try:
+                from clean_logging import SQLLogger
+                SQLLogger.generated_sql(generation_result["sql"])
+            except ImportError:
+                logger.info(f"Generated SQL:\n{generation_result['sql']}")
+            
             # Execute the generated SQL with error handling
             execution_result = self._execute_sql_with_error_handling(
                 sql_query=generation_result["sql"],
@@ -539,6 +653,13 @@ class DBQueryAgent(BaseAgent):
             )
             
             step_execution_time = time.time() - step_start_time
+            
+            # Log step completion with timing
+            try:
+                from clean_logging import AgentLogger
+                AgentLogger.query_complete("sql_generation_step", step_execution_time)
+            except ImportError:
+                logger.success(f"SQL_GENERATION_STEP | Completed in {step_execution_time:.2f}s")
             
             if execution_result["success"]:
                 return {

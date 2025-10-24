@@ -26,6 +26,8 @@ class BaseAgentState(TypedDict):
     intermediate_results: Dict[str, Any]
     # Session management
     session_id: str
+    # Conversation history for enrichment
+    conversation_history: List[Dict[str, Any]]
 
 class MeetingAgentState(BaseAgentState):
     meeting_date: str

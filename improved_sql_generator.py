@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import List, Dict, Any
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from token_tracker import track_llm_call
+from loguru import logger as loguru_logger
 
 logger = logging.getLogger(__name__)
 
@@ -14,9 +15,12 @@ class ImprovedSQLGenerator(BaseAgent):
     Focuses on generating accurate, simple queries with better multi-step support.
     """
     
-    def __init__(self, llm, schema_file_path: str = "schema"):
+    def __init__(self, llm, schema_file_path: str = "schema", schema_manager=None):
         super().__init__(llm)
         self.schema_file_path = schema_file_path
+        self.schema_manager = schema_manager  # Optional SchemaManager for focused schema
+        
+        # Load full schema from file as fallback
         self.schema_content = self._load_schema_file()
         
         self.core_patterns = {
@@ -58,6 +62,23 @@ class ImprovedSQLGenerator(BaseAgent):
         except Exception as e:
             logger.error(f"Error loading schema file: {e}")
             return "Schema file not found. Unable to load database schema."
+    
+    def _get_schema_context(self, focused_schema: str = None) -> str:
+        """
+        Get schema context for the prompt
+        
+        Args:
+            focused_schema: Optional focused schema from SchemaManager
+            
+        Returns:
+            Schema string to use in prompt
+        """
+        if focused_schema:
+            logger.info("Using focused schema from SchemaManager")
+            return focused_schema
+        else:
+            logger.info("Using full schema from file")
+            return self.schema_content
     
     def _preserve_original_context(self, current_question: str, original_query: str) -> str:
         """
@@ -111,6 +132,7 @@ class ImprovedSQLGenerator(BaseAgent):
         """
         question_lower = question.lower()
         
+        # Default to SUM aggregation (will be changed to None for LIST queries)
         intent = {
             "pattern": None,
             "table": "CustomerInvoice",
@@ -124,6 +146,18 @@ class ImprovedSQLGenerator(BaseAgent):
             "requires_top_n": False,
             "top_n_value": None
         }
+        
+        # Detect LIST queries (no aggregation needed)
+        list_indicators = ['list of', 'show me', 'give me', 'get me', 'find', 'which customers', 'which users', 'who']
+        aggregation_indicators = ['total', 'sum', 'count', 'average', 'avg', 'maximum', 'minimum', 'max', 'min']
+        
+        # If query asks for a list AND doesn't ask for aggregation, set aggregation to None
+        is_list_query = any(indicator in question_lower for indicator in list_indicators)
+        has_aggregation = any(agg in question_lower for agg in aggregation_indicators)
+        
+        if is_list_query and not has_aggregation:
+            intent["aggregation"] = None
+            logger.info("🎯 Detected LIST query (no aggregation required)")
         
         # Detect SKU-related queries
         if 'sku' in question_lower:
@@ -176,10 +210,19 @@ class ImprovedSQLGenerator(BaseAgent):
     
     def generate_sql(self, question: str, similar_sqls: List[str] = None, 
                      previous_results: Dict[str, Any] = None, 
-                     original_query: str = None) -> Dict[str, Any]:
+                     original_query: str = None,
+                     entity_info: Dict[str, Any] = None,
+                     conversation_history: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Generate SQL query with improved context handling.
         Always uses LLM generation for accuracy (simple generation disabled).
+        
+        Args:
+            entity_info: Dictionary containing verified entity information from entity verification
+                        Format: {'entities': ['name'], 'entity_types': ['ViewCustomer'], 
+                                'entity_mapping': {'name': 'ViewCustomer'}}
+            conversation_history: List of previous conversation entries from RedisMemoryManager
+                        Format: [{'original': str, 'result': dict, 'timestamp': float}, ...]
         """
         try:
             enhanced_question = self._preserve_original_context(
@@ -189,7 +232,7 @@ class ImprovedSQLGenerator(BaseAgent):
             intent = self._detect_query_intent(enhanced_question)
             
             # ALWAYS use LLM generation 
-            return self._generate_with_llm(enhanced_question, similar_sqls, previous_results, intent)
+            return self._generate_with_llm(enhanced_question, similar_sqls, previous_results, intent, entity_info, conversation_history)
             
         except Exception as e:
             logger.error(f"SQL generation error: {e}")
@@ -200,32 +243,103 @@ class ImprovedSQLGenerator(BaseAgent):
             }
     
     def _generate_with_llm(self, question: str, similar_sqls: List[Dict], 
-                          previous_results: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]:
+                          previous_results: Dict[str, Any], intent: Dict[str, Any],
+                          entity_info: Dict[str, Any] = None,
+                          conversation_history: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Generate SQL using LLM with focused prompts and better validation.
+        
+        Args:
+            entity_info: Dictionary containing verified entity information
+            conversation_history: List of previous conversation entries for multi-turn context
         """
-        if previous_results:
-            logger.info(f" PREVIOUS_RESULTS received: {list(previous_results.keys())}")
-            for key, val in previous_results.items():
-                if isinstance(val, dict):
-                    logger.info(f"   {key}: keys={list(val.keys())}")
-                    if 'data' in val:
-                        logger.info(f"      data type: {type(val['data'])}, sample: {str(val['data'])[:200]}")
+        import time
+        start_time = time.time()
+        
+        # Log retrieved SQL queries (simplified - question and similarity only)
+        if similar_sqls:
+            logger.info(f"Retrieved {len(similar_sqls)} similar SQL examples:")
+            for idx, sql_info in enumerate(similar_sqls, 1):
+                similarity = sql_info.get('similarity', 0)
+                question_text = sql_info.get('question', 'N/A')
+                logger.info(f"  [{idx}] sim={similarity:.3f} | {question_text}")
         else:
-            logger.info(" PREVIOUS_RESULTS: None")
+            logger.info("No similar SQL queries retrieved")
+        
+        if previous_results:
+            logger.info(f"Previous results available: {list(previous_results.keys())}")
         
         cleaned_previous_results = self._clean_previous_results(previous_results)
         
-        relevant_examples = self._filter_relevant_examples(similar_sqls, intent)
+        # NOTE: We no longer filter examples - all 20 retrieved SQLs are injected into conversation
+        # The LLM will naturally focus on the most similar ones (which are last in conversation)
         
-        # Create focused prompt with previous results context
-        prompt = self._create_focused_prompt(question, relevant_examples, intent, cleaned_previous_results)
+        # Get focused schema if SchemaManager is available
+        focused_schema = None
+        focused_tables = []
         
-        message_log = [{"role": "system", "content": prompt}]
-        message_log.append({"role": "user", "content": f"Generate SQL for: {question}"})
+        if self.schema_manager is not None:
+            try:
+                schema_start = time.time()
+                focused_schema = self.schema_manager.get_schema_to_use_in_prompt(
+                    current_question=question,
+                    list_similar_question_sql_pair=similar_sqls or [],
+                    k=10  # Top 10 similar tables
+                )
+                schema_time = time.time() - schema_start
+                
+                # Extract table names from focused schema for logging
+                if focused_schema:
+                    import re
+                    focused_tables = re.findall(r'^Table: (.+)$', focused_schema, re.MULTILINE)
+                    logger.info(f"Focused schema generated: {len(focused_tables)} tables ({schema_time:.2f}s)")
+                else:
+                    logger.warning("Focused schema is empty")
+            except Exception as e:
+                logger.warning(f"Failed to get focused schema: {e}. Using full schema.")
+                focused_schema = None
+        else:
+            logger.info("No SchemaManager - using full schema from file")
         
-        # ADAPTIVE TEMPERATURE: Adjust creativity based on similarity and relevance
-        adaptive_llm = self._get_adaptive_temperature_llm(similar_sqls, relevant_examples)
+        # Create focused prompt with previous results and entity context
+        # Note: We pass similar_sqls instead of filtered examples since all SQLs are in conversation
+        prompt = self._create_focused_prompt(
+            question, 
+            similar_sqls,  # Pass all retrieved SQLs (for year extraction)
+            intent,  # Keep for logging purposes only
+            cleaned_previous_results, 
+            entity_info,
+            focused_schema=focused_schema  # Pass focused schema to prompt
+        )
+        
+        # Build user message with explicit entity names if available
+        user_message = f"Generate SQL for: {question}"
+        
+        # Add entity names reminder in user message for visibility
+        if entity_info and entity_info.get("entities"):
+            entity_names = entity_info.get("entities", [])
+            entity_types = entity_info.get("entity_types", [])
+            
+            user_message += "\n\nVerified entities found in database:\n"
+            for entity_name, entity_type in zip(entity_names, entity_types):
+                user_message += f"   - {entity_type}: '{entity_name}'\n"
+            
+            user_message += "\nNote: Use these exact values in your WHERE clause (case-sensitive)."
+        
+        # Build message log with conversation history AND retrieved SQLs
+        # Retrieved SQLs are injected as fake conversation to make LLM pay attention
+        message_log = self._build_message_log_with_history(
+            system_prompt=prompt,
+            current_question=user_message,
+            conversation_history=conversation_history,
+            retrieved_sqls=similar_sqls,  # Pass retrieved SQLs for injection
+            max_history=5,  # Keep last 5 REAL conversations
+            max_retrieved_sqls=20  # Inject up to 20 retrieved SQLs
+        )
+        
+        # ADAPTIVE TEMPERATURE: Adjust creativity based on similarity
+        # Note: No longer using filtered examples, just use similarity scores from retrieved SQLs
+        adaptive_llm = self._get_adaptive_temperature_llm(similar_sqls)
         
         # Generate response with adaptive temperature
         response = adaptive_llm.invoke(message_log)
@@ -239,48 +353,171 @@ class ImprovedSQLGenerator(BaseAgent):
             model_name="gpt-4o"
         )
         
+        # Log execution timing
+        execution_time = time.time() - start_time
+        logger.info(f"SQL generation completed in {execution_time:.2f}s")
+        
         return self._parse_and_validate_response(content, question, intent)
     
-    def _get_adaptive_temperature_llm(self, similar_sqls: List[Dict], relevant_examples: List[Dict]):
+    def _build_message_log_with_history(
+        self,
+        system_prompt: str,
+        current_question: str,
+        conversation_history: List[Dict[str, Any]] = None,
+        retrieved_sqls: List[Dict[str, Any]] = None,
+        max_history: int = 5,
+        max_retrieved_sqls: int = 20
+    ) -> List[Dict[str, str]]:
         """
-        Create LLM instance with adaptive temperature based on similarity and relevance of examples.
+        Build message log with conversation history AND retrieved SQLs for multi-turn context.
         
-        Temperature Strategy:
-        - High relevance + high similarity: Low temperature (0.05) - stick to patterns  
-        - Medium relevance: Medium temperature (0.15-0.2) - balanced approach
-        - Low relevance + low similarity: High temperature (0.3-0.4) - creative exploration
+        Strategy: Inject retrieved SQLs as fake conversation history to make LLM pay attention.
+        Retrieved SQLs are sorted in ASCENDING order of similarity (most similar last = most recent).
+        This makes LLM think the most relevant example was just generated.
+        
+        Args:
+            system_prompt: System prompt with instructions
+            current_question: Current user question
+            conversation_history: List of previous REAL conversation entries (from Redis)
+            retrieved_sqls: List of retrieved SQL examples from embedding search
+            max_history: Maximum number of previous conversations to include
+            max_retrieved_sqls: Maximum number of retrieved SQLs to inject (default 20)
+            
+        Returns:
+            Message log in format: [{"role": "system/user/assistant", "content": str}, ...]
+        """
+        message_log = [{"role": "system", "content": system_prompt}]
+        
+        # Step 1: Add REAL conversation history (if exists)
+        if conversation_history and len(conversation_history) > 0:
+            recent_history = conversation_history[-max_history:] if len(conversation_history) > max_history else conversation_history
+            
+            logger.info(f"Adding {len(recent_history)} REAL conversation(s) from Redis")
+            
+            for idx, entry in enumerate(recent_history, 1):
+                user_query = entry.get("original", "")
+                message_log.append({"role": "user", "content": user_query})
+                
+                result = entry.get("result", {})
+                assistant_response = self._format_assistant_response(result, max_rows=5)
+                message_log.append({"role": "assistant", "content": assistant_response})
+                
+                logger.info(f"   Real conversation {idx}: '{user_query[:50]}...'")
+        else:
+            logger.info("No real conversation history")
+        
+        # Step 2: Inject RETRIEVED SQLs as fake conversation (ASCENDING similarity order)
+        if retrieved_sqls and len(retrieved_sqls) > 0:
+            # Sort by similarity ASCENDING (lowest first, highest last)
+            sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
+            
+            logger.info(f"Injecting {len(sorted_sqls)} retrieved SQLs as fake conversation (ASCENDING similarity)")
+            logger.info(f"   Similarity range: {sorted_sqls[0].get('similarity', 0):.3f} (first) -> {sorted_sqls[-1].get('similarity', 0):.3f} (last/most recent)")
+            
+            for idx, sql_info in enumerate(sorted_sqls, 1):
+                # Add as user question
+                question = sql_info.get('question', '')
+                message_log.append({"role": "user", "content": question})
+                
+                # Add as assistant's SQL response (just the SQL, no explanation)
+                sql = sql_info.get('sql', '')
+                assistant_sql = f"```sql\n{sql}\n```"
+                message_log.append({"role": "assistant", "content": assistant_sql})
+                
+                if idx <= 3 or idx == len(sorted_sqls):  # Log first 3 and last one
+                    similarity = sql_info.get('similarity', 0)
+                    marker = "MOST SIMILAR" if idx == len(sorted_sqls) else f"#{idx}"
+                    logger.info(f"   [{marker}] Injected SQL {idx}: sim={similarity:.3f}, Q: '{question[:50]}...'")
+        else:
+            logger.info("No retrieved SQLs to inject")
+        
+        # Step 3: Add CURRENT question (this is the actual user query)
+        message_log.append({"role": "user", "content": current_question})
+        
+        total_messages = len(message_log)
+        real_conv_count = len(conversation_history) * 2 if conversation_history else 0
+        injected_sql_count = len(retrieved_sqls) * 2 if retrieved_sqls else 0
+        
+        logger.info(f"FINAL message log: {total_messages} messages")
+        logger.info(f"   = 1 system + {real_conv_count} real history + {injected_sql_count} injected SQLs + 1 current")
+        
+        return message_log
+    
+    def _format_assistant_response(self, result: Dict[str, Any], max_rows: int = 5) -> str:
+        """
+        Format assistant's previous response for conversation history.
+        Includes SQL + summary, with optional data sample for small results.
+        
+        Args:
+            result: Result dictionary from previous query
+            max_rows: Maximum number of data rows to include
+            
+        Returns:
+            Formatted response string
+        """
+        response_parts = []
+        
+        # SQL query (truncated if too long)
+        if "sql" in result:
+            sql = result["sql"]
+            if len(sql) > 200:
+                response_parts.append(f"Generated SQL: {sql[:200]}...")
+            else:
+                response_parts.append(f"Generated SQL: {sql}")
+        
+        # Result summary
+        rows_returned = result.get("rows_returned", 0)
+        if rows_returned > 0:
+            response_parts.append(f"Result: {rows_returned} rows returned")
+            
+            # Include sample data if available and small enough
+            data = result.get("data", [])
+            if data and isinstance(data, list) and len(data) <= max_rows:
+                response_parts.append(f"\nSample data (first {len(data)} rows):")
+                response_parts.append(str(data))
+            elif data and isinstance(data, list) and len(data) > max_rows:
+                # Just show first few rows
+                sample_data = data[:max_rows]
+                response_parts.append(f"\nSample data (first {max_rows} of {len(data)} rows):")
+                response_parts.append(str(sample_data))
+        else:
+            response_parts.append("Result: Query executed successfully (no rows returned)")
+        
+        # Error info if present
+        if "error" in result:
+            response_parts.append(f"Error: {result['error']}")
+        
+        return "\n".join(response_parts)
+    
+    def _get_adaptive_temperature_llm(self, similar_sqls: List[Dict]):
+        """
+        Create LLM instance with simple 2-level adaptive temperature.
+        
+        Temperature Strategy (simplified):
+        - High similarity (≥0.70): Low temperature (0.1) - follow conversation patterns closely
+        - Low similarity (<0.70): Medium temperature (0.2) - more creative exploration
+        
+        Since examples are in conversation history, the LLM naturally focuses on the most
+        similar ones (which appear last). Temperature just adds a safety valve for low similarity.
         """
         try:
             from langchain_openai import ChatOpenAI
             import os
             
-            # Calculate relevance score
-            total_examples = len(similar_sqls) if similar_sqls else 0
-            relevant_count = len(relevant_examples) if relevant_examples else 0
-            relevance_ratio = relevant_count / total_examples if total_examples > 0 else 0
-            
-            # Get best similarity score
+            # Get best similarity score from retrieved SQLs
             best_similarity = 0
             if similar_sqls and len(similar_sqls) > 0:
                 best_similarity = similar_sqls[0].get('similarity', 0) if isinstance(similar_sqls[0], dict) else 0
             
-            if best_similarity > 0.85 and relevance_ratio > 0.7:
-                temperature = 0.05  #
-                temp_reason = f"high sim ({best_similarity:.3f}) + high rel ({relevance_ratio:.2f}) - follow patterns"
-            elif best_similarity > 0.75 and relevance_ratio > 0.5:
-                temperature = 0.1   
-                temp_reason = f"good sim ({best_similarity:.3f}) + decent rel ({relevance_ratio:.2f}) - guided creativity"
-            elif best_similarity > 0.65 or relevance_ratio > 0.3:
-                temperature = 0.2  
-                temp_reason = f"medium factors (sim: {best_similarity:.3f}, rel: {relevance_ratio:.2f}) - balanced approach"
-            elif best_similarity > 0.5:
-                temperature = 0.3  
-                temp_reason = f"low similarity ({best_similarity:.3f}) - increased creativity"
+            # Simple 2-level temperature
+            if best_similarity >= 0.70:
+                temperature = 0.1
+                temp_reason = f"high similarity ({best_similarity:.3f}) - follow conversation patterns"
             else:
-                temperature = 0.4  
-                temp_reason = f"very low similarity ({best_similarity:.3f}) - maximum creativity"
+                temperature = 0.2
+                temp_reason = f"low similarity ({best_similarity:.3f}) - allow more creativity"
             
-            logger.info(f"IMPROVED ADAPTIVE TEMP: {temperature} ({temp_reason})")
+            logger.info(f"Temperature: {temperature} ({temp_reason})")
             
             # Create adaptive LLM instance
             adaptive_llm = ChatOpenAI(
@@ -296,24 +533,9 @@ class ImprovedSQLGenerator(BaseAgent):
             logger.warning(f"Failed to create adaptive LLM: {e}, using original LLM")
             return self.llm
     
-    def _filter_relevant_examples(self, similar_sqls: List[Dict], intent: Dict[str, Any]) -> List[Dict]:
-        """
-        Filter examples to only include those relevant to the detected intent.
-        """
-        if not similar_sqls:
-            return []
-        
-        relevant = []
-        for sql_info in similar_sqls[:5]:  # Only top 5
-            sql_lower = sql_info.get('sql', '').lower()
-            
-            matches_table = intent['table'].lower() in sql_lower
-            matches_aggregation = intent['aggregation'].lower() in sql_lower
-            
-            if matches_table and sql_info.get('similarity', 0) > 0.7:
-                relevant.append(sql_info)
-        
-        return relevant[:3]  # Max 3 relevant examples
+    # NOTE: _filter_relevant_examples() method removed
+    # We no longer filter examples since ALL 20 retrieved SQLs are injected into conversation history.
+    # The LLM naturally focuses on the most similar ones (which appear last in conversation).
     
     def _clean_previous_results(self, previous_results: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -367,13 +589,12 @@ class ImprovedSQLGenerator(BaseAgent):
         """
         Extract the data year from example SQL queries.
         Looks for patterns like '2024-09-01' in WHERE clauses.
-        Falls back to current year - 1 if not found.
+        Falls back to current year if not found.
         """
         from datetime import datetime
         
         if not examples:
-            # Default to previous year (data is usually from previous year)
-            return datetime.now().year - 1
+            return datetime.now().year
         
         for ex in examples:
             sql = ex.get('sql', '')
@@ -385,172 +606,136 @@ class ImprovedSQLGenerator(BaseAgent):
             if timestamp_matches:
                 return int(timestamp_matches[0])
         
-        # Default to previous year if no year found in examples
-        logger.warning("No year found in examples, defaulting to previous year")
-        return datetime.now().year - 1
+        logger.info(f"No year found in examples, using current year: {datetime.now().year}")
+        return datetime.now().year
     
     def _create_focused_prompt(self, question: str, examples: List[Dict], intent: Dict[str, Any], 
-                              previous_results: Dict[str, Any] = None) -> str:
+                              previous_results: Dict[str, Any] = None,
+                              entity_info: Dict[str, Any] = None,
+                              focused_schema: str = None) -> str:
         """
         Create a focused prompt that emphasizes accuracy and proper SQL generation.
+        
+        Args:
+            entity_info: Dictionary containing verified entity information
+            focused_schema: Optional focused schema containing only relevant tables
         """
         data_year = self._extract_year_from_examples(examples)
         
-        examples_text = ""
-        if examples:
-            examples_text = "\n🔍 RELEVANT EXAMPLES (Study these patterns - they show correct table choices and YEAR):\n\n"
-            for i, ex in enumerate(examples, 1):
-                examples_text += f"Example {i} (Similarity: {ex.get('similarity', 0):.3f}):\n"
-                examples_text += f"Question: {ex['question']}\n"
-                examples_text += f"SQL: {ex['sql'][:400]}...\n\n"
-            
-            examples_text += f" KEY LEARNING: Examples use year {data_year} - this is the DATA YEAR, use it!\n"
-            examples_text += " KEY LEARNING: Notice which tables these examples use (CustomerInvoice vs DistributorSales)\n"
-            examples_text += f" KEY LEARNING: For dates in {data_year}, use WHERE conditions with '{data_year}-MM-DD' format\n\n"
+        # Note: Retrieved SQL examples are now injected into conversation history
+        # (not in the system prompt). This makes LLM pay more attention to them.
         
-        # Get current date for reference only (NOT for queries)
-        from datetime import datetime
-        current_date = datetime.now().strftime('%Y-%m-%d')
-        current_year = datetime.now().year
-        
-        # Extract actual SKU values from previous results
+        # Build previous context (if multi-step query)
+        # Note: Query enrichment is handled by RedisMemoryManager.enrich_query()
+        # This section just provides minimal context for reference
         previous_context = ""
-        extracted_skus = []
         if previous_results:
-            previous_context = "\n PREVIOUS STEP RESULTS (MUST USE THESE IN YOUR QUERY):\n"
+            previous_context = "\n📋 PREVIOUS STEP RESULTS:\n"
+            previous_context += "Note: The current query has already been enriched with context from previous steps.\n"
+            previous_context += "If the query mentions specific values or filters, use them directly.\n\n"
+            
             for step_key, step_data in previous_results.items():
                 if isinstance(step_data, dict):
-                    previous_context += f"\n{step_key.upper()}: {step_data.get('question', 'N/A')}\n"
-                    
+                    previous_context += f"{step_key.upper()}: {step_data.get('question', 'N/A')}\n"
                     if 'sql' in step_data:
-                        prev_sql = step_data['sql'][:300]
+                        prev_sql = step_data['sql'][:200]
                         previous_context += f"SQL: {prev_sql}...\n"
-                    
-                    # Extract SKU values from data if available
-                    # Handle both 'data' (list) and 'query_data' (DataFrame) formats
-                    data = None
-                    if 'data' in step_data:
-                        data = step_data['data']
-                        logger.info(f"      Found 'data' field with type: {type(data)}")
-                    elif 'query_data' in step_data:
-                        # Convert DataFrame to list of dicts
-                        import pandas as pd
-                        query_data = step_data['query_data']
-                        logger.info(f"      Found 'query_data' field with type: {type(query_data)}")
-                        if isinstance(query_data, pd.DataFrame):
-                            data = query_data.to_dict('records')
-                            logger.info(f"      Converted DataFrame to {len(data)} records")
-                        else:
-                            data = query_data
-                    else:
-                        logger.info(f"      No 'data' or 'query_data' found. Available keys: {list(step_data.keys())}")
-                    
-                    if data and isinstance(data, list) and len(data) > 0:
-                        logger.info(f"      Processing {len(data)} rows for SKU extraction")
-                        # Try to find SKU column (skuName, sku_name, SKU, etc.)
-                        for row in data:
-                            if isinstance(row, dict):
-                                for key, value in row.items():
-                                    if 'sku' in key.lower() and value and str(value) not in extracted_skus:
-                                        extracted_skus.append(str(value))
-                                        logger.info(f"      Extracted SKU: {value} from field '{key}'")
-                            
-                            if extracted_skus:
-                                sku_list = "', '".join(extracted_skus)
-                                previous_context += f" EXTRACTED SKUs: {extracted_skus}\n"
-                                previous_context += f"   YOU MUST FILTER: WHERE skuName IN ('{sku_list}')\n"
-                    
-            if extracted_skus:
-                sku_list = "', '".join(extracted_skus)
-                previous_context += f"\n CRITICAL: Filter by these exact SKUs: {extracted_skus}\n"
-                previous_context += f"   Add to your query: WHERE skuName IN ('{sku_list}')\n"
-            else:
-                previous_context += "\n IMPORTANT: If the current question references 'step 1' or 'identified in step X', you MUST use those results.\n"
-                previous_context += "For example: If step 1 identified SKUs ['SKU-A', 'SKU-B', 'SKU-C'], filter WHERE skuName IN ('SKU-A', 'SKU-B', 'SKU-C')\n"
+                    if 'rows_returned' in step_data:
+                        previous_context += f"Rows returned: {step_data['rows_returned']}\n"
+                    previous_context += "\n"
         
-        # Add intent-specific guidance
-        intent_guidance = ""
+        # Add entity context from verification (if available)
+        entity_context = ""
+        if entity_info and entity_info.get("verified_entities"):
+            entity_context = "\n" + "="*80 + "\n"
+            entity_context += "🎯 VERIFIED ENTITY INFORMATION\n"
+            entity_context += "="*80 + "\n"
+            entity_context += "The entity verification agent has confirmed these entities exist in the database.\n"
+            entity_context += "Use the EXACT names as shown below (they are case-sensitive in the database).\n\n"
+            
+            verified_entities = entity_info.get("verified_entities", {})
+            
+            for entity_name, entity_details in verified_entities.items():
+                entity_type = entity_details.get("type", "")
+                db_name = entity_details.get("db_name", entity_name)
+                
+                entity_context += f"ENTITY: '{db_name}'\n"
+                entity_context += f"   Type: {entity_type}\n"
+                entity_context += f"   WARNING: Use this EXACT name (case-sensitive): '{db_name}'\n\n"
+                
+                # Provide general guidance based on entity type
+                if "ViewCustomer" in entity_type:
+                    entity_context += "   Usage: Filter with WHERE ViewCustomer.name = '{db_name}'\n"
+                    entity_context += "   Join: CROSS JOIN ViewCustomer with CustomerInvoice using ViewCustomer.external_id = CustomerInvoice.externalCode\n"
+                elif "ViewDistributor" in entity_type:
+                    entity_context += "   Usage: Filter with WHERE ViewDistributor.name = '{db_name}'\n"
+                    entity_context += "   Join: CROSS JOIN ViewDistributor with relevant sales tables\n"
+                elif "Sku" in entity_type:
+                    entity_context += f"   Usage: Filter with WHERE Sku.name = '{db_name}'\n"
+                else:
+                    # Generic guidance for any other entity type
+                    entity_context += f"   Usage: Filter using the appropriate WHERE clause with this exact value\n"
+                
+                entity_context += "\n"
+            
+            entity_context += "="*80 + "\n"
         
-        if intent.get("requires_sku_join"):
-            intent_guidance += "\n- Query requires SKU data from CustomerInvoiceDetail table\n"
-            intent_guidance += "- CustomerInvoiceDetail has: skuName, skuAmount, dispatch_date, base_quantity, sellingQuantity\n"
-        
-        if intent.get("requires_top_n"):
-            intent_guidance += f"- Return top {intent.get('top_n_value', 'N')} results: Use ORDER BY and LIMIT {intent.get('top_n_value', 'N')}\n"
-        
-        if intent.get("time_range_months"):
-            intent_guidance += f"- Data needed for last {intent.get('time_range_months')} months from {data_year}\n"
-            intent_guidance += f"- Calculate range: DATE_TRUNC('month', dispatch_date) >= '{data_year}-01-01'\n"
-        
-        if intent.get("grouping") == "month":
-            intent_guidance += "- Monthly breakdown needed: Use DATE_TRUNC('month', dispatch_date) in SELECT and GROUP BY\n"
-            intent_guidance += f"- For CustomerInvoiceDetail: GROUP BY DATE_TRUNC('month', dispatch_date), skuName\n"
-        
-        if intent.get("months_requested"):
-            months_str = ', '.join(intent['months_requested'])
-            intent_guidance += f"- Specific months requested: {months_str} in year {data_year}\n"
-        
-        # Specific guidance for multi-step monthly trend queries
-        if extracted_skus and intent.get("grouping") == "month":
-            sku_list = "', '".join(extracted_skus)
-            intent_guidance += f"\n🎯 MULTI-STEP MONTHLY TREND PATTERN:\n"
-            intent_guidance += f"   SELECT\n"
-            intent_guidance += f"     DATE_TRUNC('month', dispatch_date) AS month,\n"
-            intent_guidance += f"     skuName,\n"
-            intent_guidance += f"     MEASURE(SUM(skuAmount)) AS total_sales\n"
-            intent_guidance += f"   FROM CustomerInvoiceDetail\n"
-            intent_guidance += f"   WHERE skuName IN ('{sku_list}')\n"
-            intent_guidance += f"     AND DATE_TRUNC('year', dispatch_date) = DATE_TRUNC('year', TIMESTAMP '{data_year}-01-01')\n"
-            intent_guidance += f"   GROUP BY 1, 2\n"
-            intent_guidance += f"   ORDER BY 1, 2\n"
+        # Note: Intent guidance removed - examples in conversation history show patterns better
+        # Note: Retrieved SQL examples are now part of conversation history (not in prompt)
+        # This makes LLM pay more attention to them as "recent successful queries"
         
         return f"""You are an expert SQL generator for Cube.js. Generate ACCURATE, COMPLETE queries.
 
-📅 DATA YEAR: {data_year} (this is the year in your database, NOT current year {current_year})
-📅 USE {data_year} for ALL date filters, NOT {current_year}!
+🎯 CRITICAL - FOLLOW THE RETRIEVED SQL EXAMPLES ABOVE
+================================================================================
+Your conversation history contains PROVEN, WORKING SQL queries for SIMILAR questions.
 
-CRITICAL RULES FOR CUBE.JS:
-1. 🔍 Study the EXAMPLES carefully - they show correct table patterns and use year {data_year}
-2. 📅 YEAR RULE: Your data is from {data_year}. Use dates like '{data_year}-09-01', NOT '{current_year}-09-01'
-3. 📊 TABLE RULE for SKU queries:
-   - Customer sales/invoices → CustomerInvoice + CustomerInvoiceDetail
-   - Distributor sales → DistributorSales + DistributorSalesDetail
-   - Monthly trends with SKUs → CustomerInvoiceDetail (has dispatch_date + skuName + skuAmount)
-4. 🔗 JOIN RULE: Use CROSS JOIN only (never INNER/LEFT/RIGHT JOIN with ON)
-5. 📐 AGGREGATION RULE: Use MEASURE(SUM(...)) inside WITH clause or direct SELECT
-6. 📝 GROUP BY RULE: Can be inside or outside WITH clause, both work
+⚠️ EXTREMELY IMPORTANT: 
+   - The examples above have SIMILARITY SCORES (0.80+ = very similar to current query)
+   - HIGH SIMILARITY (>0.80) means the SQL pattern is 80%+ the answer you need
+   - MEDIUM SIMILARITY (>0.70) shows the right approach
+   
+📋 YOUR TASK:
+1. Find the HIGHEST SIMILARITY example(s) in conversation history
+2. Study the SQL pattern: tables, joins, WHERE clauses, date logic
+3. COPY that pattern and adapt it for the current question
+4. Preserve the JOIN structure, filtering logic, and date handling from the example
 
-QUERY REQUIREMENTS:
-- Aggregation type: {intent.get('aggregation', 'N/A')}
-- Time grouping: {intent.get('grouping', 'none')}
-- Top N required: {intent.get('requires_top_n', False)}
-{intent_guidance}
+DO NOT create new SQL from scratch if a similar pattern exists above!
+The retrieved examples are PROVEN to work - treat them as templates.
+================================================================================
 
-{examples_text}
+CRITICAL YEAR RULE
+================================================================================
+CURRENT DATA YEAR: {data_year}
+
+⚠️ When user mentions months WITHOUT a year (e.g., "last month", "this month"):
+   - Use year {data_year}
+   - Example: "last month" = '{data_year}-09-01' (September {data_year})
+   - Example: "this month" = '{data_year}-10-01' (October {data_year})
+
+⚠️ If retrieved examples show different years (2024, 2023, etc.):
+   - UPDATE those years to {data_year} in your SQL
+================================================================================
+
+{entity_context}
 {previous_context}
 
-SCHEMA (relevant tables):
-CustomerInvoiceDetail:
-  - dispatch_date (timestamp) - USE THIS for date grouping
-  - skuName (text) - USE THIS for SKU filtering
-  - skuAmount (numeric) - USE THIS for sales amount
-  - base_quantity, sellingQuantity (numeric)
-  
-CustomerInvoice:
-  - dispatchedDate (timestamp)
-  - dispatchedvalue (numeric)
-  - year, monthYear, quarter
+DATABASE SCHEMA (Relevant Tables):
+================================================================================
+{self._get_schema_context(focused_schema)}
+================================================================================
 
-⚠️ CRITICAL CHECKLIST:
-✓ Using year {data_year} in WHERE clause (NOT {current_year})
-✓ Using correct table (CustomerInvoiceDetail for SKU monthly trends)
-✓ If previous steps found SKUs, filtering WHERE skuName IN (...)
-✓ For monthly grouping: DATE_TRUNC('month', dispatch_date)
-✓ NO INNER/LEFT/RIGHT JOIN syntax (use CROSS JOIN if needed)
+⚡ GENERATION CHECKLIST:
+1. ✅ Did I find the HIGHEST SIMILARITY example from conversation history?
+2. ✅ Am I following its JOIN pattern and WHERE clause structure?
+3. ✅ Did I update any years to {data_year}?
+4. ✅ Am I using verified entity names (if provided above)?
+5. ✅ Is my SQL a real query (not placeholder with WHERE 1=1)?
 
 RETURN FORMAT: {{"sql": "YOUR_QUERY_HERE"}}
 
-IMPORTANT: Generate a COMPLETE, ACCURATE SQL query. Do NOT use WHERE 1=1 as a placeholder."""
+Generate SQL by adapting the most similar retrieved example(s) from your conversation history."""
     
     def _parse_and_validate_response(self, content: str, question: str, intent: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -684,7 +869,8 @@ IMPORTANT: Generate a COMPLETE, ACCURATE SQL query. Do NOT use WHERE 1=1 as a pl
     
     def _validate_sql_intent(self, sql: str, intent: Dict[str, Any]) -> bool:
         """
-        Validate that generated SQL matches the detected intent.
+        Basic SQL validation - checks for placeholders and obvious issues.
+        Note: Intent-based validation removed - conversation history guides LLM better.
         """
         sql_lower = sql.lower()
         
@@ -693,20 +879,18 @@ IMPORTANT: Generate a COMPLETE, ACCURATE SQL query. Do NOT use WHERE 1=1 as a pl
             logger.warning("SQL is a placeholder query")
             return False
         
-        # Check primary table is used (relaxed for multi-table queries)
-        # Skip this check as many valid queries use multiple tables
-        
-        # Check for excessive CROSS JOINs (more than 5 is suspicious)
+        # Check for excessive CROSS JOINs (more than 6 is suspicious)
         cross_join_count = sql_lower.count('cross join')
-        if cross_join_count > 5:
+        if cross_join_count > 6:
             logger.warning(f"SQL has too many CROSS JOINs: {cross_join_count}")
             return False
         
-        # Check aggregation is present (if expected)
-        if intent['aggregation'] and intent['aggregation'].lower() not in sql_lower:
-            logger.warning(f"SQL missing expected aggregation: {intent['aggregation']}")
+        # Basic sanity check: SQL should start with SELECT or WITH
+        if not sql.strip().upper().startswith(('SELECT', 'WITH')):
+            logger.warning(f"SQL doesn't start with SELECT or WITH")
             return False
         
+        logger.info("SQL passed basic validation")
         return True
     
     def process(self, state: BaseAgentState) -> DBAgentState:

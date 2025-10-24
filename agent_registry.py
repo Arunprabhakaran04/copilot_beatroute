@@ -7,6 +7,30 @@ import re
 from typing import Dict, Any, List
 
 AGENT_REGISTRY = {
+    "entity_verification": {
+        "name": "Entity Verification Agent",
+        "capabilities": [
+            "Verify exact entity names (SKUs, brands, customers, etc.)",
+            "Generate verification SQL for ambiguous entities",
+            "Detect entity mismatches in database",
+            "Suggest similar entity names when exact match not found",
+            "Validate entity existence before query execution"
+        ],
+        "limitations": [
+            "Does not verify campaign names",
+            "Skips verification for IDs and partial matches",
+            "Cannot verify geographical locations",
+            "No verification for generic entity types"
+        ],
+        "best_for": [
+            "Validating specific entity names",
+            "Preventing failed queries due to typos",
+            "Suggesting correct entity names"
+        ],
+        "output_format": "Verification status or clarification message",
+        "runs_before": ["db_query", "decomposition"]
+    },
+    
     "db_query": {
         "name": "Database Query Agent",
         "capabilities": [

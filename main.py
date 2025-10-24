@@ -19,6 +19,7 @@ from meeting_scheduler_agent import MeetingSchedulerAgent
 from sql_retriever_agent import SQLRetrieverAgent
 from summary_agent import SummaryAgent
 from visualization_agent import VisualizationAgent
+from entity_verification_agent import EntityVerificationAgent
 from redis_memory_manager import RedisMemoryManager, RedisClassificationValidator, initialize_session, get_last_db_query_result, DEFAULT_SESSION_ID, DEFAULT_USER_ID
 from token_tracker import get_token_tracker, track_llm_call
 from improved_sql_generator import ImprovedSQLGenerator
@@ -26,6 +27,9 @@ from temp_files.improved_multi_step_handler import create_improved_decomposition
 from temp_files.llm_multi_step_analyzer import EnhancedMultiStepHandler, create_enhanced_llm_decomposition
 from temp_files.enhanced_ultra_analyzer import EnhancedUltraAnalyzer
 from agent_aware_decomposer import AgentAwareDecomposer
+from db_connection import execute_sql
+from enrich_agent import EnrichAgent
+from openai import OpenAI
 
 # Setup clean logging
 setup_logging()
@@ -54,7 +58,11 @@ class CentralOrchestrator:
             max_tokens=2000
         )
         
+        # Store schema_file_path for later use
+        self.schema_file_path = schema_file_path
+        
         self.agents = {
+            "entity_verification": EntityVerificationAgent(self.llm, execute_sql, "gpt-4o"),
             "db_query": DBQueryAgent(self.db_llm, schema_file_path),
             "email": EmailAgent(self.llm),
             "meeting": MeetingSchedulerAgent(self.llm, files_directory),
@@ -62,10 +70,12 @@ class CentralOrchestrator:
             "sql_retriever": SQLRetrieverAgent(self.db_llm, "embeddings.pkl"),
             "summary": SummaryAgent(self.db_llm, "gpt-4o"),
             "visualization": VisualizationAgent(self.db_llm, "gpt-4o"),
+            # Note: ImprovedSQLGenerator will be recreated per-request with user_context
             "improved_sql_generator": ImprovedSQLGenerator(self.db_llm, schema_file_path)
         }
         
         logger.info("Initialized CentralOrchestrator with:")
+        logger.info(f"  - Entity Verification Agent: OpenAI GPT-4o (for entity validation)")
         logger.info(f"  - DB Query Agent: OpenAI GPT-4o (orchestrator with multi-step capability)")
         logger.info(f"  - Email Agent: OpenAI GPT-4o")
         logger.info(f"  - Meeting Agent: OpenAI GPT-4o")
@@ -163,6 +173,18 @@ class CentralOrchestrator:
         self.enhanced_multi_step_handler = EnhancedMultiStepHandler(self.db_llm)
         self.enhanced_ultra_analyzer = EnhancedUltraAnalyzer(self.db_llm)
         self.agent_aware_decomposer = AgentAwareDecomposer(self.db_llm)
+        
+        # Initialize EnrichAgent with OpenAI client
+        self.openai_client = OpenAI(api_key=openai_api_key)
+        self.enrich_agent = EnrichAgent(
+            openai_client=self.openai_client,
+            sql_retriever_agent=self.agents["sql_retriever"],
+            model="gpt-4o",
+            max_tokens=2000,
+            temperature=0.3
+        )
+        logger.info("  - Enrich Agent: OpenAI GPT-4o (for intelligent query enrichment)")
+        
         self.graph = self._build_orchestrator_graph()
     
     def clear_session_memory(self, session_id: str = DEFAULT_SESSION_ID, user_id: str = DEFAULT_USER_ID):
@@ -275,6 +297,70 @@ class CentralOrchestrator:
                     logger.warning(f"Early cache check failed: {cache_err}. Continuing normally.")
                 
                 # ============================================================
+                # ENTITY VERIFICATION: Before decomposition
+                # ============================================================
+                try:
+                    logger.info("Running entity verification")
+                    entity_state = BaseAgentState(
+                        query=state["query"],
+                        agent_type="entity_verification",
+                        user_id=state.get("user_id", "default_user"),
+                        status="",
+                        error_message="",
+                        success_message="",
+                        result={},
+                        start_time=time.time(),
+                        end_time=0.0,
+                        execution_time=0.0,
+                        classification_confidence=None,
+                        redirect_count=0,
+                        original_query=state["query"],
+                        remaining_tasks=[],
+                        completed_steps=[],
+                        current_step=0,
+                        is_multi_step=False,
+                        intermediate_results={},
+                        session_id=state.get("session_id", "default_session")
+                    )
+                    
+                    entity_verification_agent = self.agents["entity_verification"]
+                    
+                    # Track entity verification timing
+                    entity_start = time.time()
+                    entity_result = entity_verification_agent.process(entity_state)
+                    entity_time = time.time() - entity_start
+                    
+                    try:
+                        from clean_logging import AgentLogger
+                        AgentLogger.query_complete("entity_verification", entity_time)
+                    except ImportError:
+                        logger.success(f"ENTITY_VERIFICATION | Completed in {entity_time:.2f}s")
+                    
+                    if entity_result.get("status") == "entity_verification_needed":
+                        verification_message = entity_result.get("result", {}).get("verification_message", "")
+                        logger.info(f"Entity verification failed: {verification_message}")
+                        
+                        state["status"] = "completed"
+                        state["result"] = {
+                            "message": verification_message,
+                            "type": "entity_verification_error"
+                        }
+                        state["success_message"] = "Entity verification requires clarification"
+                        state["agent_type"] = "entity_verification"
+                        return state
+                    else:
+                        # Store entity information for use by SQL generator
+                        entity_info = entity_result.get("result", {}).get("entity_info", {})
+                        if entity_info:
+                            state["entity_info"] = entity_info
+                            logger.info(f"Entity verification passed: {entity_info}")
+                        else:
+                            logger.info("Entity verification passed")
+                        
+                except Exception as entity_err:
+                    logger.warning(f"Entity verification failed: {entity_err}. Continuing normally.")
+                
+                # ============================================================
                 # NORMAL FLOW: Decomposition and Analysis
                 # ============================================================
                 
@@ -294,6 +380,8 @@ class CentralOrchestrator:
                     
                     if analysis_result.get("is_multi_step", False):
                         state["is_multi_step"] = True
+                        # ✅ FIX: Store classification confidence for multi-step too
+                        state["classification_confidence"] = analysis_result.get('confidence', 0.0)
                         # Get decomposed tasks from the analysis result
                         if "decomposed_tasks" in analysis_result:
                             state["remaining_tasks"] = analysis_result["decomposed_tasks"]
@@ -328,6 +416,8 @@ class CentralOrchestrator:
                     else:
                         state["is_multi_step"] = False
                         state["remaining_tasks"] = [state["query"]]
+                        # ✅ FIX: Store classification confidence in state for db_query_agent
+                        state["classification_confidence"] = analysis_result.get('confidence', 0.0)
                         logger.info(f"🤖 Agent-Aware Analysis: Single-step query detected (confidence: {analysis_result.get('confidence', 0):.2f})")
                         logger.info(f"💡 Reasoning: {analysis_result.get('reasoning', 'No reasoning provided')}")
                 except Exception as e:
@@ -1389,21 +1479,9 @@ class CentralOrchestrator:
             if state["agent_type"] == "visualization":
                 return self._handle_visualization_routing(state, agent)
             
-            # If this is a db_query agent, first retrieve similar SQL examples
-            if state["agent_type"] == "db_query":
-                try:
-                    sql_retriever = self.agents["sql_retriever"]
-                    similar_sqls = sql_retriever.retrieve_similar_sql(state["query"], k=5)
-                    
-                    if similar_sqls:
-                        state["retrieved_sql_context"] = similar_sqls
-                        logger.info(f"Retrieved {len(similar_sqls)} similar SQL examples for db_query agent")
-                    else:
-                        logger.info("No similar SQL examples found for db_query agent")
-                        
-                except Exception as e:
-                    logger.warning(f"SQL retrieval failed, proceeding without examples: {e}")
-                    # Continue without SQL examples if retrieval fails
+            # ❌ REMOVED: Duplicate SQL retrieval (db_query_agent handles this internally)
+            # The db_query_agent will retrieve step-specific SQLs for each decomposed question
+            # Retrieving here creates wasteful duplicate calls and stale context
             
             result_state = agent.process(state)
             
@@ -1654,7 +1732,17 @@ class CentralOrchestrator:
             
             row_count = len(data_rows)
             logger.info(f"Passing {row_count} rows to summary agent from step {data_source_step}")
+            
+            # Track summary agent timing
+            summary_start = time.time()
             result_state = agent.process(summary_state)
+            summary_time = time.time() - summary_start
+            
+            try:
+                from clean_logging import AgentLogger
+                AgentLogger.query_complete("summary", summary_time)
+            except ImportError:
+                logger.success(f"SUMMARY | Completed in {summary_time:.2f}s")
             
             return result_state
                 
@@ -1943,9 +2031,13 @@ class CentralOrchestrator:
         self.classification_keywords[agent_type] = keywords
         print(f"Added new agent: {agent_type}")
     
-    def process_query(self, query: str, session_id: str = DEFAULT_SESSION_ID, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
+    def process_query(self, query: str, session_id: str = DEFAULT_SESSION_ID, user_id: str = DEFAULT_USER_ID, user_context=None) -> Dict[str, Any]:
         """Production-grade query processing with comprehensive error handling"""
         initialize_session(user_id, session_id)
+        
+        # Log if UserContext is available
+        if user_context is not None:
+            logger.info(f"🎯 UserContext available: {len(user_context.schema_map)} tables loaded")
         
         # Input validation
         if not query or not query.strip():
@@ -1971,11 +2063,71 @@ class CentralOrchestrator:
         start_time = time.time()
         
         try:
-            # Memory enrichment with error handling
+            # Enrich query using EnrichAgent (replaces heuristic enrichment)
+            logger.info(f"ORIGINAL QUERY: {query}")
+            
+            # Get conversation history from Redis
+            conversation_history = self.memory.get_recent(session_id, n=5, user_id=user_id)
+            
+            # Update EnrichAgent with schema_manager if user_context is provided
+            if user_context is not None and user_context.is_schema_loaded():
+                self.enrich_agent.schema_manager = user_context.get_schema_manager()
+                logger.info("EnrichAgent now using focused schema from UserContext")
+            
+            # Call EnrichAgent to enrich query
             try:
-                enriched_query = self.memory.enrich_query(session_id, query, user_id)
+                enrich_response = self.enrich_agent.enrich_query(
+                    session_id=session_id,
+                    user_id=user_id,
+                    original_query=query,
+                    conversation_history=conversation_history,
+                    user_name=getattr(user_context, 'user_name', None) if user_context else None,
+                    email=getattr(user_context, 'email', None) if user_context else None
+                )
+                
+                # Check response type: answer, follow_up, or complete_question
+                if "answer" in enrich_response:
+                    # Direct answer - return immediately without processing
+                    logger.info(f"EnrichAgent returned direct answer: {enrich_response['answer']}")
+                    return {
+                        "success": True,
+                        "agent_type": "enrich_agent",
+                        "result": {
+                            "message": enrich_response["answer"],
+                            "type": "direct_answer"
+                        },
+                        "status": "completed",
+                        "execution_time": time.time() - start_time
+                    }
+                
+                elif "follow_up" in enrich_response:
+                    # Follow-up question - return immediately for user to answer
+                    logger.info(f"EnrichAgent needs clarification: {enrich_response['follow_up']}")
+                    return {
+                        "success": True,
+                        "agent_type": "enrich_agent",
+                        "result": {
+                            "message": enrich_response["follow_up"],
+                            "type": "follow_up"
+                        },
+                        "status": "awaiting_clarification",
+                        "execution_time": time.time() - start_time
+                    }
+                
+                elif "complete_question" in enrich_response:
+                    # Enriched query - continue with normal processing
+                    enriched_query = enrich_response["complete_question"]
+                    if enriched_query != query:
+                        logger.info(f"ENRICHED QUERY: {enriched_query}")
+                    else:
+                        logger.info(f"NO ENRICHMENT: Query used as-is (no context needed)")
+                else:
+                    # Fallback: if response format is unexpected, use original query
+                    logger.warning(f"Unexpected EnrichAgent response format: {enrich_response}")
+                    enriched_query = query
+                    
             except Exception as e:
-                logger.warning(f"Memory enrichment failed: {e}. Using original query.")
+                logger.error(f"EnrichAgent failed: {e}. Using original query.")
                 enriched_query = query
 
             # Retrieve intermediate_results from previous query in this session
@@ -1989,6 +2141,27 @@ class CentralOrchestrator:
                     logger.info(f"📦 Loaded {len(previous_intermediate_results)} intermediate result(s) from previous query")
             except Exception as e:
                 logger.warning(f"Failed to load previous intermediate_results: {e}")
+            
+            # If UserContext is provided, recreate ImprovedSQLGenerator with schema_manager
+            if user_context is not None and user_context.is_schema_loaded():
+                logger.info(f"🔄 Recreating ImprovedSQLGenerator with UserContext schema_manager")
+                
+                # Create new ImprovedSQLGenerator with schema_manager
+                improved_sql_gen = ImprovedSQLGenerator(
+                    self.db_llm, 
+                    self.schema_file_path,
+                    schema_manager=user_context.get_schema_manager()
+                )
+                
+                # Update both the orchestrator's copy AND the db_query_agent's copy
+                self.agents["improved_sql_generator"] = improved_sql_gen
+                
+                # CRITICAL: Update db_query_agent's improved_sql_generator instance
+                if "db_query" in self.agents and hasattr(self.agents["db_query"], 'improved_sql_generator'):
+                    self.agents["db_query"].improved_sql_generator = improved_sql_gen
+                    logger.info(f"✅ Updated db_query_agent's ImprovedSQLGenerator with focused schema")
+                
+                logger.info(f"✅ ImprovedSQLGenerator now using focused schema (175 tables available)")
 
             initial_state = BaseAgentState(
                 query=enriched_query,
@@ -2011,12 +2184,12 @@ class CentralOrchestrator:
                 is_multi_step=False,
                 intermediate_results=previous_intermediate_results,  # Load from previous query
                 # Session management fields
-                session_id=session_id
+                session_id=session_id,
+                # Conversation history for agents
+                conversation_history=conversation_history
             )
             
             logger.info(f"PROCESSING QUERY: {query}")
-            if enriched_query != query:
-                logger.info(f"ENRICHED QUERY: {enriched_query}")
             
             # Execute workflow with timeout and retries
             result = self._execute_with_resilience(initial_state)
