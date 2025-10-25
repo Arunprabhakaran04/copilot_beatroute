@@ -651,15 +651,21 @@ class RedisMemoryManager:
         return None
     
     def enrich_query(self, session_id: str, original_query: str, user_id: str = DEFAULT_USER_ID) -> str:
-        """Enrich query with context from conversation history"""
+        """Enrich query with context from conversation history (HEURISTIC VERSION)"""
+        logger.info(f" ENRICHMENT STARTED for query: '{original_query}'")
+        
         history = self.session_manager.get_data(user_id, session_id, "conversation_history") or []
 
         if not history:
+            logger.info("     No conversation history found - returning original query")
             return original_query
+        
+        logger.info(f"    Found {len(history)} entries in conversation history")
 
         # First, use existing lightweight heuristics (fast, deterministic)
         heur = self._heuristic_expand(original_query, history)
         if heur:
+            logger.info(f"    HEURISTIC ENRICHMENT: '{heur}'")
             return heur
 
         lowered = original_query.lower()
@@ -675,10 +681,22 @@ class RedisMemoryManager:
             "same email" in lowered,
             "add to" in lowered and ("email" in lowered or "@" in original_query),
             "send to" in lowered and "also" in lowered,
+            #added extra
+            "break it down" in lowered,
+            "break down" in lowered,
+            "can you break" in lowered,
+            "breakdown" in lowered,
+            "group by" in lowered and len(original_query.split()) < 10,  
+            "it" in lowered and ("by" in lowered or "for" in lowered),  # "show it by category", "get it for X"
+            original_query.strip().startswith(("by ", "for ", "in ", "from ")),  # Starts with preposition
+            len(original_query.split()) <= 6 and any(w in lowered for w in ["by", "for", "in", "from", "where"]),  # Short query with context references
         ])
 
         if not needs_enrichment:
+            logger.info("   ℹ  No enrichment triggers detected - returning original query")
             return original_query
+        
+        logger.info(f"    Enrichment needed detected!")
 
         recent = self.get_recent(session_id, self.max_history, user_id)
 
@@ -713,14 +731,20 @@ class RedisMemoryManager:
 
         try:
             messages = enrich_prompt.format_messages(recent_context=context_text, query=original_query)
+            logger.info(f"    Calling LLM for enrichment...")
             response = self.llm.invoke(messages)
             content = response.content.strip()
+            logger.info(f"    LLM response: {content[:200]}...")
             match = re.search(r'ENRICHED_QUERY:\s*(.+)', content, re.DOTALL)
             if match:
                 enriched = match.group(1).strip()
                 if enriched and self._validate_enriched_query(original_query, enriched):
-                    logger.info(f"Query enriched: '{original_query}' → '{enriched}'")
+                    logger.info(f"    LLM ENRICHMENT SUCCESS: '{enriched}'")
                     return enriched
+                else:
+                    logger.warning(f"     LLM enrichment validation failed")
+            else:
+                logger.warning(f"     No ENRICHED_QUERY found in LLM response")
         except Exception as e:
             logger.warning(f"LLM enrichment failed: {e}")
 
@@ -755,6 +779,7 @@ class RedisMemoryManager:
 
         # As a last resort, return the original query (system will re-classify/execute)
         return original_query
+    
     
     def _validate_enriched_query(self, original: str, enriched: str) -> bool:
         """Validate that enriched query makes sense"""
