@@ -11,6 +11,5 @@ database_structure.json
 intermediate_query
 schema
 embeddings.pkl
-db_connection.py
 logs/
 execute_table_query.py
