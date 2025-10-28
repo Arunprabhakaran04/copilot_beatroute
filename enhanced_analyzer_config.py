@@ -158,57 +158,6 @@ def print_analyzer_comparison():
     print("✅ Comprehensive error handling and recovery")
 
 
-def verify_integration():
-    """Verify that the enhanced analyzer is properly integrated."""
-    
-    print("\n" + "=" * 70) 
-    print("INTEGRATION VERIFICATION")
-    print("=" * 70)
-    
-    try:
-        # Check if we can import the enhanced analyzer
-        from temp_files.enhanced_ultra_analyzer import EnhancedUltraMultiStepHandler
-        print("✅ Enhanced Ultra Analyzer: Import successful")
-        
-        # Check if main.py has the integration
-        with open("main.py", "r") as f:
-            main_content = f.read()
-            
-        if "enhanced_ultra_analyzer" in main_content:
-            print("✅ Main.py Integration: Enhanced analyzer imported")
-        else:
-            print("❌ Main.py Integration: Enhanced analyzer not imported")
-            
-        if "EnhancedUltraMultiStepHandler" in main_content:
-            print("✅ Main.py Integration: Handler class referenced")
-        else:
-            print("❌ Main.py Integration: Handler class not found")
-            
-        if "enhanced_ultra_handler" in main_content:
-            print("✅ Main.py Integration: Handler instance created")
-        else:
-            print("❌ Main.py Integration: Handler instance not created")
-            
-        # Check for proper fallback chain
-        if "enhanced_ultra_handler.should_decompose_query" in main_content:
-            print("✅ Analysis Integration: Enhanced ultra used as primary")
-        else:
-            print("❌ Analysis Integration: Enhanced ultra not used as primary")
-            
-        print("\n🎉 Integration verification complete!")
-        return True
-        
-    except ImportError as e:
-        print(f"❌ Import Error: {e}")
-        return False
-    except FileNotFoundError:
-        print("❌ main.py file not found")
-        return False
-    except Exception as e:
-        print(f"❌ Verification Error: {e}")
-        return False
-
-
 if __name__ == "__main__":
     print("Enhanced Ultra-Advanced Analyzer Configuration")
     
