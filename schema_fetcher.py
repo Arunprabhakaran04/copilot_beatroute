@@ -72,7 +72,8 @@ def decode_base64_token(base64_token_str: str) -> Tuple[Optional[str], Optional[
 def get_final_schema_from_token(
     cubejs_api_url: str,
     auth_token: str,
-    excluded_keywords: Optional[List[str]] = None
+    excluded_keywords: Optional[List[str]] = None,
+    session_id: Optional[str] = None
 ) -> Tuple[List[str], Dict[str, str], Dict]:
     """
     Fetch complete database schema from CubeJS and INFORMATION_SCHEMA
@@ -162,7 +163,7 @@ def get_final_schema_from_token(
     logger.info("📊 Querying INFORMATION_SCHEMA for table columns...")
     
     try:
-        result = execute_sql(sql_query)
+        result = execute_sql(sql_query, session_id=session_id)
         
         if not result.get('success'):
             logger.error(f"❌ Failed to query INFORMATION_SCHEMA: {result.get('error')}")
@@ -358,7 +359,8 @@ class SchemaManager:
         try:
             schema_list, schema_map, cubejs_data = get_final_schema_from_token(
                 cubejs_api_url,
-                auth_token
+                auth_token,
+                session_id=base64_token  # Pass the full base64 token as session_id for DB auth
             )
             
             # Store the data
