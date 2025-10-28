@@ -278,6 +278,16 @@ class DBQueryAgent(BaseAgent):
                 )
                 
                 if execution_result["success"]:
+                    # Log execution_result structure for debugging
+                    logger.info(f"🔍 EXECUTION_RESULT STRUCTURE:")
+                    logger.info(f"   Keys: {list(execution_result.keys())}")
+                    logger.info(f"   Has 'query_results': {'query_results' in execution_result}")
+                    logger.info(f"   Has 'results': {'results' in execution_result}")
+                    if "query_results" in execution_result:
+                        logger.info(f"   query_results type: {type(execution_result['query_results'])}")
+                    if "results" in execution_result:
+                        logger.info(f"   results type: {type(execution_result['results'])}")
+                    
                     # Convert query results to pandas DataFrame
                     query_data_df = self._convert_to_dataframe(execution_result.get("query_results", {}))
                     
@@ -308,25 +318,30 @@ class DBQueryAgent(BaseAgent):
                     if summary_html:
                         db_state["result"]["query_results"]["summary"] = summary_html
                     
-                    # Log what we're putting in query_results
+                    # Log what we're putting in query_results (with error handling)
                     query_results = db_state["result"]["query_results"]
                     logger.info(f"📦 QUERY_RESULTS STRUCTURE:")
-                    logger.info(f"   Keys: {list(query_results.keys())}")
-                    if "data" in query_results:
-                        data = query_results["data"]
-                        logger.info(f"   Data type: {type(data)}")
-                        logger.info(f"   Data length: {len(data) if isinstance(data, (list, dict)) else 'N/A'}")
-                        if isinstance(data, list) and len(data) > 0:
-                            logger.info(f"   📊 TABLE DATA (first 3 rows):")
-                            for idx, row in enumerate(data[:3]):
-                                logger.info(f"      Row {idx + 1}: {row}")
-                    else:
-                        logger.warning(f"   ⚠️ NO 'data' FIELD IN query_results!")
                     
-                    if "summary" in query_results:
-                        logger.info(f"   Summary field exists: {len(query_results['summary'])} chars")
+                    # Check if query_results is actually a dict
+                    if isinstance(query_results, dict):
+                        logger.info(f"   Keys: {list(query_results.keys())}")
+                        if "data" in query_results:
+                            data = query_results["data"]
+                            logger.info(f"   Data type: {type(data)}")
+                            logger.info(f"   Data length: {len(data) if isinstance(data, (list, dict)) else 'N/A'}")
+                            if isinstance(data, list) and len(data) > 0:
+                                logger.info(f"   📊 TABLE DATA (first 3 rows):")
+                                for idx, row in enumerate(data[:3]):
+                                    logger.info(f"      Row {idx + 1}: {row}")
+                        else:
+                            logger.warning(f"   ⚠️ NO 'data' FIELD IN query_results!")
+                        
+                        if "summary" in query_results:
+                            logger.info(f"   Summary field exists: {len(query_results['summary'])} chars")
+                        else:
+                            logger.warning(f"   ⚠️ NO 'summary' FIELD IN query_results!")
                     else:
-                        logger.warning(f"   ⚠️ NO 'summary' FIELD IN query_results!")
+                        logger.error(f"   ❌ query_results is not a dict! Type: {type(query_results)}, Value: {query_results}")
                     
                     db_state["result"]["query_data"] = query_data_df  # Add DataFrame for summary agent
                     db_state["result"]["formatted_output"] = execution_result.get("formatted_output", "")
