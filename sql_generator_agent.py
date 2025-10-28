@@ -14,10 +14,10 @@ class SQLGeneratorAgent(BaseAgent):
     Generates reliable, error-free SQL queries with strict validation.
     """
     
-    def __init__(self, llm, schema_file_path: str = "schema"):
+    def __init__(self, llm, schema_file_path: str = None):
         super().__init__(llm)
         self.schema_file_path = schema_file_path
-        self.schema_content = self._load_schema_file()
+        self.schema_content = self._load_schema_file() if schema_file_path else ""
         self.structured_schema = self._load_structured_schema()
         self.cube_js_rules = self._initialize_cube_js_rules()
     
@@ -78,6 +78,10 @@ class SQLGeneratorAgent(BaseAgent):
     
     def _load_schema_file(self) -> str:
         """Load the database schema from the schema file."""
+        if not self.schema_file_path:
+            logger.info("No schema file path provided - will use UserContext schema")
+            return ""
+        
         try:
             with open(self.schema_file_path, 'r', encoding='utf-8') as file:
                 content = file.read()
@@ -88,11 +92,11 @@ class SQLGeneratorAgent(BaseAgent):
                 logger.info(f"Schema loaded: {self.schema_file_path} ({len(content)} chars)")
                 return content
         except FileNotFoundError:
-            logger.error(f"Schema file not found: {self.schema_file_path}")
-            return "Schema file not found. Unable to load database schema."
+            logger.warning(f"Schema file not found: {self.schema_file_path} - will use UserContext schema")
+            return ""
         except Exception as e:
-            logger.error(f"Error loading schema: {e}")
-            return f"Error loading schema: {str(e)}"
+            logger.warning(f"Error loading schema: {e} - will use UserContext schema")
+            return ""
     
     def get_schema_info(self) -> str:
         """Return the loaded schema information."""

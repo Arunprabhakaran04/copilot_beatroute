@@ -33,7 +33,14 @@ setup_logging()
 
 
 class CentralOrchestrator:
-    def __init__(self, files_directory: str = "./user_files", schema_file_path: str = "schema"):
+    def __init__(self, files_directory: str = "./user_files", schema_file_path: str = None):
+        """
+        Initialize Central Orchestrator
+        
+        Args:
+            files_directory: Directory for user context files
+            schema_file_path: DEPRECATED - Schema now loaded from UserContext via CubeJS
+        """
         load_dotenv()
         
         openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -68,7 +75,7 @@ class CentralOrchestrator:
             "summary": SummaryAgent(self.db_llm, "gpt-4o"),
             "visualization": VisualizationAgent(self.db_llm, "gpt-4o"),
             # Note: ImprovedSQLGenerator will be recreated per-request with user_context
-            "improved_sql_generator": ImprovedSQLGenerator(self.db_llm, schema_file_path)
+            "improved_sql_generator": ImprovedSQLGenerator(self.db_llm, schema_file_path=None)
         }
         
         logger.info("Initialized CentralOrchestrator with:")

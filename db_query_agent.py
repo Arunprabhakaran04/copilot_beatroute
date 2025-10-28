@@ -19,7 +19,13 @@ class DBQueryAgent(BaseAgent):
     It coordinates between the SQL Query Decomposer and SQL Generator agents.
     """
     
-    def __init__(self, llm, schema_file_path: str = "schema"):
+    def __init__(self, llm, schema_file_path: str = None):
+        super().__init__(llm)
+        self.schema_file_path = schema_file_path  # Kept for backward compatibility, not used
+        
+        # Initialize sub-agents (schema will come from UserContext)
+        self.sql_generator = SQLGeneratorAgent(llm, schema_file_path=None)
+        self.exception_agent = SQLExceptionAgent(llm, schema_file_path=None, max_iterations=5)
         super().__init__(llm)
         self.schema_file_path = schema_file_path
         self.conversation_history = []  
@@ -31,7 +37,7 @@ class DBQueryAgent(BaseAgent):
         # Add improved SQL generator
         try:
             from improved_sql_generator import ImprovedSQLGenerator
-            self.improved_sql_generator = ImprovedSQLGenerator(llm, schema_file_path)
+            self.improved_sql_generator = ImprovedSQLGenerator(llm, schema_file_path=None)
             logger.info("  - Improved SQL Generator: ENABLED (for better accuracy)")
         except ImportError:
             logger.warning("  - Improved SQL Generator: NOT AVAILABLE (using fallback)")
@@ -248,11 +254,26 @@ class DBQueryAgent(BaseAgent):
             result_state = self.sql_generator.process(generator_state)
             
             if result_state["status"] == "completed":
+                # Get focused schema from user_context if available
+                focused_schema = None
+                if "user_context" in state and state["user_context"]:
+                    user_context = state["user_context"]
+                    if hasattr(user_context, 'get_focused_schema'):
+                        # Get schema based on the question and retrieved SQLs
+                        similar_sqls = generator_state.get("retrieved_sql_context", [])
+                        focused_schema = user_context.get_focused_schema(
+                            question=state["query"],
+                            retrieved_sqls=[{"sql": sql} for sql in similar_sqls] if similar_sqls else [],
+                            k=10
+                        )
+                        logger.info("✅ Got focused schema from UserContext for exception handling")
+                
                 # Try to execute the SQL and handle any errors
                 execution_result = self._execute_sql_with_error_handling(
                     sql_query=result_state["sql_query"],
                     original_question=state["query"],
-                    similar_sqls=generator_state.get("retrieved_sql_context", [])
+                    similar_sqls=generator_state.get("retrieved_sql_context", []),
+                    focused_schema=focused_schema  # Pass focused schema
                 )
                 
                 if execution_result["success"]:
@@ -645,11 +666,25 @@ class DBQueryAgent(BaseAgent):
             except ImportError:
                 logger.info(f"Generated SQL:\n{generation_result['sql']}")
             
+            # Get focused schema from user_context if available
+            focused_schema = None
+            if "user_context" in state and state["user_context"]:
+                user_context = state["user_context"]
+                if hasattr(user_context, 'get_focused_schema'):
+                    # Get schema based on the question and retrieved SQLs
+                    focused_schema = user_context.get_focused_schema(
+                        question=question,
+                        retrieved_sqls=[{"sql": sql} for sql in similar_sqls] if similar_sqls else [],
+                        k=10
+                    )
+                    logger.info("✅ Got focused schema from UserContext for exception handling (multi-step)")
+            
             # Execute the generated SQL with error handling
             execution_result = self._execute_sql_with_error_handling(
                 sql_query=generation_result["sql"],
                 original_question=question,
-                similar_sqls=similar_sqls
+                similar_sqls=similar_sqls,
+                focused_schema=focused_schema  # Pass focused schema
             )
             
             step_execution_time = time.time() - step_start_time
@@ -748,7 +783,8 @@ class DBQueryAgent(BaseAgent):
             }
     
     def _execute_sql_with_error_handling(self, sql_query: str, original_question: str, 
-                                       similar_sqls: List[str] = None) -> Dict[str, Any]:
+                                       similar_sqls: List[str] = None,
+                                       focused_schema: str = None) -> Dict[str, Any]:
         """
         Execute SQL with comprehensive error handling and automatic fixing.
         
@@ -757,6 +793,12 @@ class DBQueryAgent(BaseAgent):
         2. If an error occurs, uses the Exception Agent to analyze and fix
         3. Retries execution with the corrected SQL
         4. Returns the final result or failure after max attempts
+        
+        Args:
+            sql_query: The SQL query to execute
+            original_question: The original user question
+            similar_sqls: Optional list of similar successful SQL queries
+            focused_schema: Optional focused schema from UserContext
         """
         try:
             logger.info(f"EXECUTING SQL WITH ERROR HANDLING:")
@@ -787,7 +829,8 @@ class DBQueryAgent(BaseAgent):
                 original_question=original_question,
                 failed_sql=sql_query,
                 error_message=execution_result["error"],
-                similar_sqls=similar_sqls or []
+                similar_sqls=similar_sqls or [],
+                focused_schema=focused_schema  # Pass focused schema to exception agent
             )
             
             if fix_result["success"]:

@@ -15,13 +15,13 @@ class ImprovedSQLGenerator(BaseAgent):
     Focuses on generating accurate, simple queries with better multi-step support.
     """
     
-    def __init__(self, llm, schema_file_path: str = "schema", schema_manager=None):
+    def __init__(self, llm, schema_file_path: str = None, schema_manager=None):
         super().__init__(llm)
         self.schema_file_path = schema_file_path
         self.schema_manager = schema_manager  # Optional SchemaManager for focused schema
         
-        # Load full schema from file as fallback
-        self.schema_content = self._load_schema_file()
+        # Load full schema from file as fallback (only if path provided)
+        self.schema_content = self._load_schema_file() if schema_file_path else ""
         
         self.core_patterns = {
             "monthly_sales": """
@@ -50,6 +50,10 @@ class ImprovedSQLGenerator(BaseAgent):
     
     def _load_schema_file(self) -> str:
         """Load the database schema from the schema file."""
+        if not self.schema_file_path:
+            logger.info("No schema file path provided - will use UserContext schema")
+            return ""
+        
         try:
             with open(self.schema_file_path, 'r', encoding='utf-8') as file:
                 content = file.read()
@@ -60,8 +64,8 @@ class ImprovedSQLGenerator(BaseAgent):
                 logger.info(f"Successfully loaded schema file: {self.schema_file_path}")
                 return content
         except Exception as e:
-            logger.error(f"Error loading schema file: {e}")
-            return "Schema file not found. Unable to load database schema."
+            logger.warning(f"Could not load schema file: {e} - will use UserContext schema")
+            return ""
     
     def _get_schema_context(self, focused_schema: str = None) -> str:
         """

@@ -17,11 +17,11 @@ class SQLExceptionAgent(BaseAgent):
     This agent is designed to be extremely fault-tolerant and learns from patterns to improve.
     """
     
-    def __init__(self, llm, schema_file_path: str = "schema", max_iterations: int = 5):
+    def __init__(self, llm, schema_file_path: str = None, max_iterations: int = 5):
         super().__init__(llm)
         self.schema_file_path = schema_file_path
         self.max_iterations = max_iterations
-        self.schema_content = self._load_schema_file()
+        self.schema_content = self._load_schema_file() if schema_file_path else ""
         self.structured_schema = self._load_structured_schema()
         self.table_relationships = self._analyze_table_relationships()
         self.cube_js_rules = self._load_cube_js_rules()
@@ -155,6 +155,10 @@ class SQLExceptionAgent(BaseAgent):
     
     def _load_schema_file(self) -> str:
         """Load the database schema for error analysis."""
+        if not self.schema_file_path:
+            logger.info("No schema file path provided - will use UserContext schema")
+            return ""
+        
         try:
             with open(self.schema_file_path, 'r', encoding='utf-8') as file:
                 content = file.read()
@@ -163,11 +167,11 @@ class SQLExceptionAgent(BaseAgent):
                 content = content.replace('\\n', '\n')
                 return content
         except FileNotFoundError:
-            logger.error(f"Schema file not found: {self.schema_file_path}")
-            return "Schema file not found."
+            logger.warning(f"Schema file not found: {self.schema_file_path} - will use UserContext schema")
+            return ""
         except Exception as e:
-            logger.error(f"Error loading schema file: {e}")
-            return f"Error loading schema: {str(e)}"
+            logger.warning(f"Error loading schema file: {e} - will use UserContext schema")
+            return ""
     
     def _load_structured_schema(self) -> Dict[str, Any]:
         """Load enhanced schema with FK relationships for better error correction."""
@@ -197,7 +201,8 @@ class SQLExceptionAgent(BaseAgent):
     
     def analyze_and_fix_sql_error(self, original_question: str, failed_sql: str, 
                                   error_message: str, similar_sqls: List[str] = None,
-                                  previous_attempts: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+                                  previous_attempts: List[Dict[str, Any]] = None,
+                                  focused_schema: str = None) -> Dict[str, Any]:
         """
         Main method to analyze SQL error and generate a corrected query.
         
@@ -207,6 +212,7 @@ class SQLExceptionAgent(BaseAgent):
             error_message: The error message from SQL execution
             similar_sqls: Context examples for reference
             previous_attempts: List of previous fix attempts
+            focused_schema: Optional focused schema from UserContext
             
         Returns:
             Dict with analysis results and corrected SQL
@@ -233,7 +239,8 @@ class SQLExceptionAgent(BaseAgent):
                 error_analysis=error_analysis,
                 root_cause=root_cause,
                 similar_sqls=similar_sqls or [],
-                previous_attempts=previous_attempts or []
+                previous_attempts=previous_attempts or [],
+                focused_schema=focused_schema  # Pass focused schema
             )
             
             return {
@@ -386,7 +393,8 @@ Respond in JSON format:
     def _generate_corrected_sql(self, original_question: str, failed_sql: str, 
                                error_message: str, error_analysis: Dict[str, Any],
                                root_cause: Dict[str, Any], similar_sqls: List[str],
-                               previous_attempts: List[Dict[str, Any]]) -> Dict[str, Any]:
+                               previous_attempts: List[Dict[str, Any]],
+                               focused_schema: str = None) -> Dict[str, Any]:
         """Enhanced SQL correction with deep Cube.js understanding and strategic fixes."""
         
         # Format similar SQLs for context
@@ -403,14 +411,18 @@ Respond in JSON format:
                 for i, attempt in enumerate(previous_attempts[-2:])  # Last 2 attempts
             ])
         
-        current_date = datetime.now().strftime('%Y-%m-%d')
+        current_date = datetime.now().strftime('%Y-%m-% d')
         
         # Determine fix strategy based on error analysis
         fix_strategy = error_analysis.get("recommended_strategy", "general_fix")
         
-        # Build enhanced schema context for relevant tables
+        # Build schema context from focused_schema (if provided) or structured_schema
         schema_context = ""
-        if self.structured_schema and 'tables' in self.structured_schema:
+        if focused_schema:
+            # Use the focused schema from UserContext directly
+            schema_context = f"\n\nDATABASE SCHEMA (USE EXACT FIELD NAMES):\n{focused_schema}"
+            logger.info("✅ Using focused schema from UserContext for SQL correction")
+        elif self.structured_schema and 'tables' in self.structured_schema:
             important_tables = ['CustomerInvoice', 'CustomerInvoiceDetail', 'DistributorSales', 
                                'DistributorSalesDetail', 'Sku', 'Order', 'OrderDetail']
             
@@ -1046,13 +1058,30 @@ LIMIT 100;"""
             return "progressive_simplification"
     
     def iterative_fix_sql(self, original_question: str, failed_sql: str, 
-                         error_message: str, similar_sqls: List[str] = None) -> Dict[str, Any]:
+                         error_message: str, similar_sqls: List[str] = None, 
+                         focused_schema: str = None) -> Dict[str, Any]:
         """
         Enhanced iterative SQL fixing with progressive simplification strategy.
+        
+        Args:
+            original_question: The original user question
+            failed_sql: The SQL query that failed
+            error_message: The error message from execution
+            similar_sqls: Optional list of similar successful SQL queries
+            focused_schema: Optional focused schema from UserContext (replaces schema file)
         """
         logger.info(f"🔧 STARTING ENHANCED ITERATIVE SQL FIX PROCESS")
         logger.info(f"Max iterations: {self.max_iterations}")
         logger.info(f"Error to fix: {error_message[:150]}...")
+        
+        # Use focused schema if provided, otherwise fall back to schema_content
+        schema_to_use = focused_schema if focused_schema else self.schema_content
+        if focused_schema:
+            logger.info("✅ Using focused schema from UserContext")
+        elif self.schema_content:
+            logger.info("📄 Using schema from file")
+        else:
+            logger.warning("⚠️ No schema available for SQL fixing")
         
         attempts = []
         current_sql = failed_sql
@@ -1085,7 +1114,8 @@ LIMIT 100;"""
                 failed_sql=current_sql,
                 error_message=current_error,
                 similar_sqls=similar_sqls,
-                previous_attempts=attempts
+                previous_attempts=attempts,
+                focused_schema=schema_to_use  # Pass focused schema
             )
             
             attempt_record = {
