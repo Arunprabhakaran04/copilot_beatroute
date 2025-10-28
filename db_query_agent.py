@@ -273,7 +273,8 @@ class DBQueryAgent(BaseAgent):
                     sql_query=result_state["sql_query"],
                     original_question=state["query"],
                     similar_sqls=generator_state.get("retrieved_sql_context", []),
-                    focused_schema=focused_schema  # Pass focused schema
+                    focused_schema=focused_schema,
+                    session_id=state.get("session_id")  # Pass session_id for DB auth
                 )
                 
                 if execution_result["success"]:
@@ -684,7 +685,8 @@ class DBQueryAgent(BaseAgent):
                 sql_query=generation_result["sql"],
                 original_question=question,
                 similar_sqls=similar_sqls,
-                focused_schema=focused_schema  # Pass focused schema
+                focused_schema=focused_schema,  # Pass focused schema
+                session_id=state.get("session_id")  # Pass session_id for DB auth
             )
             
             step_execution_time = time.time() - step_start_time
@@ -732,10 +734,14 @@ class DBQueryAgent(BaseAgent):
                 "type": "step_execution_error"
             }
     
-    def _execute_sql_in_database(self, sql_query: str) -> Dict[str, Any]:
+    def _execute_sql_in_database(self, sql_query: str, session_id: str = None) -> Dict[str, Any]:
         """
         Execute SQL query in the actual Cube.js database and return results.
         
+        Args:
+            sql_query: The SQL query to execute
+            session_id: Session ID for database authentication
+            
         Returns:
             Dict with success status, results, and any error information
         """
@@ -743,8 +749,8 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"EXECUTING SQL IN CUBE.JS DATABASE:")
             logger.info(f"SQL: {sql_query}")
             
-            # Execute query using database connection
-            db_result = execute_sql(sql_query)
+            # Execute query using database connection with session_id for authentication
+            db_result = execute_sql(sql_query, session_id=session_id)
             
             if db_result['success']:
                 logger.info(f" DATABASE EXECUTION SUCCESSFUL:")
@@ -784,7 +790,8 @@ class DBQueryAgent(BaseAgent):
     
     def _execute_sql_with_error_handling(self, sql_query: str, original_question: str, 
                                        similar_sqls: List[str] = None,
-                                       focused_schema: str = None) -> Dict[str, Any]:
+                                       focused_schema: str = None,
+                                       session_id: str = None) -> Dict[str, Any]:
         """
         Execute SQL with comprehensive error handling and automatic fixing.
         
@@ -799,6 +806,7 @@ class DBQueryAgent(BaseAgent):
             original_question: The original user question
             similar_sqls: Optional list of similar successful SQL queries
             focused_schema: Optional focused schema from UserContext
+            session_id: Session ID for database authentication
         """
         try:
             logger.info(f"EXECUTING SQL WITH ERROR HANDLING:")
@@ -838,7 +846,7 @@ class DBQueryAgent(BaseAgent):
                 logger.info(f" RETRYING WITH CORRECTED SQL:")
                 logger.info(f"Corrected SQL: {corrected_sql}")
                 
-                retry_execution = self._execute_sql_in_database(corrected_sql)
+                retry_execution = self._execute_sql_in_database(corrected_sql, session_id=session_id)
                 
                 if retry_execution["success"]:
                     logger.info(f" SQL EXECUTION SUCCESSFUL AFTER EXCEPTION HANDLING")
