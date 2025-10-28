@@ -43,7 +43,7 @@ class DBQueryAgent(BaseAgent):
             logger.info("DBQueryAgent initialized as orchestrator with sub-agents:")
             logger.info("  - SQL Query Decomposer: for multi-step analysis")
             logger.info("  - SQL Generator: for individual query generation")
-            logger.info("  - SQL Retriever: for step-specific context retrieval")
+            logger.info("  - SQL Retriever: for step-specific contecxt retrieval")
             logger.info("  - SQL Exception Agent: for error analysis and fixing")
         except Exception as e:
             logger.warning(f"Could not initialize SQL retriever: {e}")
