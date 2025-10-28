@@ -17,6 +17,7 @@ from datetime import datetime, date, time
 import decimal
 import os
 from dotenv import load_dotenv
+import pandas as pd
 
 # Load environment variables
 load_dotenv()
@@ -154,28 +155,44 @@ class DatabaseConnection:
                 # SELECT query - fetch results
                 rows = cursor.fetchall()
                 
-                # Convert to list of dictionaries for JSON serialization
-                data = []
-                for row in rows:
-                    row_dict = {}
-                    for key, value in dict(row).items():
-                        # Handle special data types for JSON serialization
-                        if isinstance(value, (datetime, date, time)):
-                            row_dict[key] = value.isoformat()
-                        elif isinstance(value, decimal.Decimal):
-                            row_dict[key] = float(value)
-                        else:
-                            row_dict[key] = value
-                    data.append(row_dict)
-                
-                # Get column information
+                # Get column information from cursor
                 columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                row_count = len(data)
+                
+                # Create pandas DataFrame from results with column names
+                if rows:
+                    # Convert rows to list of dicts for DataFrame
+                    data_for_df = []
+                    for row in rows:
+                        row_dict = {}
+                        for key, value in dict(row).items():
+                            # Handle special data types for JSON serialization
+                            if isinstance(value, (datetime, date, time)):
+                                row_dict[key] = value.isoformat()
+                            elif isinstance(value, decimal.Decimal):
+                                row_dict[key] = float(value)
+                            else:
+                                row_dict[key] = value
+                        data_for_df.append(row_dict)
+                    
+                    # Create DataFrame with explicit column names
+                    df = pd.DataFrame(data_for_df, columns=columns)
+                    
+                    # Convert DataFrame to JSON string with orient="records"
+                    # This ensures frontend gets proper array of objects with column names
+                    data = df.to_json(orient="records")
+                    
+                    logger.info(f"📊 DATAFRAME CREATED: {df.shape[0]} rows x {df.shape[1]} columns")
+                    logger.info(f"   Column names: {list(df.columns)}")
+                    logger.info(f"   First row: {df.iloc[0].to_dict() if len(df) > 0 else 'No data'}")
+                else:
+                    data = "[]"  # Empty JSON array string
+                
+                row_count = len(rows)
                 
             else:
                 # INSERT, UPDATE, DELETE queries
                 row_count = cursor.rowcount
-                data = []
+                data = "[]"  # Empty JSON array string
                 columns = []
             
             # Commit transaction
@@ -216,7 +233,7 @@ class DatabaseConnection:
             return {
                 'success': False,
                 'error': error_msg,
-                'data': [],
+                'data': "[]",  # Empty JSON array string
                 'metadata': {
                     'execution_time': (datetime.now() - start_time).total_seconds(),
                     'error_code': e.pgcode if hasattr(e, 'pgcode') else None,
@@ -236,7 +253,7 @@ class DatabaseConnection:
             return {
                 'success': False,
                 'error': error_msg,
-                'data': [],
+                'data': "[]",  # Empty JSON array string
                 'metadata': {
                     'execution_time': (datetime.now() - start_time).total_seconds(),
                     'error_type': 'execution_error',
@@ -253,17 +270,20 @@ class DatabaseConnection:
         """
         Execute query and format results for agent consumption
         
-        Returns formatted results suitable for passing to other agents
+        Returns formatted results with data as JSON string from df.to_json(orient="records")
         """
         result = self.execute_query(sql_query)
         
         if result['success']:
+            # data is already a JSON string from df.to_json(orient="records")
+            data_json_string = result['data']
+            
             # Format for agent consumption
             formatted_result = {
                 'success': True,
                 'query_executed': sql_query,
                 'results': {
-                    'data': result['data'],
+                    'data': data_json_string,  # JSON string that frontend can parse
                     'summary': {
                         'total_rows': result['metadata']['row_count'],
                         'columns': result['metadata']['columns'],
@@ -271,13 +291,14 @@ class DatabaseConnection:
                         'query_type': result['metadata']['query_type']
                     }
                 },
-                'formatted_output': self._format_results_for_display(result['data'], result['metadata']['columns']),
-                'json_results': json.dumps(result['data'], indent=2),
+                'formatted_output': self._format_results_for_display(data_json_string, result['metadata']['columns']),
+                'json_results': data_json_string,  # Same as results.data
                 'execution_metadata': result['metadata']
             }
             
             logger.info(f" QUERY RESULTS FORMATTED FOR AGENT CONSUMPTION")
             logger.info(f"Total rows: {formatted_result['results']['summary']['total_rows']}")
+            logger.info(f"Data format: JSON string from df.to_json(orient='records')")
             
             return formatted_result
         else:
@@ -289,9 +310,21 @@ class DatabaseConnection:
                 'execution_metadata': result['metadata']
             }
     
-    def _format_results_for_display(self, data: List[Dict], columns: List[str]) -> str:
-        """Format query results as a readable table string"""
-        if not data:
+    def _format_results_for_display(self, data: str, columns: List[str]) -> str:
+        """
+        Format query results as a readable table string
+        
+        Args:
+            data: JSON string from df.to_json(orient="records")
+            columns: List of column names
+        """
+        # Parse JSON string to list of dicts
+        try:
+            data_list = json.loads(data) if isinstance(data, str) else data
+        except:
+            data_list = []
+        
+        if not data_list:
             return "No results returned."
         
         # Create formatted table
@@ -303,7 +336,7 @@ class DatabaseConnection:
         formatted_lines.append("-" * len(header))
         
         # Data rows (limit to first 10 for readability)
-        display_data = data[:10]
+        display_data = data_list[:10]
         for row in display_data:
             row_values = []
             for col in columns:
@@ -316,8 +349,8 @@ class DatabaseConnection:
             formatted_lines.append(" | ".join(row_values))
         
         # Add summary if more rows exist
-        if len(data) > 10:
-            formatted_lines.append(f"... and {len(data) - 10} more rows")
+        if len(data_list) > 10:
+            formatted_lines.append(f"... and {len(data_list) - 10} more rows")
         
         return "\n".join(formatted_lines)
     

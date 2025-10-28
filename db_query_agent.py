@@ -399,9 +399,15 @@ class DBQueryAgent(BaseAgent):
                     query_results_obj = execution_result["query_results"]
                     if isinstance(query_results_obj, dict) and "data" in query_results_obj:
                         print(f"\nDATABASE RESULTS:")
-                        # Use the data to show row count
-                        data_rows = query_results_obj.get("data", [])
-                        print(f"Rows Retrieved: {len(data_rows)}")
+                        # data is now a JSON string, parse it to count rows
+                        data_rows = query_results_obj.get("data", "[]")
+                        if isinstance(data_rows, str):
+                            import json
+                            try:
+                                data_rows = json.loads(data_rows)
+                            except:
+                                data_rows = []
+                        print(f"Rows Retrieved: {len(data_rows) if isinstance(data_rows, list) else 0}")
                         # Try to get columns from first row
                         if data_rows and isinstance(data_rows, list) and len(data_rows) > 0:
                             print(f"Columns: {list(data_rows[0].keys())}")
@@ -1109,6 +1115,7 @@ class DBQueryAgent(BaseAgent):
         
         Args:
             query_results: Dictionary containing query results with 'data' key
+                          where data is now a JSON string from df.to_json(orient="records")
             
         Returns:
             pandas.DataFrame or None if conversion fails
@@ -1116,6 +1123,7 @@ class DBQueryAgent(BaseAgent):
         try:
             # Import pandas here to avoid global import issues
             import pandas as pd
+            import json
             
             if not query_results or 'data' not in query_results:
                 logger.warning("No data found in query_results for DataFrame conversion")
@@ -1124,20 +1132,35 @@ class DBQueryAgent(BaseAgent):
             data = query_results['data']
             
             if not data:
-                logger.info("Empty data list, returning empty DataFrame")
+                logger.info("Empty data, returning empty DataFrame")
                 return pd.DataFrame()
             
+            # Handle JSON string format (from df.to_json(orient="records"))
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                    logger.info(f"✅ Parsed JSON string to list of {len(data)} records")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON string: {e}")
+                    return pd.DataFrame()
+            
             if not isinstance(data, list):
-                logger.warning(f"Data is not a list, type: {type(data)}")
+                logger.warning(f"Data is not a list after parsing, type: {type(data)}")
+                return pd.DataFrame()
+            
+            if not data:
+                logger.info("Empty data list after parsing, returning empty DataFrame")
                 return pd.DataFrame()
             
             df = pd.DataFrame(data)
-            logger.info(f"Successfully converted {len(df)} rows to DataFrame with columns: {list(df.columns)}")
+            logger.info(f"✅ Successfully converted {len(df)} rows to DataFrame")
+            logger.info(f"   Columns ({len(df.columns)}): {list(df.columns)}")
+            logger.info(f"   Shape: {df.shape}")
             return df
             
         except ImportError:
             logger.error("Pandas not available for DataFrame conversion")
             return None
         except Exception as e:
-            logger.error(f"Error converting to DataFrame: {e}")
+            logger.error(f"Error converting to DataFrame: {e}", exc_info=True)
             return None
