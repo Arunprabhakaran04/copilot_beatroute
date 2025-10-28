@@ -388,6 +388,15 @@ class SummaryAgent(BaseAgent):
                 model_name=self.model_name
             )
             
+            # Clean up code fences if LLM added them
+            # Remove ```html and ``` markers
+            if summary_html.startswith("```html"):
+                summary_html = summary_html.replace("```html", "", 1).strip()
+            if summary_html.startswith("```"):
+                summary_html = summary_html.replace("```", "", 1).strip()
+            if summary_html.endswith("```"):
+                summary_html = summary_html.rsplit("```", 1)[0].strip()
+            
             logger.info("Summary generated successfully")
             logger.info(f"Summary length: {len(summary_html)} characters")
             
