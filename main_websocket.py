@@ -155,8 +155,18 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 question = json_data.get("question", None)
                 get_suggested = json_data.get("get_suggested_questions", False)
                 
-                pong_response = json_data.get("type", None)
-                if pong_response is not None and pong_response == MessageType.PONG.value:
+                # Check if this is a PONG response to our PING
+                message_type = json_data.get("type", None)
+                message_content = json_data.get("content", None)
+                
+                if message_type == MessageType.PING.value and message_content == "PONG":
+                    # Frontend is responding to PING with PONG (in content field)
+                    logger.debug(f"Received PONG from {session_id}")
+                    continue
+                
+                if message_type == MessageType.PONG.value:
+                    # Standard PONG message type
+                    logger.debug(f"Received PONG from {session_id}")
                     continue
                 
                 if question:
