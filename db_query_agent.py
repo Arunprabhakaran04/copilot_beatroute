@@ -253,6 +253,10 @@ class DBQueryAgent(BaseAgent):
             
             result_state = self.sql_generator.process(generator_state)
             
+            logger.info(f"🔍 SQL GENERATOR RESULT:")
+            logger.info(f"   Type: {type(result_state)}")
+            logger.info(f"   Status: {result_state.get('status') if isinstance(result_state, dict) else 'N/A'}")
+            
             if result_state["status"] == "completed":
                 # Get focused schema from user_context if available
                 focused_schema = None
@@ -288,8 +292,17 @@ class DBQueryAgent(BaseAgent):
                     if "results" in execution_result:
                         logger.info(f"   results type: {type(execution_result['results'])}")
                     
-                    # Convert query results to pandas DataFrame
-                    query_data_df = self._convert_to_dataframe(execution_result.get("query_results", {}))
+                    # Convert query results to pandas DataFrame - with error handling
+                    query_data_df = None
+                    try:
+                        query_results_for_df = execution_result.get("query_results", {})
+                        logger.info(f"   Converting to DataFrame - input type: {type(query_results_for_df)}")
+                        query_data_df = self._convert_to_dataframe(query_results_for_df)
+                        logger.info(f"   DataFrame conversion result: {type(query_data_df)}")
+                    except Exception as df_error:
+                        logger.error(f"❌ DataFrame conversion failed: {df_error}")
+                        logger.error(f"   Input was: {type(execution_result.get('query_results'))}")
+                        query_data_df = None
                     
                     # Generate summary using Summary Agent
                     logger.info("Generating summary for query results...")
@@ -304,11 +317,18 @@ class DBQueryAgent(BaseAgent):
                         logger.error(f"Failed to generate summary: {summary_error}")
                         summary_html = None
                     
-                    db_state["query_type"] = result_state["query_type"]
-                    db_state["sql_query"] = execution_result["final_sql"]
+                    db_state["query_type"] = result_state.get("query_type", "SELECT")
+                    db_state["sql_query"] = execution_result.get("final_sql", "")
                     db_state["status"] = "completed"
-                    db_state["success_message"] = execution_result["message"]
-                    db_state["result"] = result_state["result"]
+                    db_state["success_message"] = execution_result.get("message", "Query completed")
+                    
+                    # Safely get result_state["result"]
+                    if "result" in result_state and isinstance(result_state["result"], dict):
+                        db_state["result"] = result_state["result"]
+                    else:
+                        logger.warning(f"⚠️ result_state['result'] is missing or not a dict, creating new dict")
+                        db_state["result"] = {}
+                    
                     db_state["result"]["is_multi_step"] = False
                     db_state["result"]["step_count"] = 1
                     db_state["result"]["exception_handling"] = execution_result.get("exception_summary")
@@ -401,6 +421,8 @@ class DBQueryAgent(BaseAgent):
             
         except Exception as e:
             logger.error(f"Single-step query error: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Full traceback:", exc_info=True)
             db_state["error_message"] = f"Single-step query error: {str(e)}"
             db_state["status"] = "failed"
             return db_state
