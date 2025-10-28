@@ -33,10 +33,6 @@ orchestrator = None
 # Store UserContext instances per user_id (in production, use Redis)
 user_contexts: Dict[str, UserContext] = {}
 
-# Hardcoded base64 token for testing (contains auth token + user_id)
-# This is the token: "GNsy9yt81VBARJPqMuAxhbQDJOTqhQol-6"
-HARDCODED_BASE64_TOKEN = "R05zeTl5dDgxVkJBUkpfcU11QXhoYlFESk9UcWhRb2wtNg"
-
 
 @app.on_event("startup")
 async def startup_event():
@@ -78,10 +74,10 @@ async def ensure_user_context(user_id: str, session_id: str) -> UserContext:
         email=f"user{user_id}@example.com"
     )
     
-    # Load schema using hardcoded token (ONE-TIME LOAD)
+    # Load schema using session_id as base64 token (ONE-TIME LOAD)
     logger.info(f"📊 Loading schema for user {user_id}... This takes 5-10 seconds")
     success = await context.load_schema_from_token(
-        base64_token=HARDCODED_BASE64_TOKEN,
+        base64_token=session_id,
         cubejs_api_url="analytics.vwbeatroute.com/api/v1/meta",
         generate_embeddings=True,
         session_id=session_id  # Pass session_id to store mapping
