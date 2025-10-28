@@ -312,8 +312,15 @@ class DBQueryAgent(BaseAgent):
                     db_state["result"]["is_multi_step"] = False
                     db_state["result"]["step_count"] = 1
                     db_state["result"]["exception_handling"] = execution_result.get("exception_summary")
-                    # Add database execution results
-                    db_state["result"]["query_results"] = execution_result.get("query_results", {})
+                    
+                    # Add database execution results - ensure it's a dict
+                    query_results_data = execution_result.get("query_results", {})
+                    if not isinstance(query_results_data, dict):
+                        logger.error(f"❌ query_results is not a dict! Type: {type(query_results_data)}, converting to dict")
+                        query_results_data = {}
+                    
+                    db_state["result"]["query_results"] = query_results_data
+                    
                     # Add summary to query_results
                     if summary_html:
                         db_state["result"]["query_results"]["summary"] = summary_html
@@ -901,7 +908,7 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"Original Question: {original_question}")
             logger.info(f"SQL to Execute: {sql_query}")
             
-            execution_result = self._execute_sql_in_database(sql_query)
+            execution_result = self._execute_sql_in_database(sql_query, session_id=session_id)
             
             if execution_result["success"]:
                 logger.info(f"SQL EXECUTED SUCCESSFULLY ON FIRST ATTEMPT")
