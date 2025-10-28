@@ -395,15 +395,20 @@ class DBQueryAgent(BaseAgent):
                 
                 # Show database results
                 if execution_result.get("query_results"):
-                    results_summary = execution_result["query_results"]["summary"]
-                    print(f"\nDATABASE RESULTS:")
-                    print(f"Rows Retrieved: {results_summary['total_rows']}")
-                    print(f"Columns: {results_summary['columns']}")
-                    print(f"Execution Time: {results_summary['execution_time']}")
-                    
-                    if execution_result.get("formatted_output"):
-                        print(f"\n SAMPLE RESULTS:")
-                        print(execution_result["formatted_output"])
+                    # Check if there's execution metadata summary (not HTML summary)
+                    query_results_obj = execution_result["query_results"]
+                    if isinstance(query_results_obj, dict) and "data" in query_results_obj:
+                        print(f"\nDATABASE RESULTS:")
+                        # Use the data to show row count
+                        data_rows = query_results_obj.get("data", [])
+                        print(f"Rows Retrieved: {len(data_rows)}")
+                        # Try to get columns from first row
+                        if data_rows and isinstance(data_rows, list) and len(data_rows) > 0:
+                            print(f"Columns: {list(data_rows[0].keys())}")
+                
+                if execution_result.get("formatted_output"):
+                    print(f"\n SAMPLE RESULTS:")
+                    print(execution_result["formatted_output"])
                 
                 print("="*80)
                 
