@@ -334,20 +334,26 @@ async def send_agent_result(websocket: WebSocket, agent_type: str, result_data: 
         if "query_results" in result_data:
             query_results = result_data["query_results"]
             
+            # Send table data as JSON
             if "data" in query_results and query_results["data"]:
                 table_content = query_results["data"]
+                
+                # Ensure it's a list/dict, not a string
                 if isinstance(table_content, str):
                     import json
                     try:
                         table_content = json.loads(table_content)
                     except:
+                        logger.error(f"Failed to parse table_content as JSON: {table_content[:100]}")
                         pass
                 
+                # Send as JSON
                 await websocket.send_json({
                     "type": MessageType.TABLE.value,
-                    "content": table_content
+                    "content": table_content  # Already a Python object, will be serialized by send_json
                 })
             
+            # Send summary as HTML
             if "summary" in query_results and query_results["summary"]:
                 await websocket.send_json({
                     "type": MessageType.SUMMARY.value,
@@ -355,6 +361,29 @@ async def send_agent_result(websocket: WebSocket, agent_type: str, result_data: 
                 })
     
     elif agent_type == "summary":
+        # Send the query data as TABLE first if available
+        if "query_data" in result_data:
+            query_data = result_data["query_data"]
+            
+            # Convert DataFrame to dict if needed
+            if hasattr(query_data, 'to_dict'):
+                # Convert DataFrame to list of dicts for JSON serialization
+                query_data = query_data.to_dict('records')
+            elif isinstance(query_data, str):
+                import json
+                try:
+                    query_data = json.loads(query_data)
+                except:
+                    logger.error(f"Failed to parse query_data as JSON")
+                    query_data = None
+            
+            if query_data:
+                await websocket.send_json({
+                    "type": MessageType.TABLE.value,
+                    "content": query_data
+                })
+        
+        # Then send the summary as HTML
         if "summary" in result_data and result_data["summary"]:
             await websocket.send_json({
                 "type": MessageType.SUMMARY.value,
