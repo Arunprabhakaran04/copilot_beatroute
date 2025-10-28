@@ -23,9 +23,6 @@ from entity_verification_agent import EntityVerificationAgent
 from redis_memory_manager import RedisMemoryManager, RedisClassificationValidator, initialize_session, get_last_db_query_result, DEFAULT_SESSION_ID, DEFAULT_USER_ID
 from token_tracker import get_token_tracker, track_llm_call
 from improved_sql_generator import ImprovedSQLGenerator
-from temp_files.improved_multi_step_handler import create_improved_decomposition
-from temp_files.llm_multi_step_analyzer import EnhancedMultiStepHandler, create_enhanced_llm_decomposition
-from temp_files.enhanced_ultra_analyzer import EnhancedUltraAnalyzer
 from agent_aware_decomposer import AgentAwareDecomposer
 from db_connection import execute_sql
 from enrich_agent import EnrichAgent
@@ -170,8 +167,6 @@ class CentralOrchestrator:
         
         self.memory = RedisMemoryManager(self.llm, max_history=3)
         self.classification_validator = RedisClassificationValidator(self.memory.session_manager)
-        self.enhanced_multi_step_handler = EnhancedMultiStepHandler(self.db_llm)
-        self.enhanced_ultra_analyzer = EnhancedUltraAnalyzer(self.db_llm)
         self.agent_aware_decomposer = AgentAwareDecomposer(self.db_llm)
         
         # Initialize EnrichAgent with OpenAI client
@@ -421,48 +416,17 @@ class CentralOrchestrator:
                         logger.info(f"🤖 Agent-Aware Analysis: Single-step query detected (confidence: {analysis_result.get('confidence', 0):.2f})")
                         logger.info(f"💡 Reasoning: {analysis_result.get('reasoning', 'No reasoning provided')}")
                 except Exception as e:
-                    logger.warning(f"Agent-aware analysis failed, falling back to enhanced ultra analyzer: {e}")
-                    # Fallback to enhanced ultra analyzer
-                    try:
-                        analysis_result = self.enhanced_ultra_analyzer.analyze_and_decompose(state["query"])
-                        
-                        if analysis_result.get("is_multi_step", False):
-                            state["is_multi_step"] = True
-                            if "decomposed_tasks" in analysis_result:
-                                state["remaining_tasks"] = analysis_result["decomposed_tasks"]
-                            else:
-                                state["remaining_tasks"] = self._decompose_query(state["query"])
-                            OrchestrationLogger.multi_step_detected(state['remaining_tasks'])
-                            logger.info(f"Enhanced Ultra Fallback: decomposed into {len(state['remaining_tasks'])} tasks")
-                        else:
-                            state["is_multi_step"] = False
-                            state["remaining_tasks"] = [state["query"]]
-                            logger.info("Enhanced Ultra Fallback: Single-step query detected")
-                    except Exception as e2:
-                        logger.warning(f"Enhanced Ultra analysis also failed, using standard LLM: {e2}")
-                        # Fallback to standard LLM method
-                        try:
-                            if self.enhanced_multi_step_handler.should_decompose_query(state["query"]):
-                                state["is_multi_step"] = True
-                                state["remaining_tasks"] = self.enhanced_multi_step_handler.decompose_query(state["query"])
-                                OrchestrationLogger.multi_step_detected(state['remaining_tasks'])
-                                logger.info(f"Standard LLM fallback: decomposed into {len(state['remaining_tasks'])} tasks")
-                            else:
-                                state["is_multi_step"] = False
-                                state["remaining_tasks"] = [state["query"]]
-                                logger.info("Standard LLM fallback: Single-step query detected")
-                        except Exception as e3:
-                            logger.warning(f"Standard LLM analysis also failed, using heuristic: {e3}")
-                            # Final fallback to heuristic method
-                            if self._is_multi_step_query(state["query"]):
-                                state["is_multi_step"] = True
-                                state["remaining_tasks"] = self._decompose_query(state["query"])
-                                OrchestrationLogger.multi_step_detected(state['remaining_tasks'])
-                                logger.info(f"Heuristic fallback: Multi-step query decomposed into {len(state['remaining_tasks'])} tasks")
-                            else:
-                                state["is_multi_step"] = False
-                                state["remaining_tasks"] = [state["query"]]
-                                logger.info("Heuristic fallback: Single-step query detected")
+                    logger.error(f"Agent-aware analysis failed: {e}")
+                    # Fallback to heuristic method if agent-aware fails
+                    if self._is_multi_step_query(state["query"]):
+                        state["is_multi_step"] = True
+                        state["remaining_tasks"] = self._decompose_query(state["query"])
+                        OrchestrationLogger.multi_step_detected(state['remaining_tasks'])
+                        logger.info(f"Heuristic fallback: Multi-step query decomposed into {len(state['remaining_tasks'])} tasks")
+                    else:
+                        state["is_multi_step"] = False
+                        state["remaining_tasks"] = [state["query"]]
+                        logger.info("Heuristic fallback: Single-step query detected")
             
             # Check if we have more tasks to process
             if not state["remaining_tasks"]:
@@ -819,20 +783,13 @@ class CentralOrchestrator:
         return any(re.search(pattern, query_lower) for pattern in db_summary_patterns)
     
     def _decompose_query(self, query: str) -> List[str]:
-        """Decompose multi-step query into individual tasks using improved handler"""
+        """Decompose multi-step query into individual tasks using LLM"""
         try:
-            # Use the improved multi-step handler
-            improved_tasks = create_improved_decomposition(query)
-            if len(improved_tasks) > 1:
-                logger.info(f"Using improved decomposition: {len(improved_tasks)} tasks")
-                # Ensure any visualization/summarization tasks have a preceding DB retrieval
-                fixed_tasks = self._ensure_db_before_viz(improved_tasks, query)
-                return fixed_tasks
-            
-            # Fallback to original logic if needed
+            # Check if forced multi-step decomposition is needed
             if self._requires_forced_multi_step_decomposition(query.lower()):
                 return self._create_forced_decomposition(query)
             
+            # Use LLM-based decomposition
             decompose_prompt = ChatPromptTemplate.from_template("""
             You are an expert query decomposer specializing in business intelligence queries. Break down complex queries into logical, sequential steps.
             
