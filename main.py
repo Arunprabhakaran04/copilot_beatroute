@@ -1865,44 +1865,17 @@ class CentralOrchestrator:
         return summary.strip()
     
     def _execute_with_resilience(self, initial_state: BaseAgentState) -> Dict[str, Any]:
-        """Execute workflow with resilience mechanisms"""
+        """Execute workflow with resilience mechanisms (retries only, no timeout)"""
         max_retries = 3
-        timeout_seconds = 300  # 5 minutes
         
         for attempt in range(max_retries):
             try:
                 # Create a copy of state for each attempt
                 state_copy = {**initial_state}
                 
-                # Execute with timeout
-                import signal
-                
-                def timeout_handler(signum, frame):
-                    raise TimeoutError("Query execution timed out")
-                
-                # Set timeout for non-Windows systems
-                if hasattr(signal, 'SIGALRM'):
-                    signal.signal(signal.SIGALRM, timeout_handler)
-                    signal.alarm(timeout_seconds)
-                
-                try:
-                    result = self.graph.invoke(state_copy)
-                    
-                    # Clear timeout
-                    if hasattr(signal, 'SIGALRM'):
-                        signal.alarm(0)
-                    
-                    return result
-                    
-                except TimeoutError:
-                    logger.warning(f"Query execution timed out on attempt {attempt + 1}")
-                    if attempt == max_retries - 1:
-                        return {
-                            "status": "failed",
-                            "error_message": "Query execution timed out",
-                            "agent_type": "timeout"
-                        }
-                    continue
+                # Execute the graph directly (no timeout - signal doesn't work in threads)
+                result = self.graph.invoke(state_copy)
+                return result
                     
             except Exception as e:
                 logger.warning(f"Execution attempt {attempt + 1} failed: {e}")
