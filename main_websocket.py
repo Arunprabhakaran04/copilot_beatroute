@@ -39,7 +39,7 @@ async def startup_event():
     global orchestrator
     from main import CentralOrchestrator
     try:
-        orchestrator = CentralOrchestrator(files_directory="./user_files", schema_file_path="schema")
+        orchestrator = CentralOrchestrator(files_directory="./user_files", schema_file_path=None)
         logger.info("✅ Central Orchestrator initialized successfully")
     except Exception as e:
         logger.error(f"❌ Failed to initialize orchestrator: {e}")
