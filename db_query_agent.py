@@ -10,6 +10,7 @@ from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from sql_query_decomposer import SQLQueryDecomposer
 from sql_generator_agent import SQLGeneratorAgent
 from sql_exception_agent import SQLExceptionAgent
+from summary_agent import SummaryAgent
 from db_connection import get_database_connection, execute_sql
 from token_tracker import track_llm_call, get_token_tracker
 
@@ -26,13 +27,10 @@ class DBQueryAgent(BaseAgent):
         # Initialize sub-agents (schema will come from UserContext)
         self.sql_generator = SQLGeneratorAgent(llm, schema_file_path=None)
         self.exception_agent = SQLExceptionAgent(llm, schema_file_path=None, max_iterations=5)
-        super().__init__(llm)
-        self.schema_file_path = schema_file_path
+        self.summary_agent = SummaryAgent(llm, "gpt-4o")  # Add summary agent
         self.conversation_history = []  
         
         self.decomposer = SQLQueryDecomposer(llm)
-        self.sql_generator = SQLGeneratorAgent(llm, schema_file_path)
-        self.exception_agent = SQLExceptionAgent(llm, schema_file_path, max_iterations=5)
         
         # Add improved SQL generator
         try:
@@ -49,8 +47,9 @@ class DBQueryAgent(BaseAgent):
             logger.info("DBQueryAgent initialized as orchestrator with sub-agents:")
             logger.info("  - SQL Query Decomposer: for multi-step analysis")
             logger.info("  - SQL Generator: for individual query generation")
-            logger.info("  - SQL Retriever: for step-specific contecxt retrieval")
+            logger.info("  - SQL Retriever: for step-specific context retrieval")
             logger.info("  - SQL Exception Agent: for error analysis and fixing")
+            logger.info("  - Summary Agent: for generating data summaries")
         except Exception as e:
             logger.warning(f"Could not initialize SQL retriever: {e}")
             self.sql_retriever = None
@@ -59,6 +58,7 @@ class DBQueryAgent(BaseAgent):
             logger.info("  - SQL Generator: for individual query generation")
             logger.info("  - SQL Retriever: NOT AVAILABLE (will use fallback)")
             logger.info("  - SQL Exception Agent: for error analysis and fixing")
+            logger.info("  - Summary Agent: for generating data summaries")
     
     def get_agent_type(self) -> str:
         return "db_query"
@@ -281,6 +281,19 @@ class DBQueryAgent(BaseAgent):
                     # Convert query results to pandas DataFrame
                     query_data_df = self._convert_to_dataframe(execution_result.get("query_results", {}))
                     
+                    # Generate summary using Summary Agent
+                    logger.info("Generating summary for query results...")
+                    summary_html = None
+                    try:
+                        if query_data_df is not None and not query_data_df.empty:
+                            summary_html = self.summary_agent.generate_summary(state['query'], query_data_df)
+                            logger.info(f"✅ Summary generated successfully ({len(summary_html)} chars)")
+                        else:
+                            logger.warning("No data available for summary generation")
+                    except Exception as summary_error:
+                        logger.error(f"Failed to generate summary: {summary_error}")
+                        summary_html = None
+                    
                     db_state["query_type"] = result_state["query_type"]
                     db_state["sql_query"] = execution_result["final_sql"]
                     db_state["status"] = "completed"
@@ -291,6 +304,30 @@ class DBQueryAgent(BaseAgent):
                     db_state["result"]["exception_handling"] = execution_result.get("exception_summary")
                     # Add database execution results
                     db_state["result"]["query_results"] = execution_result.get("query_results", {})
+                    # Add summary to query_results
+                    if summary_html:
+                        db_state["result"]["query_results"]["summary"] = summary_html
+                    
+                    # Log what we're putting in query_results
+                    query_results = db_state["result"]["query_results"]
+                    logger.info(f"📦 QUERY_RESULTS STRUCTURE:")
+                    logger.info(f"   Keys: {list(query_results.keys())}")
+                    if "data" in query_results:
+                        data = query_results["data"]
+                        logger.info(f"   Data type: {type(data)}")
+                        logger.info(f"   Data length: {len(data) if isinstance(data, (list, dict)) else 'N/A'}")
+                        if isinstance(data, list) and len(data) > 0:
+                            logger.info(f"   📊 TABLE DATA (first 3 rows):")
+                            for idx, row in enumerate(data[:3]):
+                                logger.info(f"      Row {idx + 1}: {row}")
+                    else:
+                        logger.warning(f"   ⚠️ NO 'data' FIELD IN query_results!")
+                    
+                    if "summary" in query_results:
+                        logger.info(f"   Summary field exists: {len(query_results['summary'])} chars")
+                    else:
+                        logger.warning(f"   ⚠️ NO 'summary' FIELD IN query_results!")
+                    
                     db_state["result"]["query_data"] = query_data_df  # Add DataFrame for summary agent
                     db_state["result"]["formatted_output"] = execution_result.get("formatted_output", "")
                     db_state["result"]["json_results"] = execution_result.get("json_results", "[]")
@@ -491,6 +528,42 @@ class DBQueryAgent(BaseAgent):
             final_query_results = final_step_results.get("query_results", {})
             query_data_df = self._convert_to_dataframe(final_query_results)
             
+            # Generate summary using Summary Agent
+            logger.info("Generating summary for multi-step query results...")
+            summary_html = None
+            try:
+                if query_data_df is not None and not query_data_df.empty:
+                    summary_html = self.summary_agent.generate_summary(state['query'], query_data_df)
+                    logger.info(f"✅ Summary generated successfully ({len(summary_html)} chars)")
+                else:
+                    logger.warning("No data available for summary generation")
+            except Exception as summary_error:
+                logger.error(f"Failed to generate summary: {summary_error}")
+                summary_html = None
+            
+            # Add summary to final query_results
+            if summary_html:
+                final_query_results["summary"] = summary_html
+            
+            # Log what we're putting in query_results for multi-step
+            logger.info(f"📦 MULTI-STEP QUERY_RESULTS STRUCTURE:")
+            logger.info(f"   Keys: {list(final_query_results.keys())}")
+            if "data" in final_query_results:
+                data = final_query_results["data"]
+                logger.info(f"   Data type: {type(data)}")
+                logger.info(f"   Data length: {len(data) if isinstance(data, (list, dict)) else 'N/A'}")
+                if isinstance(data, list) and len(data) > 0:
+                    logger.info(f"   📊 TABLE DATA (first 3 rows):")
+                    for idx, row in enumerate(data[:3]):
+                        logger.info(f"      Row {idx + 1}: {row}")
+            else:
+                logger.warning(f"   ⚠️ NO 'data' FIELD IN query_results!")
+            
+            if "summary" in final_query_results:
+                logger.info(f"   Summary field exists: {len(final_query_results['summary'])} chars")
+            else:
+                logger.warning(f"   ⚠️ NO 'summary' FIELD IN query_results!")
+            
             db_state["query_type"] = "SELECT"  
             db_state["sql_query"] = final_sql
             db_state["status"] = "completed"
@@ -506,7 +579,7 @@ class DBQueryAgent(BaseAgent):
                 "original_question": state["query"],
                 "decomposed_questions": steps,
                 "format": "multi_step_cube_js_api_with_dataframe",
-                # Add final database results
+                # Add final database results (with summary)
                 "query_results": final_query_results,
                 "query_data": query_data_df,  # Add DataFrame for summary agent
                 "formatted_output": final_step_results.get("formatted_output", ""),

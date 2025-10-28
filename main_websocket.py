@@ -323,6 +323,9 @@ async def process_question(websocket: WebSocket, question: str, session_id: str,
 
 async def send_agent_result(websocket: WebSocket, agent_type: str, result_data: dict):
     """Send agent-specific results to the client"""
+    logger.info(f"📤 send_agent_result called with agent_type: {agent_type}")
+    logger.info(f"   Result data keys: {list(result_data.keys())}")
+    
     if agent_type == "entity_verification":
         if "type" in result_data and result_data["type"] == "entity_verification_error":
             await websocket.send_json({
@@ -331,8 +334,10 @@ async def send_agent_result(websocket: WebSocket, agent_type: str, result_data: 
             })
     
     elif agent_type == "db_query":
+        logger.info("   Processing db_query agent result")
         if "query_results" in result_data:
             query_results = result_data["query_results"]
+            logger.info(f"   query_results keys: {list(query_results.keys())}")
             
             # Send table data as JSON
             if "data" in query_results and query_results["data"]:
@@ -343,52 +348,59 @@ async def send_agent_result(websocket: WebSocket, agent_type: str, result_data: 
                     import json
                     try:
                         table_content = json.loads(table_content)
+                        logger.info(f"   ✅ Parsed table_content from JSON string")
                     except:
-                        logger.error(f"Failed to parse table_content as JSON: {table_content[:100]}")
+                        logger.error(f"   ❌ Failed to parse table_content as JSON: {table_content[:100]}")
                         pass
                 
-                # Send as JSON
+                # Log table data before sending
+                logger.info(f"📊 TABLE DATA TO SEND:")
+                logger.info(f"   Type: {type(table_content)}")
+                logger.info(f"   Length: {len(table_content) if isinstance(table_content, (list, dict)) else 'N/A'}")
+                if isinstance(table_content, list) and len(table_content) > 0:
+                    logger.info(f"   First row: {table_content[0]}")
+                    logger.info(f"   Sample data (first 3 rows):")
+                    for idx, row in enumerate(table_content[:3]):
+                        logger.info(f"      Row {idx + 1}: {row}")
+                
+                # Send as JSON with TYPE_TABLE
+                logger.info(f"   📤 Sending TYPE_TABLE message")
                 await websocket.send_json({
                     "type": MessageType.TABLE.value,
-                    "content": table_content  # Already a Python object, will be serialized by send_json
+                    "content": table_content
                 })
+                logger.info(f"   ✅ TYPE_TABLE sent successfully")
+            else:
+                logger.warning(f"   ⚠️ No 'data' field in query_results or data is empty")
             
             # Send summary as HTML
             if "summary" in query_results and query_results["summary"]:
+                logger.info(f"📝 SUMMARY TO SEND:")
+                logger.info(f"   Type: {type(query_results['summary'])}")
+                logger.info(f"   Length: {len(query_results['summary'])} chars")
+                logger.info(f"   Preview: {query_results['summary'][:200]}...")
+                
+                logger.info(f"   📤 Sending TYPE_SUMMARY message")
                 await websocket.send_json({
                     "type": MessageType.SUMMARY.value,
                     "content": query_results["summary"]
                 })
+                logger.info(f"   ✅ TYPE_SUMMARY sent successfully")
+            else:
+                logger.warning(f"   ⚠️ No 'summary' field in query_results")
     
     elif agent_type == "summary":
-        # Send the query data as TABLE first if available
-        if "query_data" in result_data:
-            query_data = result_data["query_data"]
-            
-            # Convert DataFrame to dict if needed
-            if hasattr(query_data, 'to_dict'):
-                # Convert DataFrame to list of dicts for JSON serialization
-                query_data = query_data.to_dict('records')
-            elif isinstance(query_data, str):
-                import json
-                try:
-                    query_data = json.loads(query_data)
-                except:
-                    logger.error(f"Failed to parse query_data as JSON")
-                    query_data = None
-            
-            if query_data:
-                await websocket.send_json({
-                    "type": MessageType.TABLE.value,
-                    "content": query_data
-                })
-        
-        # Then send the summary as HTML
+        logger.info("   Processing summary agent result")
+        # Summary agent shouldn't be called anymore since db_query generates summaries
+        # But if it is, just send the summary (not the data, as db_query already sent it)
         if "summary" in result_data and result_data["summary"]:
+            logger.info(f"   ⚠️ WARNING: Standalone summary agent called (should be handled by db_query)")
+            logger.info(f"   📤 Sending TYPE_SUMMARY message")
             await websocket.send_json({
                 "type": MessageType.SUMMARY.value,
                 "content": result_data["summary"]
             })
+            logger.info(f"   ✅ TYPE_SUMMARY sent successfully")
     
     elif agent_type == "visualization":
         if "visualization" in result_data and result_data["visualization"]:
