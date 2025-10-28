@@ -392,15 +392,11 @@ async def send_agent_result(websocket: WebSocket, agent_type: str, result_data: 
     elif agent_type == "summary":
         logger.info("   Processing summary agent result")
         # Summary agent shouldn't be called anymore since db_query generates summaries
-        # But if it is, just send the summary (not the data, as db_query already sent it)
-        if "summary" in result_data and result_data["summary"]:
-            logger.info(f"   ⚠️ WARNING: Standalone summary agent called (should be handled by db_query)")
-            logger.info(f"   📤 Sending TYPE_SUMMARY message")
-            await websocket.send_json({
-                "type": MessageType.SUMMARY.value,
-                "content": result_data["summary"]
-            })
-            logger.info(f"   ✅ TYPE_SUMMARY sent successfully")
+        # SKIP sending anything - db_query already sent both table and summary
+        logger.info(f"   ⚠️ WARNING: Standalone summary agent called (should be handled by db_query)")
+        logger.info(f"   � SKIPPING - db_query already sent table and summary")
+        # Do NOT send anything to avoid duplicate summaries
+        return
     
     elif agent_type == "visualization":
         if "visualization" in result_data and result_data["visualization"]:
