@@ -36,41 +36,34 @@ def decode_base64_token(base64_token_str: str) -> Tuple[Optional[str], Optional[
         Tuple of (auth_token, user_id) or (None, None) if decoding fails
     """
     try:
-        # Ensure the token is not empty and is properly padded
         if not base64_token_str:
             raise ValueError("The provided Base64 token is empty.")
-        
-        # Add padding if needed
+
+        # Fix padding if needed
         padding = len(base64_token_str) % 4
         if padding != 0:
             base64_token_str += "=" * (4 - padding)
-        
-        # Decode the token
-        base64_token_bytes = base64.b64decode(base64_token_str)
-        decoded_token = base64_token_bytes.decode('utf-8')  # Assuming the decoded value is a string
-        
-        # Print the decoded token
-        logger.debug(f"Decoded token: {decoded_token}")
-        
-        # Extract the auth token and user_id
-        # Format: auth_token-user_id (e.g., "abc123-456")
-        parts = decoded_token.split('-')
-        
-        if len(parts) < 2:
-            logger.error("Token format invalid - expected 'auth_token-user_id'")
-            return None, None
-        
-        auth_token = parts[0]
-        user_id = parts[-1]  # Get the last part (user_id)
-        
-        # Check if the last part is a number and auth_token is not empty
-        if user_id.isdigit() and auth_token != '':
-            logger.info(f"✅ Auth Token: {auth_token[:10]}..., User ID: {user_id}")
-            return auth_token, user_id
-        else:
-            logger.error("Error in Decoding Auth Token and User ID - invalid format")
-            return None, None
-    
+
+        # Decode base64
+        decoded_token = base64.b64decode(base64_token_str).decode('utf-8')
+        logger.info(f"Decoded token: {decoded_token}")
+
+        # Extract the last hyphen-separated integer as user_id
+        parts = decoded_token.rsplit('-', 1)  # Split only on the last '-'
+        if len(parts) != 2:
+            raise ValueError("Token format invalid (no hyphen separating user_id).")
+
+        auth_token, user_id = parts[0], parts[1]
+
+        # Validate user_id
+        if not user_id.isdigit():
+            raise ValueError(f"User ID '{user_id}' is not numeric.")
+
+        logger.info(f"✅ Auth Token: {auth_token}")
+        logger.info(f"✅ User ID: {user_id}")
+
+        return auth_token, user_id
+
     except Exception as e:
         logger.error(f"❌ Error decoding Base64 token: {e}")
         return None, None

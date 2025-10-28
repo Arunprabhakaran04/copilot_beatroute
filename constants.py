@@ -12,3 +12,7 @@ SUGGESTED_QUESTIONS_LIST = [
 ERROR_RESPONSE = "I apologize, but I encountered an error processing your request. Please try rephrasing your question or contact support if the issue persists."
 
 DAILY_QUESTION_LIMIT = 30
+
+# Global dictionary to store session_id -> user_id mapping
+# This is populated when a token is decoded
+SESSION_TO_USER_ID = {}

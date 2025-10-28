@@ -5,7 +5,8 @@ from typing import Dict, List, Optional, Any
 import numpy as np
 from loguru import logger
 
-from schema_fetcher import SchemaManager
+from schema_fetcher import SchemaManager, decode_base64_token
+from constants import SESSION_TO_USER_ID
 
 
 class UserContext:
@@ -68,7 +69,8 @@ class UserContext:
         self,
         base64_token: str,
         cubejs_api_url: str = "analytics.vwbeatroute.com/api/v1/meta",
-        generate_embeddings: bool = True
+        generate_embeddings: bool = True,
+        session_id: Optional[str] = None
     ) -> bool:
         """
         Load database schema using the base64 token.
@@ -79,12 +81,30 @@ class UserContext:
             base64_token: Base64 encoded token containing auth credentials
             cubejs_api_url: CubeJS API endpoint
             generate_embeddings: Whether to generate embeddings for schema
+            session_id: Optional session ID to map to user_id
             
         Returns:
             bool: True if schema loaded successfully
         """
         try:
             logger.info(f"🔐 Loading schema for user {self.user_id}...")
+            
+            # Decode token to get user_id from token
+            auth_token, token_user_id = decode_base64_token(base64_token)
+            
+            if not auth_token or not token_user_id:
+                logger.error("❌ Failed to decode base64 token")
+                return False
+            
+            # Store the mapping in constants if session_id is provided
+            if session_id:
+                SESSION_TO_USER_ID[session_id] = token_user_id
+                logger.info(f"✅ Stored session mapping: {session_id} -> user_{token_user_id}")
+            
+            # Update user_id if it was auto-generated
+            if self.user_id != token_user_id:
+                logger.info(f"📝 Updating user_id from {self.user_id} to {token_user_id}")
+                self.user_id = token_user_id
             
             # Create schema manager
             self._schema_manager = SchemaManager()
