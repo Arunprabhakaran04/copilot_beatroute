@@ -10,7 +10,7 @@ from typing import Dict
 from websocket_manager import ws_manager
 from message_type import MessageType
 from websocket_auth import validate_session_token, get_user_id_from_session
-from constants import SUGGESTED_QUESTIONS_LIST, ERROR_RESPONSE
+from constants import SUGGESTED_QUESTIONS_LIST, ERROR_RESPONSE, SESSION_TO_USER_ID
 from redis_memory_manager import initialize_session
 from user_context import UserContext
 
@@ -50,27 +50,31 @@ async def startup_event():
         raise
 
 
-async def ensure_user_context(user_id: str) -> UserContext:
+async def ensure_user_context(user_id: str, session_id: str) -> UserContext:
     """
     Ensure UserContext is loaded for the user.
     Loads schema ONCE per user and caches it.
     
     Args:
-        user_id: User identifier
+        user_id: User identifier (will be updated from token)
+        session_id: Session identifier
         
     Returns:
         UserContext instance
     """
-    if user_id in user_contexts:
-        logger.info(f"♻️ Using cached UserContext for user {user_id}")
-        return user_contexts[user_id]
+    # Check if we already have a context for a user_id mapped from this session
+    actual_user_id = SESSION_TO_USER_ID.get(session_id, user_id)
     
-    logger.info(f"🆕 Creating new UserContext for user {user_id}")
+    if actual_user_id in user_contexts:
+        logger.info(f"♻️ Using cached UserContext for user_{actual_user_id}")
+        return user_contexts[actual_user_id]
     
-    # Create UserContext
+    logger.info(f"🆕 Creating new UserContext for user {user_id} (will be updated from token)")
+    
+    # Create UserContext with temporary user_id (will be updated when schema loads)
     context = UserContext(
         user_id=user_id,
-        user_name=f"User_{user_id}",
+        user_name=f"user_{user_id}",
         email=f"user{user_id}@example.com"
     )
     
@@ -79,16 +83,20 @@ async def ensure_user_context(user_id: str) -> UserContext:
     success = await context.load_schema_from_token(
         base64_token=HARDCODED_BASE64_TOKEN,
         cubejs_api_url="analytics.vwbeatroute.com/api/v1/meta",
-        generate_embeddings=True
+        generate_embeddings=True,
+        session_id=session_id  # Pass session_id to store mapping
     )
     
     if not success:
         raise Exception("Failed to load schema")
     
-    # Cache the context
-    user_contexts[user_id] = context
+    # Get the actual user_id from token (stored in context)
+    actual_user_id = context.user_id
     
-    logger.info(f"✅ UserContext cached for user {user_id}")
+    # Cache the context with the actual user_id
+    user_contexts[actual_user_id] = context
+    
+    logger.info(f"✅ UserContext cached for user_{actual_user_id}")
     logger.info(f"   📋 Tables: {len(context.schema_map)}")
     logger.info(f"   🔮 Embeddings: {context.embeddings_schema.shape}")
     
@@ -122,9 +130,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     logger.info(f"Session initialized for user: {user_id}, session: {session_id}")
     
     # Load UserContext with schema (happens ONCE per user)
+    # This will also decode the token and update user_id
     try:
-        user_context = await ensure_user_context(user_id)
-        logger.info(f"✅ UserContext ready for user: {user_id}")
+        user_context = await ensure_user_context(user_id, session_id)
+        
+        # Get the actual user_id from the token (stored in SESSION_TO_USER_ID)
+        actual_user_id = SESSION_TO_USER_ID.get(session_id, user_id)
+        logger.info(f"✅ UserContext ready for user_{actual_user_id} (session: {session_id})")
     except Exception as e:
         logger.error(f"❌ Failed to load UserContext for user {user_id}: {e}")
         await websocket.send_json({
@@ -152,9 +164,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     continue
                 
                 if question:
+                    # Get actual user_id from session mapping
+                    actual_user_id = SESSION_TO_USER_ID.get(session_id, user_id)
+                    
                     # Pass UserContext to process_question
                     asyncio.create_task(
-                        process_question(websocket, question, session_id, user_id, user_context)
+                        process_question(websocket, question, session_id, actual_user_id, user_context)
                     )
                     
                 elif get_suggested:
