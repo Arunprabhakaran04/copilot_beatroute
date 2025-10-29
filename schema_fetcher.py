@@ -170,7 +170,14 @@ def get_final_schema_from_token(
             return [], {}, cubejs_data
         
         rows = result.get('results', {}).get('data', [])
-        logger.info(f"✅ Retrieved {len(rows)} column definitions")
+        
+        # Parse JSON string to list of dicts (DataFrame refactoring)
+        if isinstance(rows, str):
+            import json
+            rows = json.loads(rows)
+            logger.info(f"✅ Parsed {len(rows)} column definitions from JSON string")
+        else:
+            logger.info(f"✅ Retrieved {len(rows)} column definitions")
         
     except Exception as e:
         logger.error(f"❌ Error querying INFORMATION_SCHEMA: {e}")
