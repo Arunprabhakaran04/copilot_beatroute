@@ -1152,6 +1152,65 @@ class DBQueryAgent(BaseAgent):
             "estimated_accuracy_improvement": "25-35%" if self.sql_retriever else "0%"
         }
     
+    def _format_dataframe(self, df):
+        """Apply formatting to DataFrame: round numbers and format dates"""
+        try:
+            import pandas as pd
+            import re
+            
+            if df is None or df.empty:
+                return df
+            
+            # Round numeric columns (only affects numeric columns, safe if none exist)
+            numeric_cols = df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns
+            if len(numeric_cols) > 0:
+                df[numeric_cols] = df[numeric_cols].round(2)
+                logger.info(f"Rounded {len(numeric_cols)} numeric columns")
+            
+            # Format date columns
+            date_formats = [
+                "%Y-%m-%d",
+                "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y/%m/%d %H:%M:%S",
+                "%Y/%m/%d %H:%M",
+                "%Y/%m/%d",
+                "%d-%m-%Y %H:%M:%S",
+                "%d-%m-%Y %H:%M",
+                "%d-%m-%Y",
+                "%m/%d/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M",
+                "%m/%d/%Y"
+            ]
+            
+            pattern = re.compile(r"(date|month|time)", re.IGNORECASE)
+            matching_cols = [col for col in df.columns if pattern.search(col)]
+            
+            if len(matching_cols) == 0:
+                return df
+            
+            logger.info(f"Found {len(matching_cols)} potential date columns: {matching_cols}")
+            
+            for col in matching_cols:
+                parsed = None
+                for fmt in date_formats:
+                    try:
+                        parsed = pd.to_datetime(df[col], format=fmt, errors="coerce")
+                        if parsed.notna().sum() > 0:
+                            df[col] = parsed.dt.strftime("%B %d' %Y").combine_first(df[col])
+                            break
+                    except Exception:
+                        continue
+            
+            return df
+        except Exception as e:
+            logger.error(f"Error formatting DataFrame: {e}")
+            return df
+    
     def _convert_to_dataframe(self, query_results: Dict[str, Any]):
         """
         Convert query results to pandas DataFrame for summary agent consumption.
@@ -1199,6 +1258,11 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"✅ Successfully converted {len(df)} rows to DataFrame")
             logger.info(f"   Columns ({len(df.columns)}): {list(df.columns)}")
             logger.info(f"   Shape: {df.shape}")
+            
+            # Apply formatting
+            df = self._format_dataframe(df)
+            logger.info("✅ DataFrame formatted (rounded numbers and formatted dates)")
+            
             return df
             
         except ImportError:
