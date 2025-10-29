@@ -642,7 +642,31 @@ CUBE.JS CRITICAL RULES - STRICTLY FOLLOW THESE:
    - NO subqueries in WHERE clause
    - NO alias usage in WHERE clause
 
-6. FIELD USAGE NOTES - LEARN FROM EXAMPLES:
+6. ⚠️ CRITICAL: TABLE NAMES - STRICTLY FOLLOW EXAMPLES:
+   - 🚫 NEVER INVENT OR GUESS TABLE NAMES (e.g., "CustomerVisit", "SalesData", "CallHistory")
+   - ✅ ONLY use table names that appear in the PROVIDED SQL EXAMPLES below
+   - 📋 Extract ALL table names from examples and use ONLY those tables
+   - If examples show tables for visits/calls, USE THOSE EXACT TABLE NAMES
+   - If you don't see a table in examples, CHECK THE SCHEMA before inventing
+   - Common mistakes to AVOID:
+     * ❌ Using "CustomerVisit" when examples show different table
+     * ❌ Using "CallHistory" when examples use different table
+     * ❌ Using "SalesTransaction" when examples use CustomerInvoice
+   
+7. 🎯 STRICT EXAMPLE-FOLLOWING RULES:
+   - The 20 SQL EXAMPLES below are HIGHLY RELEVANT to your current question
+   - These examples have 70%+ similarity - they are VERY CLOSE to what you need
+   - ⚠️ PRIORITY ORDER when generating SQL:
+     1. FIRST: Check if examples use WITH clause → Copy that pattern
+     2. SECOND: Use EXACT table names from examples (don't invent new ones)
+     3. THIRD: Copy field naming patterns (skuName vs sku_name, dispatchedDate vs dispatch_date)
+     4. FOURTH: Copy date filtering patterns (DATE_TRUNC vs BETWEEN)
+     5. FIFTH: Copy aggregation patterns (MEASURE location, GROUP BY placement)
+   - 📝 IF EXAMPLES DON'T USE WITH CLAUSE: Don't add it unless absolutely needed for aggregation
+   - 📝 IF EXAMPLES USE SIMPLE SELECT: Follow that simpler pattern
+   - Most examples are PROVEN WORKING queries - don't overcomplicate!
+
+8. FIELD USAGE NOTES - LEARN FROM EXAMPLES:
    - 🔍 Check the EXAMPLES below to see correct field naming patterns
    - For Customer name: CROSS JOIN ViewCustomer, use ViewCustomer.name
    - For User name: CROSS JOIN ViewUser, use ViewUser.name  
@@ -721,7 +745,8 @@ CUBE.JS CRITICAL RULES - STRICTLY FOLLOW THESE:
 {previous_results}
 
 RESPONSE FORMAT:
-Return ONLY valid JSON: {{"sql": "YOUR_SQL_QUERY_HERE"}}
+Return ONLY valid JSON with properly escaped SQL (use \\n for newlines): {{"sql": "YOUR_SQL_QUERY_HERE"}}
+IMPORTANT: Escape all newlines, tabs, and special characters in the SQL string to create valid JSON.
 
 CRITICAL CHECKLIST FOR ALL QUERIES:
 
@@ -777,9 +802,41 @@ LIMIT 3
             json_match = re.search(r'\{[^{}]*"sql"[^{}]*\}', content, re.DOTALL)
             if json_match:
                 json_str = json_match.group(0)
-                data = json.loads(json_str)
                 
-                if "sql" in data:
+                # Try parsing as-is first
+                try:
+                    data = json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    # If parsing fails, try extracting SQL directly with regex
+                    # This handles cases where SQL contains unescaped newlines
+                    logger.warning(f"JSON parsing failed: {e}")
+                    logger.info("Attempting direct SQL extraction from malformed JSON...")
+                    
+                    # More robust extraction: find "sql": " and get everything until closing " followed by } or ,
+                    # This handles multi-line SQL with proper quote escaping
+                    sql_pattern = r'"sql"\s*:\s*"((?:[^"\\]|\\.)*)"\s*[,}]'
+                    sql_match = re.search(sql_pattern, json_str, re.DOTALL)
+                    if sql_match:
+                        sql = sql_match.group(1)
+                        # Unescape any escaped characters (like \n, \t)
+                        sql = sql.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+                        sql = sql.strip()
+                        logger.info(f"✅ Extracted SQL directly ({len(sql)} chars)")
+                        
+                        if sql.upper().startswith(('SELECT', 'WITH')):
+                            return {
+                                "success": True,
+                                "sql": sql,
+                                "query_type": "SELECT",
+                                "explanation": "SQL extracted directly (malformed JSON)",
+                                "format": "json_extracted"
+                            }
+                    
+                    # If extraction failed, set data to None to try other methods
+                    logger.error("❌ Failed to extract SQL from malformed JSON")
+                    data = None
+                
+                if data and "sql" in data:
                     sql = data["sql"].strip()
                     
                     if sql.upper().startswith(('SELECT', 'WITH')):
@@ -791,7 +848,7 @@ LIMIT 3
                             "format": "json"
                         }
                 
-                if "error" in data:
+                if data and "error" in data:
                     return {
                         "success": False,
                         "error": data["error"],

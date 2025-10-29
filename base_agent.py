@@ -28,6 +28,8 @@ class BaseAgentState(TypedDict):
     session_id: str
     # Conversation history for enrichment
     conversation_history: List[Dict[str, Any]]
+    # Table callback for immediate streaming
+    table_callback: Optional[Any]
 
 class MeetingAgentState(BaseAgentState):
     meeting_date: str

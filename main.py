@@ -1511,23 +1511,29 @@ class CentralOrchestrator:
                         query_results = step_result["query_results"]
                         logger.info(f"Found query_results in step {step_key}, type: {type(query_results)}")
                         if isinstance(query_results, dict):
-                            # Check for direct data/columns structure
-                            if "data" in query_results and "columns" in query_results:
-                                structured_data = query_results
-                                data_source_step = step_key
-                                logger.info(f"Found structured data (nested) from step {step_key} for visualization")
-                                break
-                            # Check for results.data structure
-                            elif "data" in query_results and "summary" in query_results:
-                                columns = query_results["summary"].get("columns", [])
+                            # Check for DataFrame format: data is JSON string
+                            if "data" in query_results:
                                 data = query_results["data"]
-                                if data and columns:
+                                
+                                # Parse JSON string to list if needed
+                                if isinstance(data, str):
+                                    import json
+                                    try:
+                                        data = json.loads(data)
+                                        logger.info(f"✅ Parsed data from JSON string: {len(data)} rows")
+                                    except json.JSONDecodeError:
+                                        logger.error(f"❌ Failed to parse data JSON string")
+                                        continue
+                                
+                                # Extract columns from first row
+                                if isinstance(data, list) and len(data) > 0:
+                                    columns = list(data[0].keys())
                                     structured_data = {
                                         "data": data,
                                         "columns": columns
                                     }
                                     data_source_step = step_key
-                                    logger.info(f"Found structured data (query_results format) from step {step_key} for visualization")
+                                    logger.info(f"Found structured data (DataFrame format) from step {step_key} with {len(data)} rows and {len(columns)} columns")
                                     break
                     
                     # Check if there's query_data key (alternative structure)
@@ -1962,7 +1968,7 @@ class CentralOrchestrator:
         self.classification_keywords[agent_type] = keywords
         print(f"Added new agent: {agent_type}")
     
-    def process_query(self, query: str, session_id: str = DEFAULT_SESSION_ID, user_id: str = DEFAULT_USER_ID, user_context=None) -> Dict[str, Any]:
+    def process_query(self, query: str, session_id: str = DEFAULT_SESSION_ID, user_id: str = DEFAULT_USER_ID, user_context=None, table_callback=None) -> Dict[str, Any]:
         """Production-grade query processing with comprehensive error handling"""
         initialize_session(user_id, session_id)
         
@@ -2117,7 +2123,9 @@ class CentralOrchestrator:
                 # Session management fields
                 session_id=session_id,
                 # Conversation history for agents
-                conversation_history=conversation_history
+                conversation_history=conversation_history,
+                # Table callback for immediate streaming
+                table_callback=table_callback
             )
             
             logger.info(f"PROCESSING QUERY: {query}")
