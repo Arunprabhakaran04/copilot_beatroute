@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose the port for FastAPI
-EXPOSE 8081
+EXPOSE 8080
 
 # Start the FastAPI app with WebSocket support
-CMD ["uvicorn", "main_websocket:app", "--host", "0.0.0.0", "--port", "8081", "--proxy-headers", "--forwarded-allow-ips", "*", "--ws", "auto", "--ws-ping-interval", "30", "--ws-ping-timeout", "180", "--log-level", "info"]
+CMD ["uvicorn", "main_websocket:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers", "--forwarded-allow-ips", "*", "--ws", "auto", "--ws-ping-interval", "30", "--ws-ping-timeout", "180", "--log-level", "info"]
