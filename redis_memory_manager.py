@@ -398,6 +398,7 @@ class RedisMemoryManager:
         - Normalizes month names and time references
         - Removes filler words and variations
         - Optionally includes structured params (dates, ranges) to make signature precise
+        - PRESERVES critical semantic keywords like "broken down", "by category", "group by", etc.
         Returns a short hex digest to use as a cache key.
         """
         if not isinstance(query, str):
@@ -424,6 +425,14 @@ class RedisMemoryManager:
         
         # Normalize "for" prepositions
         normalized = re.sub(r"\b(for\s+the\s+month\s+of|for\s+month\s+of|for\s+the\s+month|for\s+month|for)\s+", "for ", normalized)
+        
+        # ✅ CRITICAL FIX: Preserve aggregation/grouping keywords to prevent cache collision
+        # These keywords are SEMANTIC and change query meaning significantly
+        # Normalize them to a consistent canonical form but DO NOT REMOVE
+        normalized = re.sub(r"\b(broken\s+down\s+by|break\s+down\s+by|break\s+it\s+down\s+by)\b", "grouped-by", normalized)
+        normalized = re.sub(r"\bgroup\s+by\b", "grouped-by", normalized)
+        normalized = re.sub(r"\bby\s+category\b", "grouped-by category", normalized)
+        normalized = re.sub(r"\bby\s+(\w+)\b", r"grouped-by \1", normalized)
         
         # Normalize month names to consistent format BEFORE number replacement
         month_map = {
@@ -490,8 +499,13 @@ class RedisMemoryManager:
         
         if cached:
             logger.info(f"✅ Cache HIT for query signature: {sig}")
+            logger.info(f"   📝 Original query: {query}")
+            logger.info(f"   🎯 Cached result type: {type(cached)}")
+            if isinstance(cached, dict):
+                logger.info(f"   🔑 Cached result keys: {list(cached.keys())}")
         else:
             logger.debug(f"❌ Cache MISS for query signature: {sig}")
+            logger.debug(f"   📝 Query: {query}")
         
         return cached
     

@@ -338,8 +338,54 @@ class ImprovedSQLGenerator(BaseAgent):
             conversation_history=conversation_history,
             retrieved_sqls=similar_sqls,  # Pass retrieved SQLs for injection
             max_history=5,  # Keep last 5 REAL conversations
-            max_retrieved_sqls=20  # Inject up to 20 retrieved SQLs
+            max_retrieved_sqls=20  # Inject up to 20 retrieved SQLs (increased from 10)
         )
+        
+        # ✅ CRITICAL: Add explicit instruction to follow retrieved SQL patterns
+        # This is THE MOST IMPORTANT fix to make LLM use retrieved examples
+        if similar_sqls and len(similar_sqls) > 0:
+            num_examples = min(len(similar_sqls), 20)
+            top_similarity = similar_sqls[0].get('similarity', 0) if similar_sqls else 0
+            
+            # Find the last user message (current question) to enhance it
+            last_user_idx = None
+            for i in range(len(message_log) - 1, -1, -1):
+                if message_log[i]["role"] == "user":
+                    last_user_idx = i
+                    break
+            
+            if last_user_idx is not None:
+                original_question = message_log[last_user_idx]["content"]
+                
+                # ✅ Add EMPHATIC instruction to prioritize retrieved examples
+                enhanced_question = f"""{original_question}
+
+🎯 CRITICAL INSTRUCTIONS - FOLLOW RETRIEVED EXAMPLES:
+
+The conversation history above contains {num_examples} real SQL examples from our database.
+These examples are PROVEN to work with our exact schema and field names.
+
+YOU MUST CAREFULLY STUDY THESE EXAMPLES FOR:
+1. ✅ Exact field names to use (e.g., ViewCustomerActivity.__user, NOT ViewCustomer.name)
+2. ✅ Table join patterns (single table vs CROSS JOIN)
+3. ✅ WHERE clause syntax and date filtering
+4. ✅ GROUP BY and aggregation patterns
+5. ✅ Field availability in each table
+
+⚠️ COMMON MISTAKES TO AVOID:
+- DO NOT invent field names that don't exist in the examples
+- DO NOT join tables if examples use single table approach
+- DO NOT use fields from one table when selecting from another
+- DO NOT ignore the exact syntax patterns shown in examples
+
+🔥 HIGHEST PRIORITY: Match the patterns from the example with similarity {top_similarity:.3f}
+This example is the MOST similar to your current question - follow its structure closely!
+
+Now generate SQL following these proven patterns:"""
+                
+                message_log[last_user_idx]["content"] = enhanced_question
+                logger.info(f"✅ Added explicit instruction to follow {num_examples} retrieved SQL patterns")
+                logger.info(f"   Top similarity: {top_similarity:.3f} - LLM instructed to prioritize this example")
         
         # ADAPTIVE TEMPERATURE: Adjust creativity based on similarity
         # Note: No longer using filtered examples, just use similarity scores from retrieved SQLs
@@ -354,7 +400,7 @@ class ImprovedSQLGenerator(BaseAgent):
             output=content,
             agent_type="improved_sql_generator",
             operation="generate_sql",
-            model_name="gpt-4o"
+            model_name="gpt-4.1"
         )
         
         # Log execution timing
@@ -415,8 +461,23 @@ class ImprovedSQLGenerator(BaseAgent):
             # Sort by similarity ASCENDING (lowest first, highest last)
             sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
             
-            logger.info(f"Injecting {len(sorted_sqls)} retrieved SQLs as fake conversation (ASCENDING similarity)")
-            logger.info(f"   Similarity range: {sorted_sqls[0].get('similarity', 0):.3f} (first) -> {sorted_sqls[-1].get('similarity', 0):.3f} (last/most recent)")
+            logger.info(f"🎯 Injecting {len(sorted_sqls)} retrieved SQLs as fake conversation (ASCENDING similarity)")
+            logger.info(f"   Similarity range: {sorted_sqls[0].get('similarity', 0):.3f} (first) -> {sorted_sqls[-1].get('similarity', 0):.3f} (last/most similar)")
+            
+            # ✅ Log top 3 and bottom 1 to verify what LLM is seeing
+            logger.info(f"   📥 Sample injected SQLs:")
+            for idx, sql_info in enumerate(sorted_sqls[:3], 1):
+                question = sql_info.get('question', '')
+                sql = sql_info.get('sql', '')
+                similarity = sql_info.get('similarity', 0)
+                logger.info(f"      [{idx}] sim={similarity:.3f} Q: '{question[:60]}...'")
+                logger.info(f"          SQL: {sql[:120]}...")
+            
+            # Log the MOST similar (last one)
+            if len(sorted_sqls) > 3:
+                last_sql = sorted_sqls[-1]
+                logger.info(f"      [MOST SIMILAR] sim={last_sql.get('similarity', 0):.3f} Q: '{last_sql.get('question', '')[:60]}...'")
+                logger.info(f"                     SQL: {last_sql.get('sql', '')[:120]}...")
             
             for idx, sql_info in enumerate(sorted_sqls, 1):
                 # Add as user question
@@ -427,16 +488,37 @@ class ImprovedSQLGenerator(BaseAgent):
                 sql = sql_info.get('sql', '')
                 assistant_sql = f"```sql\n{sql}\n```"
                 message_log.append({"role": "assistant", "content": assistant_sql})
-                
-                if idx <= 3 or idx == len(sorted_sqls):  # Log first 3 and last one
-                    similarity = sql_info.get('similarity', 0)
-                    marker = "MOST SIMILAR" if idx == len(sorted_sqls) else f"#{idx}"
-                    logger.info(f"   [{marker}] Injected SQL {idx}: sim={similarity:.3f}, Q: '{question[:50]}...'")
         else:
             logger.info("No retrieved SQLs to inject")
         
-        # Step 3: Add CURRENT question (this is the actual user query)
-        message_log.append({"role": "user", "content": current_question})
+        # Step 3: Add CURRENT question with explicit instruction to follow examples
+        # ✅ CRITICAL: Add instruction to force LLM to follow retrieved SQL patterns
+        if retrieved_sqls and len(retrieved_sqls) > 0:
+            enhanced_question = f"""{current_question}
+
+🎯 CRITICAL INSTRUCTIONS - You MUST follow these:
+1. The {len(retrieved_sqls)} SQL examples above are REAL, WORKING queries from this exact database
+2. Study their patterns carefully:
+   - FIELD NAMES used (e.g., ViewCustomer.name requires CROSS JOIN ViewCustomer)
+   - TABLE JOINS (CROSS JOIN patterns are mandatory when selecting fields from multiple tables)
+   - WHERE clause date filtering patterns
+   - WITH clause structures for multi-step queries
+3. The MOST SIMILAR example (last one above) is the best pattern to follow
+4. If example uses CROSS JOIN ViewCustomer to access ViewCustomer.name, YOU MUST DO THE SAME
+5. DO NOT assume field names - use EXACT field names from the examples
+6. If ViewCustomerActivity is used, remember it has: __user, activityTime, count, calls, etc.
+7. If you need ViewCustomer.name, you MUST include: CROSS JOIN ViewCustomer
+
+⚠️ COMMON MISTAKES TO AVOID:
+- Using ViewCustomer.name without CROSS JOIN ViewCustomer (will fail!)
+- Removing CROSS JOIN that was in the example pattern
+- Assuming field names that don't match the examples
+- Ignoring the table join patterns from similar examples"""
+            
+            message_log.append({"role": "user", "content": enhanced_question})
+            logger.info("✅ Added explicit instruction to follow retrieved SQL patterns")
+        else:
+            message_log.append({"role": "user", "content": current_question})
         
         total_messages = len(message_log)
         real_conv_count = len(conversation_history) * 2 if conversation_history else 0
@@ -525,9 +607,9 @@ class ImprovedSQLGenerator(BaseAgent):
             
             # Create adaptive LLM instance
             adaptive_llm = ChatOpenAI(
-                model="gpt-4o",
+                model="gpt-4.1",
                 api_key=os.getenv("OPENAI_API_KEY"),
-                temperature=temperature,
+                temperature=0.1,  # Fixed at 0.1 for maximum accuracy
                 max_tokens=2000
             )
             
@@ -688,58 +770,55 @@ class ImprovedSQLGenerator(BaseAgent):
         # Note: Retrieved SQL examples are now part of conversation history (not in prompt)
         # This makes LLM pay more attention to them as "recent successful queries"
         
-        return f"""You are an expert SQL generator for Cube.js. Generate ACCURATE, COMPLETE queries.
+        return f"""You are an expert SQL generator for Cube.js.
 
-🎯 CRITICAL - FOLLOW THE RETRIEVED SQL EXAMPLES ABOVE
+🎯 CRITICAL INSTRUCTION - READ THIS FIRST
 ================================================================================
-Your conversation history contains PROVEN, WORKING SQL queries for SIMILAR questions.
+The conversation history above contains REAL SQL examples from this database.
+Examples are ordered by similarity score (ASCENDING order).
+→ The MOST RECENT message in conversation = HIGHEST similarity = BEST pattern to follow
 
-⚠️ EXTREMELY IMPORTANT: 
-   - The examples above have SIMILARITY SCORES (0.80+ = very similar to current query)
-   - HIGH SIMILARITY (>0.80) means the SQL pattern is 80%+ the answer you need
-   - MEDIUM SIMILARITY (>0.70) shows the right approach
-   
-📋 YOUR TASK:
-1. Find the HIGHEST SIMILARITY example(s) in conversation history
-2. Study the SQL pattern: tables, joins, WHERE clauses, date logic
-3. COPY that pattern and adapt it for the current question
-4. Preserve the JOIN structure, filtering logic, and date handling from the example
+Your PRIMARY task: COPY the pattern from the MOST RECENT example (last message before current question).
 
-DO NOT create new SQL from scratch if a similar pattern exists above!
-The retrieved examples are PROVEN to work - treat them as templates.
-================================================================================
+⚠️ The MOST RECENT example has the HIGHEST similarity score.
+⚠️ If similarity > 0.70, you MUST copy that example's structure exactly.
 
-CRITICAL YEAR RULE
-================================================================================
-CURRENT DATA YEAR: {data_year}
+REQUIRED STEPS:
+1. Check the MOST RECENT example (last message before current question)
+2. What TABLE does it use? → YOU use the SAME table
+3. Does it use CROSS JOIN ViewCustomer? → YOU use CROSS JOIN ViewCustomer
+4. Copy the WHERE clause pattern, date logic, and structure
+5. Change ONLY the specific date ranges for the current question
 
-⚠️ When user mentions months WITHOUT a year (e.g., "last month", "this month"):
-   - Use year {data_year}
-   - Example: "last month" = '{data_year}-09-01' (September {data_year})
-   - Example: "this month" = '{data_year}-10-01' (October {data_year})
+⛔ CRITICAL TABLE RULES:
+- Question about "visits"? → Use ViewCustomerActivity (from examples)
+- Question about "sales/orders"? → Use CustomerInvoice (from examples)
+- Need customer names? → MUST use "CROSS JOIN ViewCustomer"
+- DO NOT use tables not shown in examples above
 
-⚠️ If retrieved examples show different years (2024, 2023, etc.):
-   - UPDATE those years to {data_year} in your SQL
-================================================================================
+⛔ CRITICAL CROSS JOIN RULE:
+If example shows: "CROSS JOIN ViewCustomer" to get ViewCustomer.name
+→ YOU MUST also use "CROSS JOIN ViewCustomer"
+→ NEVER access ViewCustomer.name without CROSS JOIN
+
+Example Pattern (COPY THIS):
+```sql
+SELECT DISTINCT ViewCustomer.name 
+FROM ViewCustomerActivity 
+CROSS JOIN ViewCustomer
+WHERE ViewCustomerActivity.activityTime >= ...
+```
+
+YEAR RULE: Current data year is {data_year}. Use this year in date filters.
 
 {entity_context}
-{previous_context}
 
-DATABASE SCHEMA (Relevant Tables):
-================================================================================
+DATABASE SCHEMA:
 {self._get_schema_context(focused_schema)}
-================================================================================
-
-⚡ GENERATION CHECKLIST:
-1. ✅ Did I find the HIGHEST SIMILARITY example from conversation history?
-2. ✅ Am I following its JOIN pattern and WHERE clause structure?
-3. ✅ Did I update any years to {data_year}?
-4. ✅ Am I using verified entity names (if provided above)?
-5. ✅ Is my SQL a real query (not placeholder with WHERE 1=1)?
 
 RETURN FORMAT: {{"sql": "YOUR_QUERY_HERE"}}
 
-Generate SQL by adapting the most similar retrieved example(s) from your conversation history."""
+Now generate SQL by COPYING the most similar example's pattern."""
     
     def _parse_and_validate_response(self, content: str, question: str, intent: Dict[str, Any]) -> Dict[str, Any]:
         """

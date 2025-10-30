@@ -299,6 +299,12 @@ STRICTLY respond with DIRECTLY PARSABLE JSON string only.
 DO NOT RESPOND IN FORMAT json or as a JSON code block.
 Today's date is {current_date}. Talk politely like a person and greet back as a follow up when there is a greeting.
 Never ask to provide data or table name.
+
+IMPORTANT CAPABILITIES:
+- You CAN execute SQL queries to retrieve data from the database.
+- You CAN create visualizations (charts, graphs, plots) from query results.
+- You CAN generate summaries and insights from data.
+- When user asks for visualization of previous results, acknowledge that you can do it and rephrase as a complete_question like: "Create a bar chart showing the top 3 SKUs based on sales value from the previous query results."
 """
         
         if user_name:
@@ -372,8 +378,13 @@ Step 0: Prefer Default Assumptions When Safe
       - "What is the monthly sales for last 3 months?" means "What is the monthly secondary sales (customer dispatch) for last 3 months?"
     - Avoid follow-ups if a clear industry standard or previously used default exists.
 
-Step 1: Answer if the question is about the previous asked questions and can be answered using the results of the previous question.
-    - Answer in the format { "answer" : "answer to the question about previous question" }
+Step 1: Handle Requests About Previous Results
+    - If the question is asking for visualization, chart, graph, or plot of previous results:
+      - Check if there are previous results available in chat history
+      - If yes, return complete_question in format: "Create a [chart_type] visualization showing [what to visualize] from the previous query results"
+      - Example: User asks "can you provide a visualization?" → complete_question: "Create a bar chart showing the top 3 SKUs based on sales value from the previous query results"
+    - If the question is about the previous asked questions and can be answered using the results of the previous question:
+      - Answer in the format { "answer" : "answer to the question about previous question" }
     
 Step 2: Infer Information from Chat History
     - Retrieve the chat history to check if the current question is a follow-up or depends on previous responses.

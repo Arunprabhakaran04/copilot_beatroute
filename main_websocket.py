@@ -228,12 +228,35 @@ async def process_question(websocket: WebSocket, question: str, session_id: str,
         logger.info(f"Processing question with UserContext (focused schema enabled)")
         logger.info(f"   Available tables: {len(user_context.schema_map)}")
         
+        # Create callback to send START + table data immediately
+        start_sent = False
+        async def send_table_callback(table_data: str):
+            """Callback to send START + table data immediately before summary generation"""
+            nonlocal start_sent
+            try:
+                if not start_sent:
+                    await websocket.send_json({
+                        "type": MessageType.STATUS.value,
+                        "content": "START"
+                    })
+                    start_sent = True
+                    logger.info("START message sent via callback")
+                
+                await websocket.send_json({
+                    "type": MessageType.TABLE.value,
+                    "content": table_data
+                })
+                logger.info("Table data sent via callback before summary generation")
+            except Exception as e:
+                logger.error(f"Failed to send table via callback: {e}")
+        
         result = await asyncio.to_thread(
             orchestrator.process_query,
             query=question,
             session_id=session_id,
             user_id=user_id,
-            user_context=user_context  # Pass UserContext to orchestrator
+            user_context=user_context,
+            table_callback=send_table_callback
         )
         
         if not result.get("success", False):
@@ -289,11 +312,12 @@ async def process_question(websocket: WebSocket, question: str, session_id: str,
                 })
                 return
         
-        # Normal processing for other agents
-        await websocket.send_json({
-            "type": MessageType.STATUS.value,
-            "content": "START"
-        })
+        # Send START if not already sent via callback
+        if not start_sent:
+            await websocket.send_json({
+                "type": MessageType.STATUS.value,
+                "content": "START"
+            })
         
         if result.get("is_multi_step", False):
             for idx, step in enumerate(result.get("completed_steps", []), 1):
@@ -339,53 +363,60 @@ async def send_agent_result(websocket: WebSocket, agent_type: str, result_data: 
             query_results = result_data["query_results"]
             logger.info(f"   query_results keys: {list(query_results.keys())}")
             
-            # Send table data as JSON
-            if "data" in query_results and query_results["data"]:
-                table_content = query_results["data"]
-                
-                # Ensure it's a list/dict, not a string
-                if isinstance(table_content, str):
-                    import json
-                    try:
-                        table_content = json.loads(table_content)
-                        logger.info(f"   ✅ Parsed table_content from JSON string")
-                    except:
-                        logger.error(f"   ❌ Failed to parse table_content as JSON: {table_content[:100]}")
-                        pass
-                
-                # Log table data before sending
-                logger.info(f"📊 TABLE DATA TO SEND:")
-                logger.info(f"   Type: {type(table_content)}")
-                logger.info(f"   Length: {len(table_content) if isinstance(table_content, (list, dict)) else 'N/A'}")
-                if isinstance(table_content, list) and len(table_content) > 0:
-                    logger.info(f"   First row: {table_content[0]}")
-                    logger.info(f"   Sample data (first 3 rows):")
-                    for idx, row in enumerate(table_content[:3]):
-                        logger.info(f"      Row {idx + 1}: {row}")
-                
-                # Send as JSON with TYPE_TABLE
-                logger.info(f"   📤 Sending TYPE_TABLE message")
-                await websocket.send_json({
-                    "type": MessageType.TABLE.value,
-                    "content": table_content
-                })
-                logger.info(f"   ✅ TYPE_TABLE sent successfully")
-            else:
-                logger.warning(f"   ⚠️ No 'data' field in query_results or data is empty")
+            # Check if table was already sent via callback
+            table_already_sent = result_data.get("table_sent_via_callback", False)
             
-            # Send summary as HTML
+            if not table_already_sent:
+                # Send table data if not already sent
+                if "data" in query_results and query_results["data"]:
+                    table_content = query_results["data"]
+                    
+                    # Ensure it's a list/dict, not a string
+                    if isinstance(table_content, str):
+                        import json
+                        try:
+                            # table_content = json.loads(table_content)
+                            logger.info(f"   ✅ Parsed table_content from JSON string")
+                        except:
+                            logger.error(f"   ❌ Failed to parse table_content as JSON: {table_content[:100]}")
+                            pass
+                    
+                    # Log table data before sending
+                    logger.info(f"TABLE DATA TO SEND:")
+                    logger.info(f"   Type: {type(table_content)}")
+                    logger.info(f"   Length: {len(table_content) if isinstance(table_content, (list, dict)) else 'N/A'}")
+                    if isinstance(table_content, list) and len(table_content) > 0:
+                        logger.info(f"   First row: {table_content[0]}")
+                        logger.info(f"   Sample data (first 3 rows):")
+                        for idx, row in enumerate(table_content[:3]):
+                            logger.info(f"      Row {idx + 1}: {row}")
+                    
+                    logger.info(f"   Sending TYPE_TABLE message")
+                    await websocket.send_json({
+                        "type": MessageType.TABLE.value,
+                        "content": table_content
+                    })
+                    logger.info(f"   TYPE_TABLE sent successfully")
+                else:
+                    logger.warning(f"   No 'data' field in query_results or data is empty")
+            else:
+                logger.info("   Table already sent via callback, skipping duplicate send")
+            
+            # ✅ THEN send summary as HTML (if available)
+            # Frontend already has the data, summary is just supplementary
             if "summary" in query_results and query_results["summary"]:
                 logger.info(f"📝 SUMMARY TO SEND:")
                 logger.info(f"   Type: {type(query_results['summary'])}")
-                logger.info(f"   Length: {len(query_results['summary'])} chars")
-                logger.info(f"   Preview: {query_results['summary'][:200]}...")
+                summary_str = str(query_results['summary']) if not isinstance(query_results['summary'], str) else query_results['summary']
+                logger.info(f"   Length: {len(summary_str)} chars")
+                logger.info(f"   Preview: {summary_str[:200]}...")
                 
-                logger.info(f"   📤 Sending TYPE_SUMMARY message")
+                logger.info(f"   📤 Sending TYPE_SUMMARY message AFTER table")
                 await websocket.send_json({
                     "type": MessageType.SUMMARY.value,
                     "content": query_results["summary"]
                 })
-                logger.info(f"   ✅ TYPE_SUMMARY sent successfully")
+                logger.info(f"   ✅ TYPE_SUMMARY sent successfully (supplementary to table data)")
             else:
                 logger.warning(f"   ⚠️ No 'summary' field in query_results")
     

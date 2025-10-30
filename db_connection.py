@@ -112,17 +112,20 @@ class DatabaseConnection:
             if connection:
                 self.connection_pool.putconn(connection)
     
-    def execute_query(self, sql_query: str, params: tuple = None) -> Dict[str, Any]:
+    def execute_query(self, sql_query: str, params: tuple = None, retry_count: int = 0) -> Dict[str, Any]:
         """
         Execute a SQL query and return results with metadata
         
         Args:
             sql_query: The SQL query to execute
             params: Optional parameters for parameterized queries
+            retry_count: Internal retry counter (max 2 retries)
             
         Returns:
             Dict containing success status, data, metadata, and any errors
         """
+        MAX_RETRIES = 2
+        
         if not self.connection_pool:
             return {
                 'success': False,
@@ -201,7 +204,7 @@ class DatabaseConnection:
             
             execution_time = (datetime.now() - start_time).total_seconds()
             
-            logger.info(f" SQL QUERY EXECUTED SUCCESSFULLY")
+            logger.info(f"✅ SQL QUERY EXECUTED SUCCESSFULLY")
             logger.info(f"Rows affected/returned: {row_count}")
             logger.info(f"Execution time: {execution_time:.3f}s")
             logger.info(f"Columns: {columns}")
@@ -223,22 +226,65 @@ class DatabaseConnection:
             
         except psycopg2.Error as e:
             # PostgreSQL specific errors
+            error_msg = str(e).lower()
+            
+            # ✅ DETECT connection-related errors for auto-refresh
+            connection_errors = [
+                'connection already closed',
+                'connection closed',
+                'server closed the connection',
+                'connection reset',
+                'no connection to the server',
+                'connection timed out',
+                'authentication failed',
+                'connection refused'
+            ]
+            
+            is_connection_error = any(err in error_msg for err in connection_errors)
+            
+            if is_connection_error and retry_count < MAX_RETRIES:
+                logger.warning(f"⚠️ CONNECTION ERROR DETECTED: {error_msg}")
+                logger.info(f"🔄 Attempting connection refresh and retry (attempt {retry_count + 1}/{MAX_RETRIES})...")
+                
+                if connection:
+                    try:
+                        connection.rollback()
+                    except:
+                        pass
+                    # ✅ CRITICAL FIX: Don't return stale connection to new pool after refresh
+                    # Set to None so finally block doesn't try putconn on a connection from old pool
+                    connection = None
+                
+                # ✅ REFRESH connection pool
+                if self.refresh_connection_pool():
+                    logger.info(f"   Retrying query with fresh connection pool...")
+                    # Recursive retry with incremented counter
+                    return self.execute_query(sql_query, params, retry_count + 1)
+                else:
+                    logger.error("   Connection refresh failed, cannot retry")
+            
+            # If not connection error or max retries exceeded
             if connection:
                 connection.rollback()
             
-            error_msg = f"Database error: {e}"
-            logger.error(f" SQL EXECUTION FAILED: {error_msg}")
+            full_error_msg = f"Database error: {e}"
+            logger.error(f"❌ SQL EXECUTION FAILED: {full_error_msg}")
             logger.error(f"Failed SQL: {sql_query}")
+            
+            if retry_count > 0:
+                logger.error(f"Failed after {retry_count} retry attempts")
             
             return {
                 'success': False,
-                'error': error_msg,
+                'error': full_error_msg,
                 'data': "[]",  # Empty JSON array string
                 'metadata': {
                     'execution_time': (datetime.now() - start_time).total_seconds(),
                     'error_code': e.pgcode if hasattr(e, 'pgcode') else None,
-                    'error_type': 'database_error',
-                    'failed_sql': sql_query
+                    'error_type': 'connection_error' if is_connection_error else 'database_error',
+                    'failed_sql': sql_query,
+                    'retry_count': retry_count,
+                    'is_connection_error': is_connection_error
                 }
             }
             
@@ -247,7 +293,7 @@ class DatabaseConnection:
                 connection.rollback()
                 
             error_msg = f"Query execution error: {e}"
-            logger.error(f" SQL EXECUTION FAILED: {error_msg}")
+            logger.error(f"❌ SQL EXECUTION FAILED: {error_msg}")
             logger.error(f"Failed SQL: {sql_query}")
             
             return {
@@ -257,7 +303,8 @@ class DatabaseConnection:
                 'metadata': {
                     'execution_time': (datetime.now() - start_time).total_seconds(),
                     'error_type': 'execution_error',
-                    'failed_sql': sql_query
+                    'failed_sql': sql_query,
+                    'retry_count': retry_count
                 }
             }
             
@@ -411,6 +458,23 @@ class DatabaseConnection:
         if self.connection_pool:
             self.connection_pool.closeall()
             logger.info("Database connection pool closed")
+    
+    def refresh_connection_pool(self):
+        """Refresh connection pool with current session_id credentials"""
+        logger.info(f"🔄 Refreshing connection pool for session: {self.session_id[:20] if self.session_id else 'default'}...")
+        try:
+            # Close old pool
+            if self.connection_pool:
+                self.connection_pool.closeall()
+                logger.info("   Closed old connection pool")
+            
+            # Reinitialize with same credentials
+            self._initialize_connection_pool()
+            logger.info("✅ Connection pool refreshed successfully")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to refresh connection pool: {e}")
+            return False
 
 # Global database instance per session
 _db_instances = {}
@@ -451,3 +515,25 @@ def test_database_connection(session_id: str = None) -> Dict[str, Any]:
     """Test the database connection"""
     db = get_database_connection(session_id)
     return db.test_connection()
+
+def invalidate_session_connection(session_id: str):
+    """
+    Invalidate and remove cached database connection for a session.
+    Useful when session credentials expire.
+    
+    Args:
+        session_id: Session ID to invalidate
+        
+    Returns:
+        bool: True if session was invalidated, False if session not found
+    """
+    if session_id in _db_instances:
+        logger.info(f"🗑️ Invalidating cached connection for session: {session_id[:20] if session_id else 'default'}...")
+        try:
+            _db_instances[session_id].close_connections()
+        except Exception as e:
+            logger.error(f"Error closing connections: {e}")
+        del _db_instances[session_id]
+        logger.info("✅ Session connection invalidated")
+        return True
+    return False

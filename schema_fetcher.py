@@ -482,9 +482,10 @@ class SchemaManager:
         """
         Get focused schema context for SQL generation prompt
         
-        This method combines two approaches:
+        This method combines three approaches:
         1. Find top K similar tables based on question embedding similarity
         2. Extract tables from retrieved similar SQL queries
+        3. Keyword boosting: Add tables matching domain keywords (visit, call, etc.)
         
         Args:
             current_question: User's natural language question
@@ -511,10 +512,44 @@ class SchemaManager:
         sql_queries = [item['sql'] for item in list_similar_question_sql_pair if 'sql' in item]
         tables_from_sql = self.extract_table_names_from_sql(sql_queries)
         
-        # Step 3: Combine both sets
-        set_tables.update(tables_from_sql)
+        # Step 3: Keyword boosting - add tables with matching keywords
+        # This ensures important domain-specific tables aren't missed by embedding similarity
+        question_lower = current_question.lower()
+        keyword_matches = set()
         
-        # Step 4: Build schema for prompt
+        # Define keyword -> table patterns
+        keyword_patterns = {
+            'visit': ['visit', 'call'],  # If query mentions "visit", include tables with "visit" or "call"
+            'call': ['visit', 'call'],
+            'attendance': ['attendance', 'schedule'],
+            'inventory': ['inventory', 'stock'],
+            'outstanding': ['outstanding', 'payment', 'debit', 'credit'],
+            'payment': ['payment', 'outstanding', 'debit', 'credit'],
+            'scheme': ['scheme', 'campaign'],
+            'campaign': ['scheme', 'campaign'],
+            'return': ['return'],
+            'offtake': ['offtake'],
+        }
+        
+        # Check if question contains any keywords
+        for keyword, patterns in keyword_patterns.items():
+            if keyword in question_lower:
+                logger.info(f"🔍 Keyword '{keyword}' detected in question - boosting tables with patterns: {patterns}")
+                # Add all tables whose names contain any of the patterns
+                for table_name in self.schema_map.keys():
+                    table_lower = table_name.lower()
+                    if any(pattern in table_lower for pattern in patterns):
+                        keyword_matches.add(table_name)
+                        logger.info(f"  ✅ Added table: {table_name}")
+        
+        if keyword_matches:
+            logger.info(f"SCHEMA | Keyword boosting added {len(keyword_matches)} tables: {sorted(keyword_matches)}")
+        
+        # Step 4: Combine all three sets
+        set_tables.update(tables_from_sql)
+        set_tables.update(keyword_matches)
+        
+        # Step 5: Build schema for prompt
         schema_for_prompt = []
         tables_present = []
         tables_missing = []
@@ -530,6 +565,7 @@ class SchemaManager:
         # Log final result with timing
         schema_time = time.time() - start_time
         logger.info(f"SCHEMA | Focused schema: {len(tables_present)} tables ({schema_time:.2f}s)")
+        logger.info(f"SCHEMA | Tables included: {sorted(tables_present)}")
         if tables_missing:
             logger.warning(f"SCHEMA | Missing {len(tables_missing)} tables: {tables_missing}")
         

@@ -94,6 +94,11 @@ class DBQueryAgent(BaseAgent):
             except ImportError:
                 logger.info(f"DB_QUERY | Processing: {state['query']}")
             
+            # ✅ CRITICAL: Store user_context as class attribute for multi-step access
+            if "user_context" in state and state["user_context"]:
+                self.user_context = state["user_context"]
+                logger.info("✅ Stored user_context in DBQueryAgent for multi-step execution")
+            
             # Step 1: Input validation and sanitization
             if not state.get('query') or not state['query'].strip():
                 db_state["error_message"] = "Empty or invalid query provided"
@@ -304,6 +309,23 @@ class DBQueryAgent(BaseAgent):
                         logger.error(f"   Input was: {type(execution_result.get('query_results'))}")
                         query_data_df = None
                     
+                    # Send table data immediately via callback (before summary generation)
+                    table_sent_via_callback = False
+                    if state.get("table_callback") and execution_result.get("query_results"):
+                        try:
+                            table_data = execution_result["query_results"].get("data")
+                            if table_data:
+                                logger.info("Calling table_callback to send data immediately")
+                                import asyncio
+                                loop = asyncio.new_event_loop()
+                                loop.run_until_complete(state["table_callback"](table_data))
+                                loop.close()
+                                table_sent_via_callback = True
+                                logger.info("Table sent via callback successfully")
+                        except Exception as cb_error:
+                            logger.error(f"Table callback failed: {cb_error}")
+                            table_sent_via_callback = False
+                    
                     # Generate summary using Summary Agent
                     logger.info("Generating summary for query results...")
                     summary_html = None
@@ -332,6 +354,7 @@ class DBQueryAgent(BaseAgent):
                     db_state["result"]["is_multi_step"] = False
                     db_state["result"]["step_count"] = 1
                     db_state["result"]["exception_handling"] = execution_result.get("exception_summary")
+                    db_state["result"]["table_sent_via_callback"] = table_sent_via_callback
                     
                     # Add database execution results - ensure it's a dict
                     query_results_data = execution_result.get("query_results", {})
@@ -700,8 +723,22 @@ class DBQueryAgent(BaseAgent):
             
             if result_state["status"] == "completed":
                 similar_sqls = result_state["result"].get("similar_sqls", [])
-                logger.info(f"Retrieved {len(similar_sqls)} step-specific SQL examples")
-                return similar_sqls[:10]  # Limit to top 10 for efficiency
+                logger.info(f"📥 Retrieved {len(similar_sqls)} step-specific SQL examples")
+                
+                # ✅ Log top 3 retrieved SQLs with actual queries for debugging
+                for idx, sql_info in enumerate(similar_sqls[:3], 1):
+                    question = sql_info.get('question', 'N/A')
+                    sql = sql_info.get('sql', 'N/A')
+                    similarity = sql_info.get('similarity', 0)
+                    
+                    logger.info(f"   📋 Example {idx} (sim={similarity:.3f}):")
+                    logger.info(f"      Q: {question}")
+                    logger.info(f"      SQL: {sql[:200]}...")  # First 200 chars
+                
+                # ✅ CRITICAL: Pass ALL 20 retrieved SQLs to maximize LLM learning
+                num_to_pass = min(20, len(similar_sqls))
+                logger.info(f"🎯 Passing top {num_to_pass} examples to SQL generator (increased from 10)")
+                return similar_sqls[:20]  # Pass 20 instead of 10 for better pattern learning
             else:
                 logger.warning(f"Step-specific SQL retrieval failed for: {step_question}")
                 return []
@@ -720,6 +757,12 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"Question: {question}")
             logger.info(f"Available context examples: {len(similar_sqls)}")
             logger.info(f"Previous results available: {len(previous_results)}")
+            
+            # ✅ CRITICAL FIX: Ensure user_context is available in state for focused schema
+            # During multi-step execution, user_context may not be in step state
+            if state and "user_context" not in state and hasattr(self, 'user_context'):
+                state["user_context"] = self.user_context
+                logger.info("✅ Copied user_context to step state for schema access")
             
             # Get conversation history from state (if available)
             conversation_history = state.get("conversation_history", []) if state else []
@@ -1109,6 +1152,65 @@ class DBQueryAgent(BaseAgent):
             "estimated_accuracy_improvement": "25-35%" if self.sql_retriever else "0%"
         }
     
+    def _format_dataframe(self, df):
+        """Apply formatting to DataFrame: round numbers and format dates"""
+        try:
+            import pandas as pd
+            import re
+            
+            if df is None or df.empty:
+                return df
+            
+            # Round numeric columns (only affects numeric columns, safe if none exist)
+            numeric_cols = df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns
+            if len(numeric_cols) > 0:
+                df[numeric_cols] = df[numeric_cols].round(2)
+                logger.info(f"Rounded {len(numeric_cols)} numeric columns")
+            
+            # Format date columns
+            date_formats = [
+                "%Y-%m-%d",
+                "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y/%m/%d %H:%M:%S",
+                "%Y/%m/%d %H:%M",
+                "%Y/%m/%d",
+                "%d-%m-%Y %H:%M:%S",
+                "%d-%m-%Y %H:%M",
+                "%d-%m-%Y",
+                "%m/%d/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M",
+                "%m/%d/%Y"
+            ]
+            
+            pattern = re.compile(r"(date|month|time)", re.IGNORECASE)
+            matching_cols = [col for col in df.columns if pattern.search(col)]
+            
+            if len(matching_cols) == 0:
+                return df
+            
+            logger.info(f"Found {len(matching_cols)} potential date columns: {matching_cols}")
+            
+            for col in matching_cols:
+                parsed = None
+                for fmt in date_formats:
+                    try:
+                        parsed = pd.to_datetime(df[col], format=fmt, errors="coerce")
+                        if parsed.notna().sum() > 0:
+                            df[col] = parsed.dt.strftime("%B %d' %Y").combine_first(df[col])
+                            break
+                    except Exception:
+                        continue
+            
+            return df
+        except Exception as e:
+            logger.error(f"Error formatting DataFrame: {e}")
+            return df
+    
     def _convert_to_dataframe(self, query_results: Dict[str, Any]):
         """
         Convert query results to pandas DataFrame for summary agent consumption.
@@ -1156,6 +1258,11 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"✅ Successfully converted {len(df)} rows to DataFrame")
             logger.info(f"   Columns ({len(df.columns)}): {list(df.columns)}")
             logger.info(f"   Shape: {df.shape}")
+            
+            # Apply formatting
+            df = self._format_dataframe(df)
+            logger.info("✅ DataFrame formatted (rounded numbers and formatted dates)")
+            
             return df
             
         except ImportError:

@@ -226,6 +226,24 @@ class SQLExceptionAgent(BaseAgent):
             # Step 1: Categorize the error
             error_analysis = self._categorize_error(error_message, failed_sql)
             
+            # ✅ VALIDATE error_analysis structure
+            if not error_analysis or not isinstance(error_analysis, dict):
+                logger.error("❌ Error categorization failed - using default analysis")
+                error_analysis = {
+                    'primary_category': 'unknown',
+                    'severity': 'high',
+                    'matched_patterns': [],
+                    'error_complexity': 0,
+                    'cube_js_specific': False,
+                    'recommended_strategy': 'general_fix'
+                }
+            elif 'primary_category' not in error_analysis:
+                logger.warning("⚠️ Error analysis missing primary_category - adding default")
+                error_analysis['primary_category'] = 'unknown'
+                error_analysis['severity'] = error_analysis.get('severity', 'medium')
+                error_analysis['cube_js_specific'] = error_analysis.get('cube_js_specific', False)
+                error_analysis['recommended_strategy'] = error_analysis.get('recommended_strategy', 'general_fix')
+            
             # Step 2: Perform deep error analysis
             root_cause = self._analyze_root_cause(
                 original_question, failed_sql, error_message, error_analysis
@@ -332,14 +350,18 @@ class SQLExceptionAgent(BaseAgent):
                            error_analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Perform deep root cause analysis of the SQL error."""
         
+        # Extract values to avoid f-string issues
+        primary_cat = error_analysis['primary_category']
+        severity = error_analysis['severity']
+        
         root_cause_prompt = f"""You are an expert SQL error analyst. Analyze the SQL error and identify the root cause.
 
 ERROR CONTEXT:
 - Original Question: {question}
 - Failed SQL Query: {failed_sql}
 - Error Message: {error_message}
-- Error Category: {error_analysis['primary_category']}
-- Severity: {error_analysis['severity']}
+- Error Category: {primary_cat}
+- Severity: {severity}
 
 ANALYSIS REQUIREMENTS:
 1. Identify the specific root cause of the error
@@ -383,7 +405,7 @@ Respond in JSON format:
         
         # Fallback analysis
         return {
-            "root_cause": f"Error in {error_analysis['primary_category']} category",
+            "root_cause": f"Error in {primary_cat} category",
             "why_it_happened": "Analysis could not determine specific cause",
             "fix_complexity": 5,
             "fix_approach": "Apply standard fixes for this error category",
@@ -411,9 +433,9 @@ Respond in JSON format:
                 for i, attempt in enumerate(previous_attempts[-2:])  # Last 2 attempts
             ])
         
-        current_date = datetime.now().strftime('%Y-%m-% d')
+        current_date = datetime.now().strftime('%Y-%m-%d')
         
-        # Determine fix strategy based on error analysis
+        # ✅ SAFE: Determine fix strategy based on error analysis
         fix_strategy = error_analysis.get("recommended_strategy", "general_fix")
         
         # Build schema context from focused_schema (if provided) or structured_schema
@@ -447,17 +469,23 @@ Respond in JSON format:
             if schema_parts:
                 schema_context = "\n\nEXACT FIELD NAMES FROM DATABASE (USE THESE EXACT NAMES):" + "".join(schema_parts)
         
+        # ✅ SAFE: Extract values to avoid f-string issues with dictionary access
+        primary_cat = error_analysis.get('primary_category', 'unknown')
+        severity = error_analysis.get('severity', 'medium')
+        cube_js_specific = error_analysis.get('cube_js_specific', False)
+        root_cause_text = root_cause.get('root_cause', 'Unknown')
+        
         correction_prompt = f"""You are an expert SQL correction specialist for Cube.js SQL API with deep understanding of its constraints and requirements.
 
 ERROR ANALYSIS:
 - Original Question: {original_question}
 - Failed SQL: {failed_sql}
 - Error Message: {error_message}
-- Error Category: {error_analysis['primary_category']}
-- Severity: {error_analysis['severity']}
-- Cube.js Specific: {error_analysis['cube_js_specific']}
+- Error Category: {primary_cat}
+- Severity: {severity}
+- Cube.js Specific: {cube_js_specific}
 - Fix Strategy: {fix_strategy}
-- Root Cause: {root_cause.get('root_cause', 'Unknown')}
+- Root Cause: {root_cause_text}
 {schema_context}
 
 PREVIOUS FAILED ATTEMPTS:
@@ -498,7 +526,7 @@ STRATEGIC FIX FOR "{fix_strategy}":
 {self._get_strategy_specific_instructions(fix_strategy, error_analysis)}
 
 CORRECTION REQUIREMENTS FOR THIS SPECIFIC ERROR:
-{self._get_category_specific_fixes(error_analysis['primary_category'])}
+{self._get_category_specific_fixes(primary_cat)}
 
 CRITICAL FOR THIS QUERY "{original_question}":
 - Analyze the question to determine if it requires aggregation
@@ -1109,14 +1137,32 @@ LIMIT 100;"""
                     logger.info(f"📉 Simplified SQL from {current_sql[:100]}... to {simplified_sql[:100]}...")
                     current_sql = simplified_sql
             
-            fix_result = self.analyze_and_fix_sql_error(
-                original_question=original_question,
-                failed_sql=current_sql,
-                error_message=current_error,
-                similar_sqls=similar_sqls,
-                previous_attempts=attempts,
-                focused_schema=schema_to_use  # Pass focused schema
-            )
+            # ✅ WRAP fix attempt in try-except to catch format string and KeyError issues
+            try:
+                fix_result = self.analyze_and_fix_sql_error(
+                    original_question=original_question,
+                    failed_sql=current_sql,
+                    error_message=current_error,
+                    similar_sqls=similar_sqls,
+                    previous_attempts=attempts,
+                    focused_schema=schema_to_use  # Pass focused schema
+                )
+            except Exception as fix_error:
+                logger.error(f"❌ ITERATION {iteration} - Exception during fix: {fix_error}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                
+                # Create a failure result
+                fix_result = {
+                    "success": False,
+                    "corrected_sql": "",
+                    "error_analysis": {"primary_category": "fix_error", "severity": "high"},
+                    "root_cause": {"root_cause": f"Exception during fix: {str(fix_error)}"},
+                    "correction_explanation": f"Internal error during SQL fixing: {str(fix_error)}",
+                    "confidence_score": 0.0,
+                    "fix_type": "exception",
+                    "learning_points": [f"Fix attempt raised exception: {type(fix_error).__name__}"]
+                }
             
             attempt_record = {
                 "iteration": iteration,
