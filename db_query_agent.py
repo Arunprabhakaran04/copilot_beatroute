@@ -235,10 +235,13 @@ class DBQueryAgent(BaseAgent):
         try:
             logger.info("Processing single-step query")
             
-            # ✅ FIX: Retrieve SQL examples for single-step queries too!
-            # Previously only multi-step queries retrieved examples, causing single-step to generate wrong SQL
-            logger.info("🔍 Retrieving SQL examples for single-step query...")
-            retrieved_sqls = self._retrieve_step_specific_sqls(state["query"])
+            # ✅ FIX: Retrieve SQL examples using ORIGINAL query (not enriched) for better similarity
+            # Enriched query adds extra context which reduces similarity with simple stored questions
+            retrieval_query = state.get("original_query", state["query"])
+            logger.info(f"🔍 Retrieving SQL examples for: '{retrieval_query}'")
+            if retrieval_query != state["query"]:
+                logger.info(f"   (Enriched query: '{state['query']}')")
+            retrieved_sqls = self._retrieve_step_specific_sqls(retrieval_query)
             
             # Check if this is part of a multi-step workflow (has intermediate_results from previous steps)
             intermediate_results = state.get("intermediate_results", {})

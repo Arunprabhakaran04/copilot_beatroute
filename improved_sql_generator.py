@@ -1,6 +1,7 @@
 import re
 import json
 import logging
+import os
 from datetime import datetime
 from typing import List, Dict, Any
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
@@ -68,21 +69,13 @@ class ImprovedSQLGenerator(BaseAgent):
             return ""
     
     def _get_schema_context(self, focused_schema: str = None) -> str:
-        """
-        Get schema context for the prompt
-        
-        Args:
-            focused_schema: Optional focused schema from SchemaManager
-            
-        Returns:
-            Schema string to use in prompt
-        """
+        """Use ONLY focused schema if available, otherwise return empty"""
         if focused_schema:
             logger.info("Using focused schema from SchemaManager")
             return focused_schema
-        else:
-            logger.info("Using full schema from file")
-            return self.schema_content
+        
+        logger.warning("No focused schema available")
+        return ""
     
     def _preserve_original_context(self, current_question: str, original_query: str) -> str:
         """
@@ -218,25 +211,14 @@ class ImprovedSQLGenerator(BaseAgent):
                      entity_info: Dict[str, Any] = None,
                      conversation_history: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Generate SQL query with improved context handling.
-        Always uses LLM generation for accuracy (simple generation disabled).
+        Generate SQL query using LLM with retrieved examples as context.
         
         Args:
-            entity_info: Dictionary containing verified entity information from entity verification
-                        Format: {'entities': ['name'], 'entity_types': ['ViewCustomer'], 
-                                'entity_mapping': {'name': 'ViewCustomer'}}
+            entity_info: Dictionary containing verified entity information
             conversation_history: List of previous conversation entries from RedisMemoryManager
-                        Format: [{'original': str, 'result': dict, 'timestamp': float}, ...]
         """
         try:
-            enhanced_question = self._preserve_original_context(
-                question, original_query or question
-            )
-            
-            intent = self._detect_query_intent(enhanced_question)
-            
-            # ALWAYS use LLM generation 
-            return self._generate_with_llm(enhanced_question, similar_sqls, previous_results, intent, entity_info, conversation_history)
+            return self._generate_with_llm(question, similar_sqls, previous_results, entity_info, conversation_history)
             
         except Exception as e:
             logger.error(f"SQL generation error: {e}")
@@ -247,11 +229,11 @@ class ImprovedSQLGenerator(BaseAgent):
             }
     
     def _generate_with_llm(self, question: str, similar_sqls: List[Dict], 
-                          previous_results: Dict[str, Any], intent: Dict[str, Any],
+                          previous_results: Dict[str, Any],
                           entity_info: Dict[str, Any] = None,
                           conversation_history: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Generate SQL using LLM with focused prompts and better validation.
+        Generate SQL using LLM with retrieved examples injected as conversation history.
         
         Args:
             entity_info: Dictionary containing verified entity information
@@ -306,14 +288,12 @@ class ImprovedSQLGenerator(BaseAgent):
             logger.info("No SchemaManager - using full schema from file")
         
         # Create focused prompt with previous results and entity context
-        # Note: We pass similar_sqls instead of filtered examples since all SQLs are in conversation
         prompt = self._create_focused_prompt(
             question, 
-            similar_sqls,  # Pass all retrieved SQLs (for year extraction)
-            intent,  # Keep for logging purposes only
+            similar_sqls,
             cleaned_previous_results, 
             entity_info,
-            focused_schema=focused_schema  # Pass focused schema to prompt
+            focused_schema=focused_schema
         )
         
         # Build user message with explicit entity names if available
@@ -357,42 +337,33 @@ class ImprovedSQLGenerator(BaseAgent):
             if last_user_idx is not None:
                 original_question = message_log[last_user_idx]["content"]
                 
-                # ✅ Add EMPHATIC instruction to prioritize retrieved examples
+                # Add crisp instruction to follow retrieved examples
                 enhanced_question = f"""{original_question}
 
-🎯 CRITICAL INSTRUCTIONS - FOLLOW RETRIEVED EXAMPLES:
+CRITICAL: {num_examples} working examples above (LAST = most similar: {top_similarity:.3f})
 
-The conversation history above contains {num_examples} real SQL examples from our database.
-These examples are PROVEN to work with our exact schema and field names.
+REPLICATE THE LAST EXAMPLE EXACTLY - DO NOT "IMPROVE" IT:
+1. EXACT field names from example (NO Order.poNumber if not in example)
+2. EXACT join pattern from example (CROSS JOIN or single table)
+3. EXACT structure from example (NO WITH if example doesn't use it)
+4. Only change dates/filters for current question
 
-YOU MUST CAREFULLY STUDY THESE EXAMPLES FOR:
-1. ✅ Exact field names to use (e.g., ViewCustomerActivity.__user, NOT ViewCustomer.name)
-2. ✅ Table join patterns (single table vs CROSS JOIN)
-3. ✅ WHERE clause syntax and date filtering
-4. ✅ GROUP BY and aggregation patterns
-5. ✅ Field availability in each table
-
-⚠️ COMMON MISTAKES TO AVOID:
-- DO NOT invent field names that don't exist in the examples
-- DO NOT join tables if examples use single table approach
-- DO NOT use fields from one table when selecting from another
-- DO NOT ignore the exact syntax patterns shown in examples
-
-🔥 HIGHEST PRIORITY: Match the patterns from the example with similarity {top_similarity:.3f}
-This example is the MOST similar to your current question - follow its structure closely!
-
-Now generate SQL following these proven patterns:"""
+Generate SQL:"""
                 
                 message_log[last_user_idx]["content"] = enhanced_question
                 logger.info(f"✅ Added explicit instruction to follow {num_examples} retrieved SQL patterns")
                 logger.info(f"   Top similarity: {top_similarity:.3f} - LLM instructed to prioritize this example")
         
-        # ADAPTIVE TEMPERATURE: Adjust creativity based on similarity
-        # Note: No longer using filtered examples, just use similarity scores from retrieved SQLs
-        adaptive_llm = self._get_adaptive_temperature_llm(similar_sqls)
+        # Generate SQL with fixed temperature
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            api_key=os.getenv("OPENAI_API_KEY"),
+            temperature=0.7,
+            max_tokens=2000
+        )
         
-        # Generate response with adaptive temperature
-        response = adaptive_llm.invoke(message_log)
+        response = llm.invoke(message_log)
         content = response.content.strip()
         
         track_llm_call(
@@ -400,14 +371,14 @@ Now generate SQL following these proven patterns:"""
             output=content,
             agent_type="improved_sql_generator",
             operation="generate_sql",
-            model_name="gpt-4.1"
+            model_name="gpt-4o-mini"
         )
         
         # Log execution timing
         execution_time = time.time() - start_time
         logger.info(f"SQL generation completed in {execution_time:.2f}s")
         
-        return self._parse_and_validate_response(content, question, intent)
+        return self._parse_and_validate_response(content, question)
     
     def _build_message_log_with_history(
         self,
@@ -575,53 +546,7 @@ Now generate SQL following these proven patterns:"""
         
         return "\n".join(response_parts)
     
-    def _get_adaptive_temperature_llm(self, similar_sqls: List[Dict]):
-        """
-        Create LLM instance with simple 2-level adaptive temperature.
-        
-        Temperature Strategy (simplified):
-        - High similarity (≥0.70): Low temperature (0.1) - follow conversation patterns closely
-        - Low similarity (<0.70): Medium temperature (0.2) - more creative exploration
-        
-        Since examples are in conversation history, the LLM naturally focuses on the most
-        similar ones (which appear last). Temperature just adds a safety valve for low similarity.
-        """
-        try:
-            from langchain_openai import ChatOpenAI
-            import os
-            
-            # Get best similarity score from retrieved SQLs
-            best_similarity = 0
-            if similar_sqls and len(similar_sqls) > 0:
-                best_similarity = similar_sqls[0].get('similarity', 0) if isinstance(similar_sqls[0], dict) else 0
-            
-            # Simple 2-level temperature
-            if best_similarity >= 0.70:
-                temperature = 0.1
-                temp_reason = f"high similarity ({best_similarity:.3f}) - follow conversation patterns"
-            else:
-                temperature = 0.2
-                temp_reason = f"low similarity ({best_similarity:.3f}) - allow more creativity"
-            
-            logger.info(f"Temperature: {temperature} ({temp_reason})")
-            
-            # Create adaptive LLM instance
-            adaptive_llm = ChatOpenAI(
-                model="gpt-4.1",
-                api_key=os.getenv("OPENAI_API_KEY"),
-                temperature=0.1,  # Fixed at 0.1 for maximum accuracy
-                max_tokens=2000
-            )
-            
-            return adaptive_llm
-            
-        except Exception as e:
-            logger.warning(f"Failed to create adaptive LLM: {e}, using original LLM")
-            return self.llm
-    
-    # NOTE: _filter_relevant_examples() method removed
-    # We no longer filter examples since ALL 20 retrieved SQLs are injected into conversation history.
-    # The LLM naturally focuses on the most similar ones (which appear last in conversation).
+
     
     def _clean_previous_results(self, previous_results: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -770,57 +695,47 @@ Now generate SQL following these proven patterns:"""
         # Note: Retrieved SQL examples are now part of conversation history (not in prompt)
         # This makes LLM pay more attention to them as "recent successful queries"
         
-        return f"""You are an expert SQL generator for Cube.js.
+        schema_content = self._get_schema_context(focused_schema)
+        schema_warning = ""
+        if not schema_content or len(schema_content.strip()) == 0:
+            schema_warning = "\n⚠️ WARNING: No schema available - you MUST copy field names EXACTLY from the examples above!\n"
+        
+        return f"""You are an expert SQL generator for Cube.js SQL API.
 
-🎯 CRITICAL INSTRUCTION - READ THIS FIRST
-================================================================================
-The conversation history above contains REAL SQL examples from this database.
-Examples are ordered by similarity score (ASCENDING order).
-→ The MOST RECENT message in conversation = HIGHEST similarity = BEST pattern to follow
+CUBE.JS RULES:
+1. CROSS JOIN ONLY - NO INNER/LEFT/RIGHT JOIN, NO ON clause
+2. NO: TO_CHAR(), EXTRACT(), COALESCE(), GETDATE(), SELECT *, aliases in WHERE
+3. WITH clause: Optional (use only if example uses it)
 
-Your PRIMARY task: COPY the pattern from the MOST RECENT example (last message before current question).
+FIELD NAMES (verify in schema):
+- Customer: ViewCustomer.name
+- User: ViewUser.name  
+- SKU: Sku.name
+- Order date: Order.datetime
+- Sales date: CustomerInvoice.dispatchedDate
 
-⚠️ The MOST RECENT example has the HIGHEST similarity score.
-⚠️ If similarity > 0.70, you MUST copy that example's structure exactly.
+SCHEMA:
+{schema_content}
+{schema_warning}
 
-REQUIRED STEPS:
-1. Check the MOST RECENT example (last message before current question)
-2. What TABLE does it use? → YOU use the SAME table
-3. Does it use CROSS JOIN ViewCustomer? → YOU use CROSS JOIN ViewCustomer
-4. Copy the WHERE clause pattern, date logic, and structure
-5. Change ONLY the specific date ranges for the current question
-
-⛔ CRITICAL TABLE RULES:
-- Question about "visits"? → Use ViewCustomerActivity (from examples)
-- Question about "sales/orders"? → Use CustomerInvoice (from examples)
-- Need customer names? → MUST use "CROSS JOIN ViewCustomer"
-- DO NOT use tables not shown in examples above
-
-⛔ CRITICAL CROSS JOIN RULE:
-If example shows: "CROSS JOIN ViewCustomer" to get ViewCustomer.name
-→ YOU MUST also use "CROSS JOIN ViewCustomer"
-→ NEVER access ViewCustomer.name without CROSS JOIN
-
-Example Pattern (COPY THIS):
-```sql
-SELECT DISTINCT ViewCustomer.name 
-FROM ViewCustomerActivity 
-CROSS JOIN ViewCustomer
-WHERE ViewCustomerActivity.activityTime >= ...
-```
-
-YEAR RULE: Current data year is {data_year}. Use this year in date filters.
-
+YEAR: {data_year}
 {entity_context}
+{previous_context}
 
-DATABASE SCHEMA:
-{self._get_schema_context(focused_schema)}
+CRITICAL INSTRUCTION:
+The conversation above shows real working queries sorted by similarity.
+The LAST message is the MOST similar query.
 
-RETURN FORMAT: {{"sql": "YOUR_QUERY_HERE"}}
+REPLICATE THE LAST EXAMPLE EXACTLY:
+- Use EXACT same structure (WITH or no WITH, same FROM, same WHERE pattern)
+- Use EXACT same field names (verify in schema)
+- Only change: date filters and specific values
 
-Now generate SQL by COPYING the most similar example's pattern."""
+DO NOT "improve" or "optimize" the example!
+
+RETURN: {{"sql": "YOUR_QUERY_HERE"}}"""
     
-    def _parse_and_validate_response(self, content: str, question: str, intent: Dict[str, Any]) -> Dict[str, Any]:
+    def _parse_and_validate_response(self, content: str, question: str) -> Dict[str, Any]:
         """
         Parse LLM response and validate the generated SQL.
         """
@@ -862,53 +777,38 @@ Now generate SQL by COPYING the most similar example's pattern."""
                             "invalid_sql": sql
                         }
                     
-                    # Validate SQL matches intent
-                    if self._validate_sql_intent(sql, intent):
-                        return {
-                            "success": True,
-                            "sql": sql,
-                            "query_type": "SELECT",
-                            "explanation": "Generated with LLM and validated",
-                            "method": "llm_validated",
-                            "intent": intent
-                        }
-                    else:
-                        logger.warning("Generated SQL doesn't match intent")
-                        return {
-                            "success": False,
-                            "error": "Generated SQL doesn't match detected intent",
-                            "type": "validation_error",
-                            "invalid_sql": sql
-                        }
+                    return {
+                        "success": True,
+                        "sql": sql,
+                        "query_type": "SELECT",
+                        "explanation": "Generated with LLM",
+                        "method": "llm_validated"
+                    }
             
             # Approach 2: Try to extract SQL from markdown code block
             sql_block_match = re.search(r'```(?:sql)?\s*(.*?)\s*```', content, re.DOTALL | re.IGNORECASE)
             if sql_block_match:
                 sql = sql_block_match.group(1).strip()
                 logger.info("Extracted SQL from markdown code block")
-                if self._validate_sql_intent(sql, intent):
-                    return {
-                        "success": True,
-                        "sql": sql,
-                        "query_type": "SELECT",
-                        "explanation": "Generated with LLM (extracted from markdown)",
-                        "method": "llm_markdown_extraction",
-                        "intent": intent
-                    }
+                return {
+                    "success": True,
+                    "sql": sql,
+                    "query_type": "SELECT",
+                    "explanation": "Generated with LLM (extracted from markdown)",
+                    "method": "llm_markdown_extraction"
+                }
             
             # Approach 3: Check if content itself is raw SQL
             if content.upper().strip().startswith(('SELECT', 'WITH')):
                 sql = content.strip()
                 logger.info("Content appears to be raw SQL")
-                if self._validate_sql_intent(sql, intent):
-                    return {
-                        "success": True,
-                        "sql": sql,
-                        "query_type": "SELECT",
-                        "explanation": "Generated with LLM (raw SQL)",
-                        "method": "llm_raw_sql",
-                        "intent": intent
-                    }
+                return {
+                    "success": True,
+                    "sql": sql,
+                    "query_type": "SELECT",
+                    "explanation": "Generated with LLM (raw SQL)",
+                    "method": "llm_raw_sql"
+                }
             
             # If all parsing attempts fail, return error
             logger.error("Failed to parse LLM response using all methods")

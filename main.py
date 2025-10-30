@@ -248,7 +248,9 @@ class CentralOrchestrator:
         """Central thinking agent that orchestrates multi-step queries"""
         try:
             if state.get("current_step", 0) == 0:
-                state["original_query"] = state["query"]
+                # Only set original_query if not already set (preserve the true original from process_query)
+                if "original_query" not in state or not state["original_query"]:
+                    state["original_query"] = state["query"]
                 state["completed_steps"] = []
                 state["intermediate_results"] = {}
                 state["current_step"] = 1
