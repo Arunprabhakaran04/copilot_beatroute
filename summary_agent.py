@@ -300,14 +300,20 @@ class SummaryAgent(BaseAgent):
         
         return state
     
-    def generate_summary(self, question: str, df: pd.DataFrame) -> str:
+    def generate_summary(self, question: str, df: pd.DataFrame, **kwargs) -> str:
         """
+        **Example:**
+        ```python
+        summary_agent.generate_summary("What are the top 10 customers by sales?", df)
+        ```
+
         Generate a summary of the results of a SQL query.
-        
+
         Args:
             question (str): The question that was asked.
             df (pd.DataFrame): The results of the SQL query.
-            
+            **kwargs: Additional arguments including optional _cost list for tracking
+
         Returns:
             str: The HTML summary of the results.
         """
@@ -316,6 +322,9 @@ class SummaryAgent(BaseAgent):
             logger.info(f"DataFrame shape: {df.shape}")
             logger.info(f"DataFrame columns: {list(df.columns)}")
             logger.info(f"DataFrame head:\n{df.head()}")
+            
+            # Get cost tracker if provided
+            cost = kwargs.get("_cost", [])
             
             # Get response language configuration (defaulting to English)
             response_language = self._get_response_language()
@@ -342,31 +351,31 @@ class SummaryAgent(BaseAgent):
             
             # Create user message with detailed instructions
             user_message_content = f"""
-            📊 Briefly summarize the data accurately based on the question that was asked, summarize the data clearly and accurately in a structured, point-wise format.
-            ✅ Include the question on the top.
-            ✅ Include the timeframe if mentioned in the question.
-            📌 Use bold formatting for key metrics or highlights.
-            🆔 Do not round off or alter ID fields — treat them as integer or string and retain their exact values.
-            💡 Avoid associating numbers with currency unless explicitly specified.
-            🔢 Display all numeric values without scientific notation.
-            📈 If the question involves analysis, provide a multi-faceted analysis with noteworthy insights.
-            🧠 Highlight any trends, anomalies, or significant observations in a concise and readable format.
-            🚫 Do not mention or refer to table names.
-            🔇 Do not include any extra explanation outside the summary itself.
+📊 Briefly summarize the data accurately based on the question that was asked, summarize the data clearly and accurately in a structured, point-wise format.
+✅ Include the question on the top.
+✅ Include the timeframe if mentioned in the question.
+📌 Use bold formatting for key metrics or highlights.
+🆔 Do not round off or alter ID fields — treat them as integer or string and retain their exact values.
+💡 Avoid associating numbers with currency unless explicitly specified.
+🔢 Display all numeric values without scientific notation.
+📈 If the question involves analysis, provide a multi-faceted analysis with noteworthy insights.
+🧠 Highlight any trends, anomalies, or significant observations in a concise and readable format.
+🚫 Do not mention or refer to table names.
+🔇 Do not include any extra explanation outside the summary itself.
 
-            - Use <ul> and <li> tags to format the summary as bullet points.
-            - Use <strong> to bold important values like totals, IDs, or key metrics.
+- Use <ul> and <li> tags to format the summary as bullet points.
+- Use <strong> to bold important values like totals, IDs, or key metrics.
 
-            ⚠️ Output must be a valid HTML string. Example:
-            
-            <ul>
-            <li>📅 <strong>Timeframe:</strong> Jan to June 2024</li>
-            <li>✅ <strong>Total Orders:</strong> 3,245</li>
-            <li>📈 <strong>Top Month:</strong> March (812 orders)</li>
-            <li>🧾 <strong>Top Customer ID:</strong> 10231</li>
-            </ul>
-            {response_language}
-            """
+⚠️ Output must be a valid HTML string. Example:
+
+<ul>
+<li>📅 <strong>Timeframe:</strong> Jan to June 2024</li>
+<li>✅ <strong>Total Orders:</strong> 3,245</li>
+<li>📈 <strong>Top Month:</strong> March (812 orders)</li>
+<li>🧾 <strong>Top Customer ID:</strong> 10231</li>
+</ul>
+{response_language}
+"""
             
             # Create the prompt
             prompt = ChatPromptTemplate.from_messages([
@@ -379,14 +388,19 @@ class SummaryAgent(BaseAgent):
             response = self.llm.invoke(messages)
             summary_html = response.content.strip()
             
-            # Track token usage
-            track_llm_call(
+            # Track token usage with cost tracker
+            summary_cost = track_llm_call(
                 input_prompt=messages,
                 output=summary_html,
                 agent_type="summary",
                 operation="generate_summary",
                 model_name=self.model_name
             )
+            
+            # Add to cost list if provided
+            if isinstance(cost, list):
+                cost.append(summary_cost)
+                logger.info(f"Summary Generation Cost: {summary_cost}")
             
             # Clean up code fences if LLM added them
             # Remove ```html and ``` markers
