@@ -2060,14 +2060,28 @@ class CentralOrchestrator:
                         logger.info(f"ENRICHED QUERY: {enriched_query}")
                     else:
                         logger.info(f"NO ENRICHMENT: Query used as-is (no context needed)")
+                    
+                    # ✅ PERFORMANCE OPTIMIZATION: Extract cache from EnrichAgent response
+                    cached_sqls = enrich_response.get("_cached_retrieved_sqls", [])
+                    cached_schema = enrich_response.get("_cached_focused_schema", "")
+                    cache_source = enrich_response.get("_cache_source_query", "")
+                    
+                    if cached_sqls and cached_schema:
+                        logger.info(f"✅ Retrieved cache from EnrichAgent: {len(cached_sqls)} SQLs, schema={len(cached_schema)} chars")
                 else:
                     # Fallback: if response format is unexpected, use original query
                     logger.warning(f"Unexpected EnrichAgent response format: {enrich_response}")
                     enriched_query = query
+                    cached_sqls = []
+                    cached_schema = ""
+                    cache_source = ""
                     
             except Exception as e:
                 logger.error(f"EnrichAgent failed: {e}. Using original query.")
                 enriched_query = query
+                cached_sqls = []
+                cached_schema = ""
+                cache_source = ""
 
             # Retrieve intermediate_results from previous query in this session
             # This allows agents to access results from the immediately preceding query
@@ -2127,7 +2141,11 @@ class CentralOrchestrator:
                 # Conversation history for agents
                 conversation_history=conversation_history,
                 # Table callback for immediate streaming
-                table_callback=table_callback
+                table_callback=table_callback,
+                # ✅ PERFORMANCE OPTIMIZATION: Per-question cache from EnrichAgent
+                cached_retrieved_sqls=cached_sqls,  # 20 SQL examples
+                cached_focused_schema=cached_schema,  # Focused schema
+                cache_source_query=cache_source  # Original query for cache validation
             )
             
             logger.info(f"PROCESSING QUERY: {query}")

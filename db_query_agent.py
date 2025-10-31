@@ -229,13 +229,24 @@ class DBQueryAgent(BaseAgent):
         try:
             logger.info("Processing single-step query")
             
-            # ✅ FIX: Retrieve SQL examples using ORIGINAL query (not enriched) for better similarity
-            # Enriched query adds extra context which reduces similarity with simple stored questions
+            # ✅ PERFORMANCE OPTIMIZATION: Use cached SQLs from EnrichAgent if available
+            cached_sqls = state.get("cached_retrieved_sqls", [])
+            cache_source = state.get("cache_source_query", "")
             retrieval_query = state.get("original_query", state["query"])
-            logger.info(f"🔍 Retrieving SQL examples for: '{retrieval_query}'")
-            if retrieval_query != state["query"]:
-                logger.info(f"   (Enriched query: '{state['query']}')")
-            retrieved_sqls = self._retrieve_step_specific_sqls(retrieval_query)
+            
+            # Validate cache: ensure it's for the SAME question (cache invalidation)
+            if cached_sqls and cache_source == retrieval_query:
+                logger.info(f"💾 Using cached SQL examples from EnrichAgent: {len(cached_sqls)} SQLs")
+                logger.info(f"   Cache is valid for query: '{cache_source}'")
+                retrieved_sqls = cached_sqls
+            else:
+                # Cache miss or invalid - retrieve fresh
+                if cached_sqls:
+                    logger.warning(f"❌ Cache invalid: source='{cache_source}' vs current='{retrieval_query}'")
+                logger.info(f"🔍 Retrieving SQL examples for: '{retrieval_query}'")
+                if retrieval_query != state["query"]:
+                    logger.info(f"   (Enriched query: '{state['query']}')")
+                retrieved_sqls = self._retrieve_step_specific_sqls(retrieval_query)
             
             # Check if this is part of a multi-step workflow (has intermediate_results from previous steps)
             intermediate_results = state.get("intermediate_results", {})
@@ -259,6 +270,14 @@ class DBQueryAgent(BaseAgent):
             # Get entity info and conversation history
             entity_info = state.get("verified_entities", {})
             conversation_history = state.get("conversation_history", [])
+            
+            # ✅ PERFORMANCE OPTIMIZATION: Pass cached focused schema to SQL generator
+            cached_schema = state.get("cached_focused_schema", "")
+            if cached_schema and not entity_info:
+                entity_info = {}
+            if cached_schema:
+                entity_info["cached_focused_schema"] = cached_schema
+                logger.info(f"💾 Passing cached focused schema to SQL generator ({len(cached_schema)} chars)")
             
             generation_result = self.sql_generator.generate_sql(
                 question=state["query"],
@@ -502,8 +521,23 @@ class DBQueryAgent(BaseAgent):
                 logger.info(f" EXECUTING MULTI-STEP QUERY - STEP {step_idx}/{step_count}")
                 logger.info(f"Step {step_idx} Question: {step_question}")
                 
-                # Retrieve SQL examples specific to this step
-                step_specific_sqls = self._retrieve_step_specific_sqls(step_question)
+                # ✅ PERFORMANCE OPTIMIZATION: Use cached SQLs for FIRST step only
+                # Subsequent steps get fresh retrieval since they're different questions
+                if step_idx == 1:
+                    cached_sqls = state.get("cached_retrieved_sqls", [])
+                    cache_source = state.get("cache_source_query", "")
+                    original_query = state.get("original_query", state["query"])
+                    
+                    # Validate cache for first step (should match original query)
+                    if cached_sqls and cache_source == original_query:
+                        logger.info(f"💾 Using cached SQL examples for step 1: {len(cached_sqls)} SQLs")
+                        step_specific_sqls = cached_sqls
+                    else:
+                        logger.info(f"🔍 Cache miss for step 1 - retrieving fresh examples")
+                        step_specific_sqls = self._retrieve_step_specific_sqls(step_question)
+                else:
+                    # For steps 2+, always retrieve fresh (different questions)
+                    step_specific_sqls = self._retrieve_step_specific_sqls(step_question)
                 
                 logger.info(f" Retrieved {len(step_specific_sqls)} SQL examples for step {step_idx}")
                 if step_specific_sqls:
@@ -811,6 +845,14 @@ class DBQueryAgent(BaseAgent):
                     }
             else:
                 logger.info(f"Entity info available: {len(entity_info.get('entities', []))} entities")
+            
+            # ✅ PERFORMANCE OPTIMIZATION: Pass cached focused schema for multi-step queries
+            cached_schema = state.get("cached_focused_schema", "") if state else ""
+            if cached_schema and not entity_info:
+                entity_info = {}
+            if cached_schema:
+                entity_info["cached_focused_schema"] = cached_schema
+                logger.info(f"💾 Passing cached focused schema to SQL generator (multi-step)")
             
             generation_result = self.sql_generator.generate_sql(
                 question=question,

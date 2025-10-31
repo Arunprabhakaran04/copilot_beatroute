@@ -261,6 +261,12 @@ class EnrichAgent:
             if len(self.session_message_logs[session_id]) > 10:
                 self.session_message_logs[session_id] = self.session_message_logs[session_id][-10:]
             
+            # ✅ PERFORMANCE OPTIMIZATION: Cache retrieved SQLs and focused schema
+            complete_response["_cached_retrieved_sqls"] = similar_questions
+            complete_response["_cached_focused_schema"] = schema_context
+            complete_response["_cache_source_query"] = original_query
+            logger.info(f"💾 Cached {len(similar_questions)} SQLs and focused schema for reuse")
+            
             return complete_response
         
         # Call LLM for enrichment
@@ -322,6 +328,13 @@ class EnrichAgent:
             logger.info(f"ENRICH AGENT COMPLETED in {total_time:.2f}s")
             logger.info(f"Response type: {list(parsed_response.keys())[0]}")
             
+            # ✅ PERFORMANCE OPTIMIZATION: Cache retrieved SQLs and focused schema
+            # This cache is PER-QUESTION and will be invalidated when a new question arrives
+            parsed_response["_cached_retrieved_sqls"] = similar_questions  # 20 SQL examples
+            parsed_response["_cached_focused_schema"] = schema_context  # Focused schema
+            parsed_response["_cache_source_query"] = original_query  # For cache invalidation
+            logger.info(f"💾 Cached {len(similar_questions)} SQLs and focused schema for reuse")
+            
             return parsed_response
             
         except Exception as e:
@@ -335,6 +348,12 @@ class EnrichAgent:
                 "role": "assistant",
                 "content": json.dumps(fallback_response)
             })
+            
+            # ✅ PERFORMANCE OPTIMIZATION: Cache retrieved SQLs and focused schema even on error
+            fallback_response["_cached_retrieved_sqls"] = similar_questions
+            fallback_response["_cached_focused_schema"] = schema_context
+            fallback_response["_cache_source_query"] = original_query
+            logger.info(f"💾 Cached {len(similar_questions)} SQLs and focused schema for reuse (fallback)")
             
             return fallback_response
     

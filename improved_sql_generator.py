@@ -257,11 +257,19 @@ class ImprovedSQLGenerator(BaseAgent):
         # NOTE: We no longer filter examples - all 20 retrieved SQLs are injected into conversation
         # The LLM will naturally focus on the most similar ones (which are last in conversation)
         
-        # Get focused schema if SchemaManager is available
+        # ✅ PERFORMANCE OPTIMIZATION: Use cached focused schema if available
+        # Check if we have a cached schema passed from EnrichAgent via state
+        cached_schema = entity_info.get("cached_focused_schema") if entity_info else None
         focused_schema = None
         focused_tables = []
         
-        if self.schema_manager is not None:
+        if cached_schema:
+            # Use cached schema from EnrichAgent (no regeneration needed)
+            focused_schema = cached_schema
+            import re
+            focused_tables = re.findall(r'^Table: (.+)$', focused_schema, re.MULTILINE)
+            logger.info(f"💾 Using cached focused schema from EnrichAgent: {len(focused_tables)} tables (0.00s)")
+        elif self.schema_manager is not None:
             try:
                 schema_start = time.time()
                 focused_schema = self.schema_manager.get_schema_to_use_in_prompt(
