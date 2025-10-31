@@ -31,6 +31,7 @@ class EnrichAgent:
         user_role_list: Optional[List] = None,
         user_designation_list: Optional[List] = None,
         customer_subtype_list: Optional[List] = None,
+        user_context=None,  # NEW: Accept UserContext object
         model: str = "gpt-4o",
         max_tokens: int = 2000,
         temperature: float = 0.3
@@ -42,11 +43,12 @@ class EnrichAgent:
             openai_client: OpenAI client instance
             schema_manager: SchemaManager instance for focused schema generation
             sql_retriever_agent: SQLRetrieverAgent for similar questions
-            campaign_table: Campaign table data for campaign context
-            campaign_custom_map: Custom field mapping for campaigns
-            user_role_list: List of user roles
-            user_designation_list: List of user designations
-            customer_subtype_list: List of customer subtypes
+            campaign_table: Campaign table data for campaign context (deprecated, use user_context)
+            campaign_custom_map: Custom field mapping for campaigns (deprecated, use user_context)
+            user_role_list: List of user roles (deprecated, use user_context)
+            user_designation_list: List of user designations (deprecated, use user_context)
+            customer_subtype_list: List of customer subtypes (deprecated, use user_context)
+            user_context: UserContext object containing all user metadata (recommended)
             model: OpenAI model to use
             max_tokens: Maximum tokens for response
             temperature: Temperature for LLM
@@ -54,11 +56,26 @@ class EnrichAgent:
         self.client = openai_client
         self.schema_manager = schema_manager
         self.sql_retriever = sql_retriever_agent
-        self.campaign_table = campaign_table or ""
-        self.campaign_custom_map = campaign_custom_map or {}
-        self.user_role_list = user_role_list or []
-        self.user_designation_list = user_designation_list or []
-        self.customer_subtype_list = customer_subtype_list or []
+        
+        # NEW: Store user_context reference
+        self.user_context = user_context
+        
+        # Backward compatibility: Use parameters if provided, otherwise use user_context
+        if user_context is not None:
+            self.campaign_table = user_context.campaign_table
+            self.campaign_custom_map = user_context.campaign_custom_map
+            self.user_role_list = user_context.user_role_list
+            self.user_designation_list = user_context.user_designation_list
+            self.customer_subtype_list = user_context.customer_subtype_list
+            logger.info("EnrichAgent initialized with UserContext metadata")
+        else:
+            # Fallback to individual parameters (backward compatibility)
+            self.campaign_table = campaign_table or ""
+            self.campaign_custom_map = campaign_custom_map or {}
+            self.user_role_list = user_role_list or []
+            self.user_designation_list = user_designation_list or []
+            self.customer_subtype_list = customer_subtype_list or []
+            logger.warning("EnrichAgent initialized without UserContext, using individual parameters")
         
         self.config = {
             "model": model,
@@ -71,6 +88,40 @@ class EnrichAgent:
         self.session_message_logs: Dict[str, List[Dict[str, str]]] = {}
         
         logger.info(f"EnrichAgent initialized with model: {model}")
+    
+    def update_user_context(self, user_context) -> None:
+        """
+        Update EnrichAgent with new UserContext metadata.
+        
+        This method allows updating the agent with user-specific metadata
+        after initialization, which is useful when UserContext is loaded
+        after the agent is created.
+        
+        Args:
+            user_context: UserContext object containing all user metadata
+        """
+        if user_context is None:
+            logger.warning("Attempted to update EnrichAgent with None UserContext")
+            return
+        
+        self.user_context = user_context
+        
+        # Update all metadata from user_context
+        self.campaign_table = user_context.campaign_table
+        self.campaign_custom_map = user_context.campaign_custom_map
+        self.user_role_list = user_context.user_role_list
+        self.user_designation_list = user_context.user_designation_list
+        self.customer_subtype_list = user_context.customer_subtype_list
+        
+        # Also update schema_manager if available
+        if user_context.is_schema_loaded():
+            self.schema_manager = user_context.get_schema_manager()
+        
+        logger.info(f"✅ EnrichAgent updated with UserContext metadata:")
+        logger.info(f"   - User roles: {len(self.user_role_list)}")
+        logger.info(f"   - User designations: {len(self.user_designation_list)}")
+        logger.info(f"   - Customer subtypes: {len(self.customer_subtype_list)}")
+        logger.info(f"   - Campaign tables: {len(self.campaign_custom_map)}")
     
     
     def enrich_query(

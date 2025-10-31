@@ -6,6 +6,7 @@ from loguru import logger
 import json
 import asyncio
 from typing import Dict
+import os
 
 from websocket_manager import ws_manager
 from message_type import MessageType
@@ -13,6 +14,7 @@ from websocket_auth import validate_session_token, get_user_id_from_session
 from constants import SUGGESTED_QUESTIONS_LIST, ERROR_RESPONSE, SESSION_TO_USER_ID
 from redis_memory_manager import initialize_session
 from user_context import UserContext
+from db_connection import get_database_connection
 
 load_dotenv()
 
@@ -74,13 +76,17 @@ async def ensure_user_context(user_id: str, session_id: str) -> UserContext:
         email=f"user{user_id}@example.com"
     )
     
+    # Get database connection for this session
+    db_connection = get_database_connection(session_id=session_id)
+    
     # Load schema using session_id as base64 token (ONE-TIME LOAD)
     logger.info(f"📊 Loading schema for user {user_id}... This takes 5-10 seconds")
     success = await context.load_schema_from_token(
         base64_token=session_id,
         cubejs_api_url="analytics.vwbeatroute.com/api/v1/meta",
         generate_embeddings=True,
-        session_id=session_id  # Pass session_id to store mapping
+        session_id=session_id,  # Pass session_id to store mapping
+        db_connection=db_connection  # Pass database connection for metadata queries
     )
     
     if not success:

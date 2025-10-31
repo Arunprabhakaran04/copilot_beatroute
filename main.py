@@ -2008,10 +2008,10 @@ class CentralOrchestrator:
             # Get conversation history from Redis
             conversation_history = self.memory.get_recent(session_id, n=5, user_id=user_id)
             
-            # Update EnrichAgent with schema_manager if user_context is provided
+            # Update EnrichAgent with user_context metadata if provided
             if user_context is not None and user_context.is_schema_loaded():
-                self.enrich_agent.schema_manager = user_context.get_schema_manager()
-                logger.info("EnrichAgent now using focused schema from UserContext")
+                self.enrich_agent.update_user_context(user_context)
+                logger.info("✅ EnrichAgent updated with UserContext (schema + metadata)")
             
             # Call EnrichAgent to enrich query
             try:

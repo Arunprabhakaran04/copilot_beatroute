@@ -1002,6 +1002,42 @@ class DBQueryAgent(BaseAgent):
             logger.info(f" SQL EXECUTION FAILED - INVOKING EXCEPTION AGENT")
             logger.info(f"Error: {execution_result['error']}")
             
+            # Check if error is due to non-existent field/column (graceful handling)
+            error_msg = execution_result['error'].lower()
+            if "no field named" in error_msg or "column does not exist" in error_msg:
+                logger.info("🔍 Detected missing field/column error - checking if data exists...")
+                
+                # Extract the missing field name from error message
+                import re
+                field_match = re.search(r"no field named '([^']+)'", execution_result['error'], re.IGNORECASE)
+                if field_match:
+                    missing_field = field_match.group(1)
+                    logger.info(f"❌ Field '{missing_field}' does not exist in schema")
+                    
+                    # Check if this is a filter condition (e.g., category='Doctors')
+                    if "category" in missing_field.lower() or "subtype" in missing_field.lower():
+                        logger.info("💡 Graceful handling: Returning empty result (no data matches criteria)")
+                        
+                        return {
+                            "success": True,
+                            "final_sql": sql_query,
+                            "message": f"No data found - field '{missing_field}' does not exist in the database schema",
+                            "attempts": 1,
+                            "query_results": {
+                                "data": [],
+                                "columns": [],
+                                "summary": {
+                                    "total_rows": 0,
+                                    "columns_count": 0,
+                                    "query_type": "SELECT"
+                                }
+                            },
+                            "formatted_output": "No data found matching your criteria. The requested field does not exist in the database.",
+                            "json_results": "[]",
+                            "graceful_empty": True,
+                            "graceful_reason": f"Field '{missing_field}' does not exist in schema"
+                        }
+            
             fix_result = self.exception_agent.iterative_fix_sql(
                 original_question=original_question,
                 failed_sql=sql_query,
