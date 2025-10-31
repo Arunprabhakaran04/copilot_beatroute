@@ -1,14 +1,11 @@
 import re
 import json
-import logging
 import os
 from datetime import datetime
 from typing import List, Dict, Any
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from token_tracker import track_llm_call
-from loguru import logger as loguru_logger
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 class ImprovedSQLGenerator(BaseAgent):
     """
@@ -311,7 +308,7 @@ class ImprovedSQLGenerator(BaseAgent):
             user_message += "\nNote: Use these exact values in your WHERE clause (case-sensitive)."
         
         # Build message log with conversation history AND retrieved SQLs
-        # Retrieved SQLs are injected as fake conversation to make LLM pay attention
+        # Retrieved SQLs are injected as user-assistant pairs with JSON format
         message_log = self._build_message_log_with_history(
             system_prompt=prompt,
             current_question=user_message,
@@ -321,45 +318,22 @@ class ImprovedSQLGenerator(BaseAgent):
             max_retrieved_sqls=20  # Inject up to 20 retrieved SQLs (increased from 10)
         )
         
-        # ✅ CRITICAL: Add explicit instruction to follow retrieved SQL patterns
-        # This is THE MOST IMPORTANT fix to make LLM use retrieved examples
+        # Log example statistics
         if similar_sqls and len(similar_sqls) > 0:
             num_examples = min(len(similar_sqls), 20)
-            top_similarity = similar_sqls[0].get('similarity', 0) if similar_sqls else 0
+            sorted_sqls = sorted(similar_sqls[:num_examples], key=lambda x: x.get('similarity', 0))
+            top_similarity = sorted_sqls[-1].get('similarity', 0) if sorted_sqls else 0
             
-            # Find the last user message (current question) to enhance it
-            last_user_idx = None
-            for i in range(len(message_log) - 1, -1, -1):
-                if message_log[i]["role"] == "user":
-                    last_user_idx = i
-                    break
-            
-            if last_user_idx is not None:
-                original_question = message_log[last_user_idx]["content"]
-                
-                # Add crisp instruction to follow retrieved examples
-                enhanced_question = f"""{original_question}
-
-CRITICAL: {num_examples} working examples above (LAST = most similar: {top_similarity:.3f})
-
-REPLICATE THE LAST EXAMPLE EXACTLY - DO NOT "IMPROVE" IT:
-1. EXACT field names from example (NO Order.poNumber if not in example)
-2. EXACT join pattern from example (CROSS JOIN or single table)
-3. EXACT structure from example (NO WITH if example doesn't use it)
-4. Only change dates/filters for current question
-
-Generate SQL:"""
-                
-                message_log[last_user_idx]["content"] = enhanced_question
-                logger.info(f"✅ Added explicit instruction to follow {num_examples} retrieved SQL patterns")
-                logger.info(f"   Top similarity: {top_similarity:.3f} - LLM instructed to prioritize this example")
+            logger.info(f"Passed {num_examples} examples to LLM as user-assistant pairs")
+            logger.info(f"   Top similarity (last example): {top_similarity:.3f}")
         
-        # Generate SQL with fixed temperature
+        # Generate SQL with deterministic sampling
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             api_key=os.getenv("OPENAI_API_KEY"),
-            temperature=0.7,
+            temperature=0.1,
+            seed=42,
             max_tokens=2000
         )
         
@@ -371,7 +345,7 @@ Generate SQL:"""
             output=content,
             agent_type="improved_sql_generator",
             operation="generate_sql",
-            model_name="gpt-4o-mini"
+            model_name="gpt-4.1-mini"
         )
         
         # Log execution timing
@@ -390,11 +364,10 @@ Generate SQL:"""
         max_retrieved_sqls: int = 20
     ) -> List[Dict[str, str]]:
         """
-        Build message log with conversation history AND retrieved SQLs for multi-turn context.
+        Build message log with conversation history AND retrieved SQLs as user-assistant pairs.
         
-        Strategy: Inject retrieved SQLs as fake conversation history to make LLM pay attention.
-        Retrieved SQLs are sorted in ASCENDING order of similarity (most similar last = most recent).
-        This makes LLM think the most relevant example was just generated.
+        Strategy: Examples appear as real Q->A pairs with assistant returning JSON format.
+        Retrieved SQLs are sorted in ASCENDING order of similarity (most similar last).
         
         Args:
             system_prompt: System prompt with instructions
@@ -427,16 +400,16 @@ Generate SQL:"""
         else:
             logger.info("No real conversation history")
         
-        # Step 2: Inject RETRIEVED SQLs as fake conversation (ASCENDING similarity order)
+        # Step 2: Inject RETRIEVED SQLs as user-assistant pairs (ASCENDING similarity order)
         if retrieved_sqls and len(retrieved_sqls) > 0:
             # Sort by similarity ASCENDING (lowest first, highest last)
             sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
             
-            logger.info(f"🎯 Injecting {len(sorted_sqls)} retrieved SQLs as fake conversation (ASCENDING similarity)")
+            logger.info(f"Injecting {len(sorted_sqls)} retrieved SQLs as user-assistant pairs (ASCENDING similarity)")
             logger.info(f"   Similarity range: {sorted_sqls[0].get('similarity', 0):.3f} (first) -> {sorted_sqls[-1].get('similarity', 0):.3f} (last/most similar)")
             
-            # ✅ Log top 3 and bottom 1 to verify what LLM is seeing
-            logger.info(f"   📥 Sample injected SQLs:")
+            # Log top 3 and bottom 1 to verify what LLM is seeing
+            logger.info(f"   Sample injected SQLs:")
             for idx, sql_info in enumerate(sorted_sqls[:3], 1):
                 question = sql_info.get('question', '')
                 sql = sql_info.get('sql', '')
@@ -455,39 +428,37 @@ Generate SQL:"""
                 question = sql_info.get('question', '')
                 message_log.append({"role": "user", "content": question})
                 
-                # Add as assistant's SQL response (just the SQL, no explanation)
+                # Add as assistant's JSON response (CRITICAL: JSON format with sql key)
                 sql = sql_info.get('sql', '')
-                assistant_sql = f"```sql\n{sql}\n```"
-                message_log.append({"role": "assistant", "content": assistant_sql})
+                # Escape the SQL for JSON format
+                escaped_sql = json.dumps(sql)
+                assistant_json = f'{{"sql": {escaped_sql}}}'
+                message_log.append({"role": "assistant", "content": assistant_json})
         else:
             logger.info("No retrieved SQLs to inject")
         
-        # Step 3: Add CURRENT question with explicit instruction to follow examples
-        # ✅ CRITICAL: Add instruction to force LLM to follow retrieved SQL patterns
+        # Step 3: Add CURRENT question with explicit instruction to follow the last example
         if retrieved_sqls and len(retrieved_sqls) > 0:
+            sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
+            most_similar = sorted_sqls[-1]
+            similarity = most_similar.get('similarity', 0)
+            most_similar_question = most_similar.get('question', '')
+            
+            # Add strong instruction to follow the pattern
             enhanced_question = f"""{current_question}
 
-🎯 CRITICAL INSTRUCTIONS - You MUST follow these:
-1. The {len(retrieved_sqls)} SQL examples above are REAL, WORKING queries from this exact database
-2. Study their patterns carefully:
-   - FIELD NAMES used (e.g., ViewCustomer.name requires CROSS JOIN ViewCustomer)
-   - TABLE JOINS (CROSS JOIN patterns are mandatory when selecting fields from multiple tables)
-   - WHERE clause date filtering patterns
-   - WITH clause structures for multi-step queries
-3. The MOST SIMILAR example (last one above) is the best pattern to follow
-4. If example uses CROSS JOIN ViewCustomer to access ViewCustomer.name, YOU MUST DO THE SAME
-5. DO NOT assume field names - use EXACT field names from the examples
-6. If ViewCustomerActivity is used, remember it has: __user, activityTime, count, calls, etc.
-7. If you need ViewCustomer.name, you MUST include: CROSS JOIN ViewCustomer
+CRITICAL: The example immediately above (similarity: {similarity:.3f}) is the MOST SIMILAR to this question.
+Question was: "{most_similar_question}"
 
-⚠️ COMMON MISTAKES TO AVOID:
-- Using ViewCustomer.name without CROSS JOIN ViewCustomer (will fail!)
-- Removing CROSS JOIN that was in the example pattern
-- Assuming field names that don't match the examples
-- Ignoring the table join patterns from similar examples"""
+YOU MUST:
+1. Use the EXACT same table names and field names from that example
+2. Use the EXACT same JOIN pattern (if it uses CROSS JOIN ViewCustomer, YOU MUST USE IT)
+3. Use the EXACT same WHERE clause structure
+4. Only change the date filters to match this question
+
+Do NOT deviate from the example structure."""
             
             message_log.append({"role": "user", "content": enhanced_question})
-            logger.info("✅ Added explicit instruction to follow retrieved SQL patterns")
         else:
             message_log.append({"role": "user", "content": current_question})
         
@@ -497,6 +468,32 @@ Generate SQL:"""
         
         logger.info(f"FINAL message log: {total_messages} messages")
         logger.info(f"   = 1 system + {real_conv_count} real history + {injected_sql_count} injected SQLs + 1 current")
+        
+        # DEBUG: Log first 2 and last 2 injected examples to verify format
+        if retrieved_sqls and len(retrieved_sqls) > 0:
+            logger.info("DEBUG: Verifying injected example format:")
+            logger.info("   FIRST 2 examples (lowest similarity):")
+            example_count = 0
+            for i, msg in enumerate(message_log):
+                if msg["role"] == "user" and i > 0 and example_count < 2:
+                    if i + 1 < len(message_log) and message_log[i + 1]["role"] == "assistant":
+                        logger.info(f"      Example {example_count + 1}:")
+                        logger.info(f"         USER: {msg['content'][:80]}...")
+                        logger.info(f"         ASSISTANT: {message_log[i + 1]['content'][:150]}...")
+                        example_count += 1
+            
+            logger.info("   LAST 2 examples (highest similarity - most important):")
+            example_positions = []
+            for i, msg in enumerate(message_log):
+                if msg["role"] == "user" and i > 0 and i + 1 < len(message_log):
+                    if message_log[i + 1]["role"] == "assistant":
+                        example_positions.append(i)
+            
+            if len(example_positions) >= 2:
+                for idx, pos in enumerate(example_positions[-2:], 1):
+                    logger.info(f"      Example (last-{3-idx}):")
+                    logger.info(f"         USER: {message_log[pos]['content'][:80]}...")
+                    logger.info(f"         ASSISTANT: {message_log[pos + 1]['content'][:200]}...")
         
         return message_log
     
@@ -700,40 +697,41 @@ Generate SQL:"""
         if not schema_content or len(schema_content.strip()) == 0:
             schema_warning = "\n⚠️ WARNING: No schema available - you MUST copy field names EXACTLY from the examples above!\n"
         
-        return f"""You are an expert SQL generator for Cube.js SQL API.
+        return f"""You are an expert Cube.js SQL generator.
 
-CUBE.JS RULES:
+CRITICAL: Must output JSON only: {{"sql": "..."}}
+
+CUBE.JS STRICT RULES:
 1. CROSS JOIN ONLY - NO INNER/LEFT/RIGHT JOIN, NO ON clause
-2. NO: TO_CHAR(), EXTRACT(), COALESCE(), GETDATE(), SELECT *, aliases in WHERE
-3. WITH clause: Optional (use only if example uses it)
-
-FIELD NAMES (verify in schema):
-- Customer: ViewCustomer.name
-- User: ViewUser.name  
-- SKU: Sku.name
-- Order date: Order.datetime
-- Sales date: CustomerInvoice.dispatchedDate
+2. FORBIDDEN: TO_CHAR(), EXTRACT(), COALESCE(), GETDATE(), SELECT *, aliases in WHERE clause
+3. WITH clause: Use ONLY if examples show it
 
 SCHEMA:
 {schema_content}
 {schema_warning}
 
-YEAR: {data_year}
+DATABASE YEAR: {data_year}
 {entity_context}
 {previous_context}
 
-CRITICAL INSTRUCTION:
-The conversation above shows real working queries sorted by similarity.
-The LAST message is the MOST similar query.
+CRITICAL PATTERN MATCHING INSTRUCTIONS:
+You will see example queries in the conversation history before the current question.
+These examples are sorted by similarity - the MOST RECENT example (just before the current question) is the MOST SIMILAR.
 
-REPLICATE THE LAST EXAMPLE EXACTLY:
-- Use EXACT same structure (WITH or no WITH, same FROM, same WHERE pattern)
-- Use EXACT same field names (verify in schema)
-- Only change: date filters and specific values
+MANDATORY RULES:
+1. Do NOT invent or change table/column names - use ONLY what appears in SCHEMA or examples
+2. If a column or table is not in the SCHEMA, output: {{"error":"UNKNOWN_COLUMN: <name>"}}
+3. REPLICATE the structure of the most recent example (last one before current question):
+   - Same FROM clause (use same tables)
+   - Same JOIN pattern (if example uses CROSS JOIN ViewCustomer, YOU MUST TOO)
+   - Same WHERE clause structure
+   - Same field names (if example uses ViewCustomer.name, YOU MUST USE IT)
+4. For customer names: ALWAYS use "ViewCustomer.name" with "CROSS JOIN ViewCustomer"
+5. For order IDs: Use CustomerInvoice.externalOrderId or Order fields based on examples
+6. Only modify: date filters and specific entity values for current question
+7. Do NOT "improve" or "optimize" the example structure
 
-DO NOT "improve" or "optimize" the example!
-
-RETURN: {{"sql": "YOUR_QUERY_HERE"}}"""
+OUTPUT FORMAT: {{"sql": "YOUR_QUERY_HERE"}}"""
     
     def _parse_and_validate_response(self, content: str, question: str) -> Dict[str, Any]:
         """

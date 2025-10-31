@@ -8,7 +8,7 @@ from loguru import logger
 from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from sql_query_decomposer import SQLQueryDecomposer
-from sql_generator_agent import SQLGeneratorAgent
+from improved_sql_generator import ImprovedSQLGenerator
 from sql_exception_agent import SQLExceptionAgent
 from summary_agent import SummaryAgent
 from db_connection import get_database_connection, execute_sql
@@ -16,8 +16,8 @@ from token_tracker import track_llm_call, get_token_tracker
 
 class DBQueryAgent(BaseAgent):
     """
-    DB Query Agent now works as an orchestrator for handling both simple and complex multi-step SQL queries.
-    It coordinates between the SQL Query Decomposer and SQL Generator agents.
+    DB Query Agent orchestrator for handling both simple and complex multi-step SQL queries.
+    Uses ImprovedSQLGenerator exclusively for all SQL generation tasks.
     """
     
     def __init__(self, llm, schema_file_path: str = None):
@@ -25,28 +25,22 @@ class DBQueryAgent(BaseAgent):
         self.schema_file_path = schema_file_path  # Kept for backward compatibility, not used
         
         # Initialize sub-agents (schema will come from UserContext)
-        self.sql_generator = SQLGeneratorAgent(llm, schema_file_path=None)
+        self.sql_generator = ImprovedSQLGenerator(llm, schema_file_path=None)
         self.exception_agent = SQLExceptionAgent(llm, schema_file_path=None, max_iterations=5)
-        self.summary_agent = SummaryAgent(llm, "gpt-4o")  # Add summary agent
+        self.summary_agent = SummaryAgent(llm, "gpt-4o")
         self.conversation_history = []  
         
         self.decomposer = SQLQueryDecomposer(llm)
         
-        # Add improved SQL generator
-        try:
-            from improved_sql_generator import ImprovedSQLGenerator
-            self.improved_sql_generator = ImprovedSQLGenerator(llm, schema_file_path=None)
-            logger.info("  - Improved SQL Generator: ENABLED (for better accuracy)")
-        except ImportError:
-            logger.warning("  - Improved SQL Generator: NOT AVAILABLE (using fallback)")
-            self.improved_sql_generator = None
+        # Keep reference as improved_sql_generator for compatibility
+        self.improved_sql_generator = self.sql_generator
         
         try:
             from sql_retriever_agent import SQLRetrieverAgent
             self.sql_retriever = SQLRetrieverAgent(llm, "embeddings.pkl")
             logger.info("DBQueryAgent initialized as orchestrator with sub-agents:")
             logger.info("  - SQL Query Decomposer: for multi-step analysis")
-            logger.info("  - SQL Generator: for individual query generation")
+            logger.info("  - Improved SQL Generator: for all SQL generation")
             logger.info("  - SQL Retriever: for step-specific context retrieval")
             logger.info("  - SQL Exception Agent: for error analysis and fixing")
             logger.info("  - Summary Agent: for generating data summaries")
@@ -259,7 +253,35 @@ class DBQueryAgent(BaseAgent):
             
             logger.info(f"📚 Passing {len(retrieved_sqls)} SQL examples to generator")
             
-            result_state = self.sql_generator.process(generator_state)
+            # Use Improved SQL Generator for all SQL generation
+            logger.info("Using Improved SQL Generator for single-step query")
+            
+            # Get entity info and conversation history
+            entity_info = state.get("verified_entities", {})
+            conversation_history = state.get("conversation_history", [])
+            
+            generation_result = self.sql_generator.generate_sql(
+                question=state["query"],
+                similar_sqls=retrieved_sqls,
+                previous_results=state.get("previous_step_results", {}),
+                original_query=state.get("original_query", state["query"]),
+                entity_info=entity_info,
+                conversation_history=conversation_history
+            )
+            
+            # Convert to expected format
+            if generation_result.get("success"):
+                result_state = {
+                    "status": "completed",
+                    "sql_query": generation_result["sql"],
+                    "query_type": generation_result.get("query_type", "SELECT"),
+                    "explanation": generation_result.get("explanation", "Generated with Improved SQL Generator")
+                }
+            else:
+                result_state = {
+                    "status": "failed",
+                    "error_message": generation_result.get("error", "SQL generation failed")
+                }
             
             logger.info(f"🔍 SQL GENERATOR RESULT:")
             logger.info(f"   Type: {type(result_state)}")
@@ -770,62 +792,35 @@ class DBQueryAgent(BaseAgent):
             # Get conversation history from state (if available)
             conversation_history = state.get("conversation_history", []) if state else []
             
-            # Generate SQL for this step - use improved generator if available
-            if hasattr(self, 'improved_sql_generator') and self.improved_sql_generator:
-                original_query = state.get("original_query", question)
-                entity_info = state.get("entity_info", None)  # Get entity info from state
-                
-                # ✅ FIXED: Better entity_info validation and fallback
-                if entity_info is None:
-                    # Try alternative state keys where entity info might be stored
-                    entity_info = state.get("verified_entities", None)
-                    if entity_info:
-                        logger.info(f"✅ Found entity_info under 'verified_entities' key")
-                    else:
-                        logger.warning(f"⚠️ No entity_info in state. Available keys: {list(state.keys())}")
-                        # Create empty entity_info structure to prevent downstream errors
-                        entity_info = {
-                            "entities": [],
-                            "entity_types": [],
-                            "entity_mapping": {},
-                            "verified_entities": {}
-                        }
+            # Generate SQL using Improved SQL Generator
+            original_query = state.get("original_query", question)
+            entity_info = state.get("entity_info", None)
+            
+            # Validate and get entity_info
+            if entity_info is None:
+                entity_info = state.get("verified_entities", None)
+                if entity_info:
+                    logger.info(f"Found entity_info under 'verified_entities' key")
                 else:
-                    logger.info(f"✅ Entity info available: {len(entity_info.get('entities', []))} entities")
-                
-                generation_result = self.improved_sql_generator.generate_sql(
-                    question=question,
-                    similar_sqls=similar_sqls,
-                    previous_results=previous_results,
-                    original_query=original_query,
-                    entity_info=entity_info,  # Pass entity info to SQL generator
-                    conversation_history=conversation_history  # Pass conversation history
-                )
-                logger.info(f"Using improved SQL generator (method: {generation_result.get('method', 'unknown')})")
+                    logger.warning(f"No entity_info in state. Available keys: {list(state.keys())}")
+                    entity_info = {
+                        "entities": [],
+                        "entity_types": [],
+                        "entity_mapping": {},
+                        "verified_entities": {}
+                    }
             else:
-                entity_info = state.get("entity_info", None)
-                
-                # ✅ FIXED: Same validation for standard generator
-                if entity_info is None:
-                    entity_info = state.get("verified_entities", None)
-                    if entity_info:
-                        logger.info(f"✅ Found entity_info under 'verified_entities' key (standard gen)")
-                    else:
-                        logger.warning(f"⚠️ No entity_info in state (standard gen)")
-                        entity_info = {
-                            "entities": [],
-                            "entity_types": [],
-                            "entity_mapping": {},
-                            "verified_entities": {}
-                        }
-                
-                generation_result = self.sql_generator.generate_sql(
-                    question=question,
-                    similar_sqls=similar_sqls,
-                    previous_results=previous_results,
-                    entity_info=entity_info  # Pass entity info here too
-                )
-                logger.info("Using standard SQL generator")
+                logger.info(f"Entity info available: {len(entity_info.get('entities', []))} entities")
+            
+            generation_result = self.sql_generator.generate_sql(
+                question=question,
+                similar_sqls=similar_sqls,
+                previous_results=previous_results,
+                original_query=original_query,
+                entity_info=entity_info,
+                conversation_history=conversation_history
+            )
+            logger.info(f"Using Improved SQL Generator (method: {generation_result.get('method', 'unknown')})")
             
             if not generation_result["success"]:
                 return {
