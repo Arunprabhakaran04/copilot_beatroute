@@ -1439,11 +1439,26 @@ class CentralOrchestrator:
             if state["agent_type"] == "visualization":
                 return self._handle_visualization_routing(state, agent)
             
-            # ❌ REMOVED: Duplicate SQL retrieval (db_query_agent handles this internally)
-            # The db_query_agent will retrieve step-specific SQLs for each decomposed question
-            # Retrieving here creates wasteful duplicate calls and stale context
-            
-            result_state = agent.process(state)
+            # Special handling for meeting agent - needs session_id and user_id for DB access
+            if state["agent_type"] == "meeting":
+                session_id = state.get("session_id")
+                user_id = state.get("user_id")
+                auth_token = os.getenv("BEATROUTE_AUTH_TOKEN")
+                
+                # Recreate meeting agent with current session context
+                meeting_agent = MeetingSchedulerAgent(
+                    llm=self.llm,
+                    auth_token=auth_token,
+                    user_id=user_id,
+                    session_id=session_id
+                )
+                result_state = meeting_agent.process(state)
+            else:
+                # ❌ REMOVED: Duplicate SQL retrieval (db_query_agent handles this internally)
+                # The db_query_agent will retrieve step-specific SQLs for each decomposed question
+                # Retrieving here creates wasteful duplicate calls and stale context
+                
+                result_state = agent.process(state)
             
             if "session_id" in state and "user_id" in state:
                 self.classification_validator.validate_classification(
