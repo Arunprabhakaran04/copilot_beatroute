@@ -1,10 +1,12 @@
 import json
 import re
 import logging
+import os
 from typing import Optional, List, Dict
 from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState
 from token_tracker import track_llm_call
+import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,12 @@ class CampaignAgent(BaseAgent):
                 "is_table_available": "yes"
             }
         ]
+        
+        # Initialize Gemini client
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        self.gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        
+        logger.info("CampaignAgent initialized with Gemini 2.5 Flash")
     
     def get_agent_type(self) -> str:
         return "campaign"
@@ -128,21 +136,23 @@ For a given question:
 Question: {question}
 """
             
-            campaign_prompt = ChatPromptTemplate.from_template(prompt)
-            messages = campaign_prompt.format_messages(
+            # Format prompt for Gemini
+            full_prompt = prompt.format(
                 campaign_table=str(self.campaign_info_table),
                 question=state["query"]
             )
-            response = self.llm.invoke(messages)
-            content = response.content.strip()
+            
+            # Use Gemini API
+            response = self.gemini_model.generate_content(full_prompt)
+            content = response.text.strip()
             
             # Track token usage
             track_llm_call(
-                input_prompt=messages,
+                input_prompt=full_prompt,
                 output=content,
                 agent_type="campaign",
                 operation="process_campaign_query",
-                model_name="gpt-4.1-mini"
+                model_name="gemini-2.5-flash"
             )
             
             logger.info(f"Campaign LLM response: {content}")

@@ -8,6 +8,7 @@ from langchain.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 from base_agent import BaseAgent, BaseAgentState, EmailAgentState
 from token_tracker import track_llm_call
+import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +22,17 @@ class EmailAgent(BaseAgent):
         self.smtp_email = os.getenv("SMTP_EMAIL")
         self.smtp_password = os.getenv("SMTP_PASSWORD")
         
+        # Initialize Gemini client
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        self.gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        
         if not self.smtp_email or not self.smtp_password:
             logger.warning("SMTP credentials not found in environment variables. Email sending will be simulated.")
             self.smtp_enabled = False
         else:
             self.smtp_enabled = True
+        
+        logger.info("EmailAgent initialized with Gemini 2.5 Flash")
     
     def get_agent_type(self) -> str:
         return "email"
@@ -110,21 +117,47 @@ class EmailAgent(BaseAgent):
             - End with appropriate closing
             """)
             
-            messages = content_prompt.format_messages(
-                query=state["query"],
-                previous_context=previous_context if previous_context else "No previous context available.",
-                cached_data=cached_data_context if cached_data_context else "No cached data available."
-            )
-            response = self.llm.invoke(messages)
-            content = response.content.strip()
+            # Format the prompt for Gemini
+            full_prompt = f"""You are composing an email based on the user's request.
+
+Query: {state["query"]}
+
+Previous Context: {previous_context if previous_context else "No previous context available."}
+
+Cached Data: {cached_data_context if cached_data_context else "No cached data available."}
+
+Guidelines:
+1. Extract ALL email addresses from the query (support formats: abc@example.com, abc@example.com, def@test.com, etc.)
+2. If query says "CC" or "cc" → extract emails AFTER "CC"/"cc" into CC field, rest into TO field
+3. If query has multiple emails without CC indication → put first email in TO, others in CC
+4. If query says "send to bob@x.com" → TO: bob@x.com, CC: none
+5. Extract subject from "subject:" or infer from context
+
+Guidelines for content:
+- Keep the email professional, relevant, and concise
+- Make the subject line clear and specific
+- Structure the content with proper paragraphs
+- If previous context is provided (meeting details, etc.), INCLUDE the relevant information in the email body
+- If cached data is provided, INCLUDE IT in the email body in a clear, formatted way
+- End with appropriate closing
+
+Provide your response STRICTLY in this format:
+TO: <email(s)>
+CC: <email(s) or none>
+SUBJECT: <subject line>
+CONTENT: <email body>"""
+            
+            # Use Gemini API
+            response = self.gemini_model.generate_content(full_prompt)
+            content = response.text.strip()
             
             # Track token usage
             track_llm_call(
-                input_prompt=messages,
+                input_prompt=full_prompt,
                 output=content,
                 agent_type="email",
                 operation="compose_email",
-                model_name="gpt-4.1-mini"
+                model_name="gemini-2.5-flash"
             )
             
             to_match = re.search(r'TO:\s*(.+)', content)

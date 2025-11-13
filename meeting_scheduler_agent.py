@@ -10,6 +10,7 @@ from base_agent import BaseAgent, BaseAgentState, MeetingAgentState
 from token_tracker import track_llm_call
 from loguru import logger
 from db_connection import DatabaseConnection
+import google.generativeai as genai
 
 def date_str_to_epoch_ddmmyyyy(date_str: str) -> int:
     """Convert DD/MM/YYYY string to epoch time in milliseconds."""
@@ -24,13 +25,19 @@ class MeetingSchedulerAgent(BaseAgent):
         self.session_id = session_id
         self.db_connection = None
         
+        # Initialize Gemini client
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        self.gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        
         # Initialize DB connection if session_id provided
         if session_id:
             try:
                 self.db_connection = DatabaseConnection(session_id=session_id)
-                logger.info(f"✅ Meeting agent initialized with DB connection for session: {session_id}")
+                logger.info(f"✅ Meeting agent initialized with DB connection for session: {session_id} (using Gemini)")
             except Exception as e:
-                logger.warning(f"⚠️ Could not initialize DB connection: {e}")
+                logger.warning(f"⚠️ Could not initialize DB connection for meeting agent: {e}")
+        else:
+            logger.warning("⚠️ Meeting agent initialized without session_id - DB functionality limited")
     
     def get_agent_type(self) -> str:
         return "meeting"
@@ -253,19 +260,21 @@ Latest Query:
                     prompt += f"\n**Previous Question:** {prev_q}\n"
                     prompt += f"**Data Retrieved:** ```json\n{df_str}\n```\n"
 
-        message_log = [{"role": "system", "content": prompt}, {"role": "user", "content": question}]
+        # Combine system and user messages for Gemini
+        full_prompt = f"{prompt}\n\nQuestion: {question}"
 
         try:
-            response = self.llm.invoke(message_log)
-            answer = response.content.strip()
+            # Use Gemini API
+            response = self.gemini_model.generate_content(full_prompt)
+            answer = response.text.strip()
             
             # Track token usage
             track_llm_call(
-                input_prompt=message_log,
+                input_prompt=full_prompt,
                 output=answer,
                 agent_type="meeting",
                 operation="detect_schedule_intent",
-                model_name="gpt-4.1-mini"
+                model_name="gemini-2.5-flash"
             )
             
             logger.info(f"🔍 MEETING AGENT | Intent detection completed")
@@ -609,16 +618,21 @@ Latest Query:
                 next_week_date=next_week_date,
                 next_monday=next_monday_str
             )
-            response = self.llm.invoke(messages)
-            content = response.content.strip()
+            
+            # Format messages for Gemini
+            full_prompt = "\n".join([msg.content if hasattr(msg, 'content') else str(msg) for msg in messages])
+            
+            # Use Gemini API
+            response = self.gemini_model.generate_content(full_prompt)
+            content = response.text.strip()
             
             # Track token usage
             track_llm_call(
-                input_prompt=messages,
+                input_prompt=full_prompt,
                 output=content,
                 agent_type="meeting",
                 operation="schedule_meeting",
-                model_name="gpt-4.1-mini"
+                model_name="gemini-2.5-flash"
             )
             
             if content.startswith("ERROR:"):

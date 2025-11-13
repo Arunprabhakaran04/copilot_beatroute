@@ -7,11 +7,13 @@ It takes a pandas DataFrame from the DB Agent and creates user-friendly summarie
 """
 
 import logging
+import os
 import pandas as pd
 from typing import Dict, Any
 from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState
 from token_tracker import track_llm_call, get_token_tracker
+import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,12 @@ class SummaryAgent(BaseAgent):
     def __init__(self, llm, model_name: str = "gpt-4.1-mini"):
         super().__init__(llm)
         self.model_name = model_name
-        logger.info(f"SummaryAgent initialized with model: {model_name}")
+        
+        # Initialize Gemini client
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        self.gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        
+        logger.info(f"SummaryAgent initialized with model: {model_name} (using Gemini)")
     
     def get_agent_type(self) -> str:
         return "summary"
@@ -383,18 +390,20 @@ class SummaryAgent(BaseAgent):
                 ("human", user_message_content)
             ])
             
-            # Format and invoke the LLM
-            messages = prompt.format_messages()
-            response = self.llm.invoke(messages)
-            summary_html = response.content.strip()
+            # Format prompt for Gemini
+            full_prompt = f"{system_message_content}\n\n{user_message_content}"
+            
+            # Use Gemini API
+            response = self.gemini_model.generate_content(full_prompt)
+            summary_html = response.text.strip()
             
             # Track token usage with cost tracker
             summary_cost = track_llm_call(
-                input_prompt=messages,
+                input_prompt=full_prompt,
                 output=summary_html,
                 agent_type="summary",
                 operation="generate_summary",
-                model_name=self.model_name
+                model_name="gemini-2.5-flash"
             )
             
             # Add to cost list if provided

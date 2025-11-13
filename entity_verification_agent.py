@@ -1,9 +1,11 @@
 import logging
 import json
 import time
+import os
 from typing import Dict, Any, List, Optional
 from base_agent import BaseAgent, BaseAgentState
 from token_tracker import track_llm_call
+import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +14,12 @@ class EntityVerificationAgent(BaseAgent):
         super().__init__(llm)
         self.model_name = model_name
         self.db_executor = db_executor
-        logger.info(f"EntityVerificationAgent initialized with model: {model_name}")
+        
+        # Initialize Gemini client
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        self.gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        
+        logger.info(f"EntityVerificationAgent initialized with model: {model_name} (using Gemini)")
     
     def get_agent_type(self) -> str:
         return "entity_verification"
@@ -227,20 +234,19 @@ Table: ViewCustomer (columns: id, name, subType)
 Table: ViewUser (columns: id, name, role, designation)
 Table: ViewDistributor (columns: id, name)"""
         
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question}
-        ]
+        # Combine system and user messages for Gemini
+        full_prompt = f"{system_prompt}\n\nQuestion: {question}"
         
-        response = self.llm.invoke(messages)
-        answer = response.content.strip()
+        # Use Gemini API
+        response = self.gemini_model.generate_content(full_prompt)
+        answer = response.text.strip()
         
         track_llm_call(
-            input_prompt=messages,
+            input_prompt=full_prompt,
             output=answer,
             agent_type="entity_verification",
             operation="identify_entities",
-            model_name=self.model_name
+            model_name="gemini-2.5-flash"
         )
         
         total_time = time.perf_counter() - start_time
