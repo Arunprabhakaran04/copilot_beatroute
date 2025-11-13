@@ -124,7 +124,7 @@ class EmailAgent(BaseAgent):
                 output=content,
                 agent_type="email",
                 operation="compose_email",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             to_match = re.search(r'TO:\s*(.+)', content)

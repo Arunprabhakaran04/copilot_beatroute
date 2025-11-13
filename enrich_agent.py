@@ -32,7 +32,7 @@ class EnrichAgent:
         user_designation_list: Optional[List] = None,
         customer_subtype_list: Optional[List] = None,
         user_context=None,  # NEW: Accept UserContext object
-        model: str = "gpt-4o",
+        model: str = "gpt-4.1-mini",
         max_tokens: int = 2000,
         temperature: float = 0.3
     ):

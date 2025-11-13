@@ -27,7 +27,7 @@ class DBQueryAgent(BaseAgent):
         # Initialize sub-agents (schema will come from UserContext)
         self.sql_generator = ImprovedSQLGenerator(llm, schema_file_path=None)
         self.exception_agent = SQLExceptionAgent(llm, schema_file_path=None, max_iterations=5)
-        self.summary_agent = SummaryAgent(llm, "gpt-4o")
+        self.summary_agent = SummaryAgent(llm, "gpt-4.1-mini")
         self.conversation_history = []  
         
         self.decomposer = SQLQueryDecomposer(llm)

@@ -334,10 +334,12 @@ async def process_question(websocket: WebSocket, question: str, session_id: str,
         else:
             await send_agent_result(websocket, agent_type, result_data)
         
+        logger.info("📤 Sending END status message")
         await websocket.send_json({
             "type": MessageType.STATUS.value,
             "content": "END"
         })
+        logger.info("✅ END message sent successfully")
         
     except Exception as e:
         logger.exception(f"Error processing question for session {session_id}: {e}")
@@ -436,11 +438,25 @@ async def send_agent_result(websocket: WebSocket, agent_type: str, result_data: 
         return
     
     elif agent_type == "visualization":
-        if "visualization" in result_data and result_data["visualization"]:
-            await websocket.send_json({
-                "type": MessageType.GRAPH.value,
-                "content": result_data["visualization"]
-            })
+        logger.info("   Processing visualization agent result")
+        logger.info(f"   Has 'visualization' key: {'visualization' in result_data}")
+        if "visualization" in result_data:
+            viz_data = result_data["visualization"]
+            logger.info(f"   Visualization data type: {type(viz_data)}")
+            logger.info(f"   Visualization data length: {len(viz_data) if viz_data else 0}")
+            logger.info(f"   Visualization data preview: {str(viz_data)[:100] if viz_data else 'None'}")
+            
+            if viz_data:
+                logger.info(f"   📤 Sending TYPE_GRAPH message")
+                await websocket.send_json({
+                    "type": MessageType.GRAPH.value,
+                    "content": viz_data
+                })
+                logger.info(f"   ✅ TYPE_GRAPH sent successfully")
+            else:
+                logger.warning(f"   ⚠️ Visualization data is empty!")
+        else:
+            logger.warning(f"   ⚠️ No 'visualization' key in result_data")
     
     elif agent_type in ["email", "meeting", "campaign"]:
         message_content = result_data.get("message", str(result_data))

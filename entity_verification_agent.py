@@ -8,7 +8,7 @@ from token_tracker import track_llm_call
 logger = logging.getLogger(__name__)
 
 class EntityVerificationAgent(BaseAgent):
-    def __init__(self, llm, db_executor, model_name: str = "gpt-4o"):
+    def __init__(self, llm, db_executor, model_name: str = "gpt-4.1-mini"):
         super().__init__(llm)
         self.model_name = model_name
         self.db_executor = db_executor

@@ -142,7 +142,7 @@ Question: {question}
                 output=content,
                 agent_type="campaign",
                 operation="process_campaign_query",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             logger.info(f"Campaign LLM response: {content}")

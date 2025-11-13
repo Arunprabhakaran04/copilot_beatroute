@@ -458,7 +458,7 @@ If the example already matches the user's request perfectly, return it AS IS."""
                 output=content,
                 agent_type="sql_generator",
                 operation="generate_sql",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             parsed_result = self._parse_and_validate_sql(content, question)
@@ -1034,7 +1034,7 @@ LIMIT 3
             logger.info(f"Adaptive temp: {temp} ({reason}, sim: {similarity:.3f}, rel_ratio: {relevance_ratio:.2f})")
             
             return ChatOpenAI(
-                model="gpt-4o",
+                model="gpt-4.1-mini",
                 api_key=os.getenv("OPENAI_API_KEY"),
                 temperature=temp,
                 max_tokens=2000

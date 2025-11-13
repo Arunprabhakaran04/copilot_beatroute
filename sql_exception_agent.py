@@ -393,7 +393,7 @@ Respond in JSON format:
                 output=content,
                 agent_type="sql_exception",
                 operation="analyze_error",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
@@ -613,7 +613,7 @@ Always return valid JSON with the corrected SQL or failure explanation."""
                 output=content,
                 agent_type="sql_exception",
                 operation="fix_sql",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             logger.debug(f"LLM response for SQL correction: {content[:300]}...")

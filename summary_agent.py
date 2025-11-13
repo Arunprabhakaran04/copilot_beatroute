@@ -28,7 +28,7 @@ class SummaryAgent(BaseAgent):
     Designed to work with output from DB Agent to provide user-friendly data summaries.
     """
     
-    def __init__(self, llm, model_name: str = "gpt-4o"):
+    def __init__(self, llm, model_name: str = "gpt-4.1-mini"):
         super().__init__(llm)
         self.model_name = model_name
         logger.info(f"SummaryAgent initialized with model: {model_name}")

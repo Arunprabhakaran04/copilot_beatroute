@@ -445,26 +445,33 @@ class ImprovedSQLGenerator(BaseAgent):
         else:
             logger.info("No retrieved SQLs to inject")
         
-        # Step 3: Add CURRENT question with explicit instruction to follow the last example
+        # Step 3: Add CURRENT question with explicit COPY instructions
         if retrieved_sqls and len(retrieved_sqls) > 0:
             sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
             most_similar = sorted_sqls[-1]
             similarity = most_similar.get('similarity', 0)
             most_similar_question = most_similar.get('question', '')
+            most_similar_sql = most_similar.get('sql', '')
             
-            # Add strong instruction to follow the pattern
+            # Add STRICT copy instruction with pattern breakdown
             enhanced_question = f"""{current_question}
 
-CRITICAL: The example immediately above (similarity: {similarity:.3f}) is the MOST SIMILAR to this question.
+CRITICAL COPY INSTRUCTIONS:
+The example immediately above (similarity: {similarity:.3f}) is your TEMPLATE.
 Question was: "{most_similar_question}"
 
-YOU MUST:
-1. Use the EXACT same table names and field names from that example
-2. Use the EXACT same JOIN pattern (if it uses CROSS JOIN ViewCustomer, YOU MUST USE IT)
-3. Use the EXACT same WHERE clause structure
-4. Only change the date filters to match this question
+STEP-BY-STEP COPYING RULES:
+1. COPY the FROM clause EXACTLY from that example
+2. COPY the CROSS JOIN pattern EXACTLY (same tables, same order)
+3. COPY the WHERE clause structure EXACTLY
+4. COPY the SELECT fields structure EXACTLY
+5. ONLY change: date values and entity names to match current question
+6. Do NOT add nested subqueries unless the example has them
+7. Do NOT add NOT IN unless the example uses it
+8. Do NOT add OR conditions unless the example uses them
+9. Keep the same level of complexity - do NOT make it more complex
 
-Do NOT deviate from the example structure."""
+Remember: The example works. Copy it. Change only dates/names. Nothing else."""
             
             message_log.append({"role": "user", "content": enhanced_question})
         else:
@@ -705,6 +712,45 @@ Do NOT deviate from the example structure."""
         if not schema_content or len(schema_content.strip()) == 0:
             schema_warning = "\n⚠️ WARNING: No schema available - you MUST copy field names EXACTLY from the examples above!\n"
         
+        # Build few-shot examples section with top 3 most similar SQLs
+        few_shot_examples = ""
+        if examples and len(examples) > 0:
+            # Get top 3 most similar examples (they're already sorted by similarity)
+            top_examples = sorted(examples, key=lambda x: x.get('similarity', 0), reverse=True)[:3]
+            
+            few_shot_examples = "\n" + "="*80 + "\n"
+            few_shot_examples += "📚 FEW-SHOT EXAMPLES - TOP 3 MOST SIMILAR PATTERNS\n"
+            few_shot_examples += "="*80 + "\n"
+            few_shot_examples += "These are PROVEN, TESTED SQL patterns that work correctly in CubeJS.\n"
+            few_shot_examples += "YOU MUST FOLLOW THESE PATTERNS EXACTLY.\n\n"
+            
+            for idx, example in enumerate(top_examples, 1):
+                question = example.get('question', 'N/A')
+                sql = example.get('sql', 'N/A')
+                similarity = example.get('similarity', 0)
+                
+                few_shot_examples += f"EXAMPLE {idx} (Similarity: {similarity:.3f}):\n"
+                few_shot_examples += f"User Question: {question}\n"
+                few_shot_examples += f"Correct SQL Pattern:\n{sql}\n"
+                few_shot_examples += f"\nKey Pattern Elements to COPY:\n"
+                
+                # Extract pattern elements
+                if 'CROSS JOIN' in sql:
+                    cross_joins = sql.count('CROSS JOIN')
+                    few_shot_examples += f"  ✓ Uses {cross_joins} CROSS JOIN(s) - YOU MUST USE SAME NUMBER\n"
+                if 'WITH' in sql.upper():
+                    few_shot_examples += f"  ✓ Uses WITH clause (CTE) - YOU CAN USE THIS PATTERN\n"
+                if 'ViewCustomer' in sql:
+                    few_shot_examples += f"  ✓ Uses ViewCustomer table - COPY THIS IF YOUR QUERY INVOLVES CUSTOMERS\n"
+                if 'NOT IN' in sql.upper():
+                    few_shot_examples += f"  ⚠️ Uses NOT IN - ONLY USE IF ABSOLUTELY NECESSARY\n"
+                if 'GROUP BY' in sql.upper():
+                    few_shot_examples += f"  ✓ Uses GROUP BY - COPY THIS PATTERN IF AGGREGATING\n"
+                
+                few_shot_examples += "\n"
+            
+            few_shot_examples += "="*80 + "\n\n"
+        
         return f"""You are an expert Cube.js SQL generator.
 
 CRITICAL: Must output JSON only: {{"sql": "..."}}
@@ -714,6 +760,20 @@ CUBE.JS STRICT RULES:
 2. FORBIDDEN: TO_CHAR(), EXTRACT(), COALESCE(), GETDATE(), SELECT *, aliases in WHERE clause
 3. WITH clause: Use ONLY if examples show it
 
+❌ COMMON MISTAKES THAT FAIL IN CUBEJS (DO NOT DO THESE):
+WRONG: SELECT ... WHERE col NOT IN (SELECT ...) with nested subquery in WHERE
+WRONG: Complex nested CTEs with multiple levels of subqueries
+WRONG: Using OR conditions in WHERE clause spanning multiple time periods
+WRONG: Nested subqueries inside WHERE IN clauses
+WRONG: Using different table names than what examples show
+
+✅ CORRECT PATTERNS (FOLLOW THESE):
+RIGHT: Simple WITH clause defining CTEs, then clean SELECT
+RIGHT: Direct CROSS JOIN without nested subqueries
+RIGHT: Clean WHERE clauses with AND conditions only
+RIGHT: Use MEASURE() function for aggregations when shown in examples
+RIGHT: Copy table names EXACTLY from similar examples
+
 SCHEMA:
 {schema_content}
 {schema_warning}
@@ -722,22 +782,27 @@ DATABASE YEAR: {data_year}
 {entity_context}
 {previous_context}
 
+{few_shot_examples}
+
 CRITICAL PATTERN MATCHING INSTRUCTIONS:
 You will see example queries in the conversation history before the current question.
 These examples are sorted by similarity - the MOST RECENT example (just before the current question) is the MOST SIMILAR.
 
-MANDATORY RULES:
-1. Do NOT invent or change table/column names - use ONLY what appears in SCHEMA or examples
-2. If a column or table is not in the SCHEMA, output: {{"error":"UNKNOWN_COLUMN: <name>"}}
-3. REPLICATE the structure of the most recent example (last one before current question):
-   - Same FROM clause (use same tables)
-   - Same JOIN pattern (if example uses CROSS JOIN ViewCustomer, YOU MUST TOO)
-   - Same WHERE clause structure
-   - Same field names (if example uses ViewCustomer.name, YOU MUST USE IT)
-4. For customer names: ALWAYS use "ViewCustomer.name" with "CROSS JOIN ViewCustomer"
-5. For order IDs: Use CustomerInvoice.externalOrderId or Order fields based on examples
-6. Only modify: date filters and specific entity values for current question
-7. Do NOT "improve" or "optimize" the example structure
+MANDATORY COPY INSTRUCTIONS (FOLLOW EXACTLY):
+1. COPY the FROM clause WORD-FOR-WORD from the most similar example above
+2. COPY the JOIN structure CHARACTER-BY-CHARACTER from the example
+3. COPY the WHERE clause structure from the example
+4. Do NOT add nested subqueries if the example doesn't have them
+5. Do NOT add NOT IN or complex WHERE conditions unless the example shows it
+6. Do NOT add OR conditions unless the example uses them
+7. Do NOT change table names - use EXACT table names from examples
+8. Do NOT invent new patterns - COPY what works from examples
+9. Only modify: date filters (last month, this month, etc.) and specific entity names
+10. If a column or table is not in SCHEMA or examples, output: {{"error":"UNKNOWN_COLUMN: <name>"}}
+
+SIMPLICITY RULE:
+Simpler SQL is better. If you can answer with one CTE and one CROSS JOIN (like examples), 
+do NOT add more complexity. More complexity = higher chance of failure.
 
 OUTPUT FORMAT: {{"sql": "YOUR_QUERY_HERE"}}"""
     

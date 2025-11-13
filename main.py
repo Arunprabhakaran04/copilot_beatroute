@@ -49,14 +49,14 @@ class CentralOrchestrator:
             raise ValueError("OPENAI_API_KEY not found in environment variables.")
         
         self.llm = ChatOpenAI(
-            model="gpt-4o",
+            model="gpt-4.1-mini",
             api_key=openai_api_key,
             temperature=0.1,
             max_tokens=1000
         )
         
         self.db_llm = ChatOpenAI(
-            model="gpt-4o", 
+            model="gpt-4.1-mini", 
             api_key=openai_api_key,
             temperature=0.1,
             max_tokens=2000
@@ -66,26 +66,26 @@ class CentralOrchestrator:
         self.schema_file_path = schema_file_path
         
         self.agents = {
-            "entity_verification": EntityVerificationAgent(self.llm, execute_sql, "gpt-4o"),
+            "entity_verification": EntityVerificationAgent(self.llm, execute_sql, "gpt-4.1-mini"),
             "db_query": DBQueryAgent(self.db_llm, schema_file_path),
             "email": EmailAgent(self.llm),
             "meeting": MeetingSchedulerAgent(self.llm, files_directory),
             "campaign": CampaignAgent(self.llm),
             "sql_retriever": SQLRetrieverAgent(self.db_llm, "embeddings.pkl"),
-            "summary": SummaryAgent(self.db_llm, "gpt-4o"),
-            "visualization": VisualizationAgent(self.db_llm, "gpt-4o"),
+            "summary": SummaryAgent(self.db_llm, "gpt-4.1-mini"),
+            "visualization": VisualizationAgent(self.db_llm, "gpt-4.1-mini"),
             # Note: ImprovedSQLGenerator will be recreated per-request with user_context
             "improved_sql_generator": ImprovedSQLGenerator(self.db_llm, schema_file_path=None)
         }
         
         logger.info("Initialized CentralOrchestrator with:")
-        logger.info(f"  - Entity Verification Agent: OpenAI GPT-4o (for entity validation)")
-        logger.info(f"  - DB Query Agent: OpenAI GPT-4o (orchestrator with multi-step capability)")
-        logger.info(f"  - Email Agent: OpenAI GPT-4o")
-        logger.info(f"  - Meeting Agent: OpenAI GPT-4o")
-        logger.info(f"  - SQL Retriever Agent: OpenAI GPT-4o (for embeddings and retrieval)")
-        logger.info(f"  - Summary Agent: OpenAI GPT-4o (for data summarization)")
-        logger.info(f"  - Visualization Agent: OpenAI GPT-4o (for data visualization)")
+        logger.info(f"  - Entity Verification Agent: OpenAI GPT-4.1-mini (for entity validation)")
+        logger.info(f"  - DB Query Agent: OpenAI GPT-4.1-mini (orchestrator with multi-step capability)")
+        logger.info(f"  - Email Agent: OpenAI GPT-4.1-mini")
+        logger.info(f"  - Meeting Agent: OpenAI GPT-4.1-mini")
+        logger.info(f"  - SQL Retriever Agent: OpenAI GPT-4.1-mini (for embeddings and retrieval)")
+        logger.info(f"  - Summary Agent: OpenAI GPT-4.1-mini (for data summarization)")
+        logger.info(f"  - Visualization Agent: OpenAI GPT-4.1-mini (for data visualization)")
         
         self.classification_keywords = {
             "db_query": [
@@ -181,11 +181,11 @@ class CentralOrchestrator:
         self.enrich_agent = EnrichAgent(
             openai_client=self.openai_client,
             sql_retriever_agent=self.agents["sql_retriever"],
-            model="gpt-4o",
+            model="gpt-4.1-mini",
             max_tokens=2000,
             temperature=0.3
         )
-        logger.info("  - Enrich Agent: OpenAI GPT-4o (for intelligent query enrichment)")
+        logger.info("  - Enrich Agent: OpenAI GPT-4.1-mini (for intelligent query enrichment)")
         
         self.graph = self._build_orchestrator_graph()
     
@@ -874,7 +874,7 @@ class CentralOrchestrator:
                 output=content,
                 agent_type="orchestrator", 
                 operation="query_decomposition",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             # Parse tasks

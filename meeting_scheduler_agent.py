@@ -265,7 +265,7 @@ Latest Query:
                 output=answer,
                 agent_type="meeting",
                 operation="detect_schedule_intent",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             logger.info(f"🔍 MEETING AGENT | Intent detection completed")
@@ -618,7 +618,7 @@ Latest Query:
                 output=content,
                 agent_type="meeting",
                 operation="schedule_meeting",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             if content.startswith("ERROR:"):

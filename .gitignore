@@ -13,3 +13,4 @@ schema
 embeddings.pkl
 logs/
 execute_table_query.py
+frontend/

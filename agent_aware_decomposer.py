@@ -399,7 +399,7 @@ Respond with this EXACT JSON structure:
                 output=content,
                 agent_type="agent_aware_decomposer",
                 operation="decomposition",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             analysis = self._safe_json_parse(content)
