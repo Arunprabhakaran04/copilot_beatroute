@@ -46,6 +46,14 @@ class ImprovedSQLGenerator(BaseAgent):
     def get_agent_type(self) -> str:
         return "improved_sql_generator"
     
+    def _get_adaptive_temperature(self, max_similarity: float) -> float:
+        if max_similarity > 0.7:
+            return 0.3
+        elif max_similarity >= 0.4:
+            return 0.6
+        else:
+            return 0.8
+    
     def _load_schema_file(self) -> str:
         """Load the database schema from the schema file."""
         if not self.schema_file_path:
@@ -275,7 +283,7 @@ class ImprovedSQLGenerator(BaseAgent):
                 focused_schema = self.schema_manager.get_schema_to_use_in_prompt(
                     current_question=question,
                     list_similar_question_sql_pair=similar_sqls or [],
-                    k=10  # Top 10 similar tables
+                    k=15
                 )
                 schema_time = time.time() - schema_start
                 
@@ -321,26 +329,28 @@ class ImprovedSQLGenerator(BaseAgent):
             system_prompt=prompt,
             current_question=user_message,
             conversation_history=conversation_history,
-            retrieved_sqls=similar_sqls,  # Pass retrieved SQLs for injection
-            max_history=5,  # Keep last 5 REAL conversations
-            max_retrieved_sqls=20  # Inject up to 20 retrieved SQLs (increased from 10)
+            retrieved_sqls=similar_sqls,
+            max_history=5,
+            max_retrieved_sqls=7
         )
         
-        # Log example statistics
+        max_similarity = 0.0
         if similar_sqls and len(similar_sqls) > 0:
-            num_examples = min(len(similar_sqls), 20)
+            num_examples = min(len(similar_sqls), 7)
             sorted_sqls = sorted(similar_sqls[:num_examples], key=lambda x: x.get('similarity', 0))
-            top_similarity = sorted_sqls[-1].get('similarity', 0) if sorted_sqls else 0
+            max_similarity = sorted_sqls[-1].get('similarity', 0) if sorted_sqls else 0
             
             logger.info(f"Passed {num_examples} examples to LLM as user-assistant pairs")
-            logger.info(f"   Top similarity (last example): {top_similarity:.3f}")
+            logger.info(f"Top similarity (last example): {max_similarity:.3f}")
         
-        # Generate SQL with deterministic sampling
+        adaptive_temp = self._get_adaptive_temperature(max_similarity)
+        logger.info(f"Using adaptive temperature: {adaptive_temp} (similarity: {max_similarity:.3f})")
+        
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(
             model="gpt-4.1-mini",
             api_key=os.getenv("OPENAI_API_KEY"),
-            temperature=0.1,
+            temperature=adaptive_temp,
             seed=42,
             max_tokens=2000
         )
@@ -445,44 +455,54 @@ class ImprovedSQLGenerator(BaseAgent):
         else:
             logger.info("No retrieved SQLs to inject")
         
-        # Step 3: Add CURRENT question with explicit COPY instructions
+        # Step 3: Add CURRENT question with smart copy instructions based on similarity
         if retrieved_sqls and len(retrieved_sqls) > 0:
             sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
             most_similar = sorted_sqls[-1]
             similarity = most_similar.get('similarity', 0)
             most_similar_question = most_similar.get('question', '')
-            most_similar_sql = most_similar.get('sql', '')
             
-            # Add STRICT copy instruction with pattern breakdown
-            enhanced_question = f"""{current_question}
+            if similarity > 0.7:
+                instruction = f"""HIGH SIMILARITY MATCH (similarity: {similarity:.3f})
+The example above is VERY similar to your question: "{most_similar_question}"
 
-CRITICAL COPY INSTRUCTIONS:
-The example immediately above (similarity: {similarity:.3f}) is your TEMPLATE.
-Question was: "{most_similar_question}"
+INSTRUCTIONS: Follow this pattern VERY closely. Adapt only dates, names, and specific values.
+- COPY the FROM clause structure
+- COPY the CROSS JOIN pattern
+- COPY the WHERE clause structure
+- COPY the SELECT fields
+- ONLY change: dates, entity names, and filter values to match current question"""
+            elif similarity >= 0.4:
+                instruction = f"""MEDIUM SIMILARITY MATCH (similarity: {similarity:.3f})
+The example above is related: "{most_similar_question}"
 
-STEP-BY-STEP COPYING RULES:
-1. COPY the FROM clause EXACTLY from that example
-2. COPY the CROSS JOIN pattern EXACTLY (same tables, same order)
-3. COPY the WHERE clause structure EXACTLY
-4. COPY the SELECT fields structure EXACTLY
-5. ONLY change: date values and entity names to match current question
-6. Do NOT add nested subqueries unless the example has them
-7. Do NOT add NOT IN unless the example uses it
-8. Do NOT add OR conditions unless the example uses them
-9. Keep the same level of complexity - do NOT make it more complex
+INSTRUCTIONS: Use this pattern as inspiration. Adapt the structure intelligently.
+- Use similar table joins if applicable
+- Adapt the WHERE clause logic to your needs
+- Keep the query structure simple and efficient
+- Don't force-fit the pattern if it doesn't match well"""
+            else:
+                instruction = f"""LOW SIMILARITY MATCH (similarity: {similarity:.3f})
+The examples above are loosely related.
 
-Remember: The example works. Copy it. Change only dates/names. Nothing else."""
+INSTRUCTIONS: Use SQL best practices. Create a simple, efficient query.
+- Use appropriate tables from the schema
+- Keep joins minimal and necessary
+- Write clear, straightforward WHERE conditions
+- Prefer simple queries over complex CTEs"""
             
+            enhanced_question = f"{current_question}\n\n{instruction}"
             message_log.append({"role": "user", "content": enhanced_question})
         else:
             message_log.append({"role": "user", "content": current_question})
         
         total_messages = len(message_log)
         real_conv_count = len(conversation_history) * 2 if conversation_history else 0
-        injected_sql_count = len(retrieved_sqls) * 2 if retrieved_sqls else 0
+        num_sqls_injected = min(len(retrieved_sqls), max_retrieved_sqls) if retrieved_sqls else 0
+        injected_sql_count = num_sqls_injected * 2
         
         logger.info(f"FINAL message log: {total_messages} messages")
-        logger.info(f"   = 1 system + {real_conv_count} real history + {injected_sql_count} injected SQLs + 1 current")
+        logger.info(f"   = 1 system + {real_conv_count} real history + {injected_sql_count} injected ({num_sqls_injected} SQLs) + 1 current")
         
         # DEBUG: Log first 2 and last 2 injected examples to verify format
         if retrieved_sqls and len(retrieved_sqls) > 0:
