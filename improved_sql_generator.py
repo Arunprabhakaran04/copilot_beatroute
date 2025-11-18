@@ -46,14 +46,6 @@ class ImprovedSQLGenerator(BaseAgent):
     def get_agent_type(self) -> str:
         return "improved_sql_generator"
     
-    def _get_adaptive_temperature(self, max_similarity: float) -> float:
-        if max_similarity > 0.7:
-            return 0.3
-        elif max_similarity >= 0.4:
-            return 0.6
-        else:
-            return 0.8
-    
     def _load_schema_file(self) -> str:
         """Load the database schema from the schema file."""
         if not self.schema_file_path:
@@ -283,7 +275,7 @@ class ImprovedSQLGenerator(BaseAgent):
                 focused_schema = self.schema_manager.get_schema_to_use_in_prompt(
                     current_question=question,
                     list_similar_question_sql_pair=similar_sqls or [],
-                    k=15
+                    k=10  # Top 10 similar tables
                 )
                 schema_time = time.time() - schema_start
                 
@@ -300,13 +292,20 @@ class ImprovedSQLGenerator(BaseAgent):
         else:
             logger.info("No SchemaManager - using full schema from file")
         
+        # Calculate top similarity for adaptive prompt
+        top_similarity = 0.0
+        if similar_sqls and len(similar_sqls) > 0:
+            sorted_sqls = sorted(similar_sqls, key=lambda x: x.get('similarity', 0))
+            top_similarity = sorted_sqls[-1].get('similarity', 0) if sorted_sqls else 0
+        
         # Create focused prompt with previous results and entity context
         prompt = self._create_focused_prompt(
             question, 
             similar_sqls,
             cleaned_previous_results, 
             entity_info,
-            focused_schema=focused_schema
+            focused_schema=focused_schema,
+            top_similarity=top_similarity
         )
         
         # Build user message with explicit entity names if available
@@ -329,28 +328,40 @@ class ImprovedSQLGenerator(BaseAgent):
             system_prompt=prompt,
             current_question=user_message,
             conversation_history=conversation_history,
-            retrieved_sqls=similar_sqls,
-            max_history=5,
-            max_retrieved_sqls=7
+            retrieved_sqls=similar_sqls,  # Pass retrieved SQLs for injection
+            max_history=5,  # Keep last 5 REAL conversations
+            max_retrieved_sqls=20  # Inject up to 20 retrieved SQLs (increased from 10)
         )
         
-        max_similarity = 0.0
+        # Calculate top similarity and determine dynamic temperature
+        top_similarity = 0.0
         if similar_sqls and len(similar_sqls) > 0:
-            num_examples = min(len(similar_sqls), 7)
+            num_examples = min(len(similar_sqls), 20)
             sorted_sqls = sorted(similar_sqls[:num_examples], key=lambda x: x.get('similarity', 0))
-            max_similarity = sorted_sqls[-1].get('similarity', 0) if sorted_sqls else 0
+            top_similarity = sorted_sqls[-1].get('similarity', 0) if sorted_sqls else 0
             
             logger.info(f"Passed {num_examples} examples to LLM as user-assistant pairs")
-            logger.info(f"Top similarity (last example): {max_similarity:.3f}")
+            logger.info(f"   Top similarity (last example): {top_similarity:.3f}")
         
-        adaptive_temp = self._get_adaptive_temperature(max_similarity)
-        logger.info(f"Using adaptive temperature: {adaptive_temp} (similarity: {max_similarity:.3f})")
+        # 🎯 DYNAMIC TEMPERATURE based on similarity score
+        if top_similarity > 0.80:
+            temperature = 0.1  # High similarity - deterministic, copy pattern closely
+            creativity_level = "LOW (COPY pattern)"
+        elif top_similarity >= 0.60:
+            temperature = 0.4  # Moderate similarity - moderate creativity, adapt pattern
+            creativity_level = "MODERATE (ADAPT pattern)"
+        else:
+            temperature = 0.6  # Low similarity - high creativity, be inventive
+            creativity_level = "HIGH (BE CREATIVE)"
         
+        logger.info(f"🌡️ Dynamic temperature: {temperature} (similarity: {top_similarity:.3f}, creativity: {creativity_level})")
+        
+        # Generate SQL with dynamic temperature
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(
             model="gpt-4.1-mini",
             api_key=os.getenv("OPENAI_API_KEY"),
-            temperature=adaptive_temp,
+            temperature=temperature,
             seed=42,
             max_tokens=2000
         )
@@ -455,54 +466,44 @@ class ImprovedSQLGenerator(BaseAgent):
         else:
             logger.info("No retrieved SQLs to inject")
         
-        # Step 3: Add CURRENT question with smart copy instructions based on similarity
+        # Step 3: Add CURRENT question with explicit COPY instructions
         if retrieved_sqls and len(retrieved_sqls) > 0:
             sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
             most_similar = sorted_sqls[-1]
             similarity = most_similar.get('similarity', 0)
             most_similar_question = most_similar.get('question', '')
+            most_similar_sql = most_similar.get('sql', '')
             
-            if similarity > 0.7:
-                instruction = f"""HIGH SIMILARITY MATCH (similarity: {similarity:.3f})
-The example above is VERY similar to your question: "{most_similar_question}"
+            # Add STRICT copy instruction with pattern breakdown
+            enhanced_question = f"""{current_question}
 
-INSTRUCTIONS: Follow this pattern VERY closely. Adapt only dates, names, and specific values.
-- COPY the FROM clause structure
-- COPY the CROSS JOIN pattern
-- COPY the WHERE clause structure
-- COPY the SELECT fields
-- ONLY change: dates, entity names, and filter values to match current question"""
-            elif similarity >= 0.4:
-                instruction = f"""MEDIUM SIMILARITY MATCH (similarity: {similarity:.3f})
-The example above is related: "{most_similar_question}"
+CRITICAL COPY INSTRUCTIONS:
+The example immediately above (similarity: {similarity:.3f}) is your TEMPLATE.
+Question was: "{most_similar_question}"
 
-INSTRUCTIONS: Use this pattern as inspiration. Adapt the structure intelligently.
-- Use similar table joins if applicable
-- Adapt the WHERE clause logic to your needs
-- Keep the query structure simple and efficient
-- Don't force-fit the pattern if it doesn't match well"""
-            else:
-                instruction = f"""LOW SIMILARITY MATCH (similarity: {similarity:.3f})
-The examples above are loosely related.
+STEP-BY-STEP COPYING RULES:
+1. COPY the FROM clause EXACTLY from that example
+2. COPY the CROSS JOIN pattern EXACTLY (same tables, same order)
+3. COPY the WHERE clause structure EXACTLY
+4. COPY the SELECT fields structure EXACTLY
+5. ONLY change: date values and entity names to match current question
+6. Do NOT add nested subqueries unless the example has them
+7. Do NOT add NOT IN unless the example uses it
+8. Do NOT add OR conditions unless the example uses them
+9. Keep the same level of complexity - do NOT make it more complex
 
-INSTRUCTIONS: Use SQL best practices. Create a simple, efficient query.
-- Use appropriate tables from the schema
-- Keep joins minimal and necessary
-- Write clear, straightforward WHERE conditions
-- Prefer simple queries over complex CTEs"""
+Remember: The example works. Copy it. Change only dates/names. Nothing else."""
             
-            enhanced_question = f"{current_question}\n\n{instruction}"
             message_log.append({"role": "user", "content": enhanced_question})
         else:
             message_log.append({"role": "user", "content": current_question})
         
         total_messages = len(message_log)
         real_conv_count = len(conversation_history) * 2 if conversation_history else 0
-        num_sqls_injected = min(len(retrieved_sqls), max_retrieved_sqls) if retrieved_sqls else 0
-        injected_sql_count = num_sqls_injected * 2
+        injected_sql_count = len(retrieved_sqls) * 2 if retrieved_sqls else 0
         
         logger.info(f"FINAL message log: {total_messages} messages")
-        logger.info(f"   = 1 system + {real_conv_count} real history + {injected_sql_count} injected ({num_sqls_injected} SQLs) + 1 current")
+        logger.info(f"   = 1 system + {real_conv_count} real history + {injected_sql_count} injected SQLs + 1 current")
         
         # DEBUG: Log first 2 and last 2 injected examples to verify format
         if retrieved_sqls and len(retrieved_sqls) > 0:
@@ -655,13 +656,15 @@ INSTRUCTIONS: Use SQL best practices. Create a simple, efficient query.
     def _create_focused_prompt(self, question: str, examples: List[Dict], intent: Dict[str, Any], 
                               previous_results: Dict[str, Any] = None,
                               entity_info: Dict[str, Any] = None,
-                              focused_schema: str = None) -> str:
+                              focused_schema: str = None,
+                              top_similarity: float = 0.0) -> str:
         """
         Create a focused prompt that emphasizes accuracy and proper SQL generation.
         
         Args:
             entity_info: Dictionary containing verified entity information
             focused_schema: Optional focused schema containing only relevant tables
+            top_similarity: Highest similarity score from retrieved examples (for adaptive instructions)
         """
         data_year = self._extract_year_from_examples(examples)
         
@@ -771,28 +774,145 @@ INSTRUCTIONS: Use SQL best practices. Create a simple, efficient query.
             
             few_shot_examples += "="*80 + "\n\n"
         
+        # 🎯 Generate adaptive instructions based on similarity score
+        if top_similarity > 0.75:
+            adaptive_instructions = """🔒 HIGH SIMILARITY (>0.75) - COPY MODE:
+1. COPY the FROM clause WORD-FOR-WORD from the most similar example
+2. COPY the JOIN structure CHARACTER-BY-CHARACTER from the example
+3. COPY the WHERE clause structure from the example
+4. Only modify: date filters, entity names, and minor adjustments
+5. Do NOT add patterns the example doesn't show
+6. TRUST the example - it's proven to work"""
+        elif top_similarity >= 0.50:
+            adaptive_instructions = """🔄 MODERATE SIMILARITY (0.50-0.75) - ADAPT MODE:
+1. USE the example as a GUIDE, not strict template
+2. ADAPT the logic to fit your specific question
+3. Be creative with WHERE conditions if question logic differs
+4. Keep the same table selection and JOIN pattern
+5. Think critically: Does example logic match question logic?
+6. If logic doesn't match, redesign the approach while keeping SQL style"""
+        else:
+            adaptive_instructions = """🚀 LOW SIMILARITY (<0.50) - CREATIVE MODE:
+1. Examples are just REFERENCE - be creative and independent
+2. Design SQL from scratch based on question requirements
+3. Follow CubeJS rules (CROSS JOIN, no forbidden functions)
+4. Think through the logic step-by-step
+5. Use simple patterns: WITH clause + CROSS JOIN + clean WHERE
+6. Don't force-fit an example pattern that doesn't match"""
+        
         return f"""You are an expert Cube.js SQL generator.
 
 CRITICAL: Must output JSON only: {{"sql": "..."}}
 
-CUBE.JS STRICT RULES:
-1. CROSS JOIN ONLY - NO INNER/LEFT/RIGHT JOIN, NO ON clause
-2. FORBIDDEN: TO_CHAR(), EXTRACT(), COALESCE(), GETDATE(), SELECT *, aliases in WHERE clause
-3. WITH clause: Use ONLY if examples show it
+=== CUBE.JS SQL API STRICT RULES (FAILURE = QUERY REJECTED) ===
 
-❌ COMMON MISTAKES THAT FAIL IN CUBEJS (DO NOT DO THESE):
-WRONG: SELECT ... WHERE col NOT IN (SELECT ...) with nested subquery in WHERE
-WRONG: Complex nested CTEs with multiple levels of subqueries
-WRONG: Using OR conditions in WHERE clause spanning multiple time periods
-WRONG: Nested subqueries inside WHERE IN clauses
-WRONG: Using different table names than what examples show
+🚫 ABSOLUTE PROHIBITIONS (THESE WILL FAIL):
+1. ❌ NO JOIN CONDITIONS: ONLY use CROSS JOIN, NO ON clause, NO join conditions in WHERE
+   - WRONG: FROM Table1 CROSS JOIN Table2 WHERE Table1.id = Table2.id
+   - RIGHT: FROM Table1 CROSS JOIN Table2
+   
+2. ❌ NO SUBQUERIES IN WHERE CLAUSE: Especially NOT IN (SELECT ...) or IN (SELECT ...)
+   - WRONG: WHERE customer IN (SELECT customer FROM ...)
+   - WRONG: WHERE customer NOT IN (SELECT customer FROM ...)
+   - RIGHT: Use WITH clause to create CTEs, then simple WHERE conditions
+   
+3. ❌ NO FORBIDDEN FUNCTIONS: TO_CHAR(), EXTRACT(), COALESCE(), GETDATE()
+   
+4. ❌ NO SELECT *: Must explicitly list columns
+   
+5. ❌ NO ALIASES IN WHERE: Cannot reference column aliases in WHERE clause
+   
+6. ❌ NO NESTED SUBQUERIES: Subqueries inside other subqueries in WHERE/HAVING
 
-✅ CORRECT PATTERNS (FOLLOW THESE):
-RIGHT: Simple WITH clause defining CTEs, then clean SELECT
-RIGHT: Direct CROSS JOIN without nested subqueries
-RIGHT: Clean WHERE clauses with AND conditions only
-RIGHT: Use MEASURE() function for aggregations when shown in examples
-RIGHT: Copy table names EXACTLY from similar examples
+=== MANDATORY PATTERNS (ONLY THESE WORK) ===
+
+✅ WITH Clause Pattern (for complex queries):
+   - Define CTEs first with WITH clause
+   - Use MEASURE() inside WITH clause for aggregations
+   - Use SUM() outside WITH clause (MEASURE doesn't work outside)
+   - Always assign aliases in WITH clause
+   - Include GROUP BY inside WITH clause
+   - ⚠️ DO NOT create 2 tables with WITH and then JOIN them - use UNION ALL instead
+   
+✅ CROSS JOIN Pattern:
+   - Use CROSS JOIN ONLY (no other join types)
+   - NO ON clause ever
+   - NO join conditions in WHERE clause
+   - Tables are automatically related by CROSS JOIN
+   
+✅ Table Relationships (use CROSS JOIN for these):
+   - Order ↔ ViewCustomer, ViewDistributor, ViewUser, OrderDetail
+   - OrderDetail ↔ Sku
+   - Sku ↔ Brand, Category
+   - CustomerInvoice ↔ CustomerInvoiceDetail, ViewCustomer
+   
+✅ Name Column Patterns:
+   - Customer names: CROSS JOIN ViewCustomer, use ViewCustomer.name
+   - User names: CROSS JOIN ViewUser, use ViewUser.name
+   - Distributor names: CROSS JOIN ViewDistributor, use ViewDistributor.name
+   - SKU names: CROSS JOIN Sku, use Sku.name (NOT Order.skuName or CustomerInvoiceDetail.skuName)
+   - Category names: CROSS JOIN Category with Sku, use Category.name
+   - Brand names: CROSS JOIN Brand with Sku, use Brand.name
+   
+✅ Date Field Patterns:
+   - Order dates: Order.datetime
+   - Sales/Revenue/Dispatch dates: CustomerInvoice.dispatchedDate
+   
+✅ Count Patterns:
+   - WRONG: COUNT(DISTINCT ViewCustomer.id)
+   - RIGHT: MEASURE(ViewCustomer.count)
+
+🎯 CRITICAL PATTERN: "Items in Period A but NOT in Period B"
+This is YOUR CURRENT TASK TYPE - PAY CLOSE ATTENTION!
+
+❌ WRONG APPROACH (WILL FAIL IN CUBEJS):
+WITH period_a AS (SELECT DISTINCT name FROM Order CROSS JOIN ViewCustomer WHERE date >= a1 AND date < a2)
+SELECT name FROM ViewCustomer 
+WHERE name IN (SELECT name FROM period_a) 
+  AND name NOT IN (SELECT name FROM Order CROSS JOIN ViewCustomer WHERE date >= b1)  -- ❌ SUBQUERY IN WHERE!
+
+✅ CORRECT APPROACH (METHOD 1 - Two CTEs):
+WITH august_orders AS (
+  SELECT DISTINCT ViewCustomer.name AS customer_name
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= '2024-08-01' AND Order.datetime < '2024-09-01'
+), september_orders AS (
+  SELECT DISTINCT ViewCustomer.name AS customer_name
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= '2024-09-01' AND Order.datetime < '2024-10-01'
+)
+SELECT customer_name AS CustomerName
+FROM august_orders
+WHERE customer_name NOT IN (SELECT customer_name FROM september_orders)
+ORDER BY CustomerName
+
+✅ CORRECT APPROACH (METHOD 2 - COUNT DISTINCT):
+WITH all_order_months AS (
+  SELECT 
+    ViewCustomer.name AS customer_name,
+    DATE_TRUNC('month', Order.datetime) AS order_month
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= '2024-08-01' AND Order.datetime < '2024-10-01'
+  GROUP BY ViewCustomer.name, DATE_TRUNC('month', Order.datetime)
+), customer_month_count AS (
+  SELECT 
+    customer_name,
+    COUNT(DISTINCT order_month) AS month_count
+  FROM all_order_months
+  GROUP BY customer_name
+)
+SELECT customer_name AS CustomerName
+FROM customer_month_count
+WHERE month_count = 1  -- Only ordered in one month (August, not September)
+ORDER BY CustomerName
+
+KEY DIFFERENCES:
+- ✅ Method 1: No subqueries in WHERE of main SELECT
+- ✅ Method 2: No subqueries at all, uses HAVING clause
+- ❌ Never: WHERE x IN (...) AND x NOT IN (...) in main SELECT
 
 SCHEMA:
 {schema_content}
@@ -808,17 +928,14 @@ CRITICAL PATTERN MATCHING INSTRUCTIONS:
 You will see example queries in the conversation history before the current question.
 These examples are sorted by similarity - the MOST RECENT example (just before the current question) is the MOST SIMILAR.
 
-MANDATORY COPY INSTRUCTIONS (FOLLOW EXACTLY):
-1. COPY the FROM clause WORD-FOR-WORD from the most similar example above
-2. COPY the JOIN structure CHARACTER-BY-CHARACTER from the example
-3. COPY the WHERE clause structure from the example
-4. Do NOT add nested subqueries if the example doesn't have them
-5. Do NOT add NOT IN or complex WHERE conditions unless the example shows it
-6. Do NOT add OR conditions unless the example uses them
-7. Do NOT change table names - use EXACT table names from examples
-8. Do NOT invent new patterns - COPY what works from examples
-9. Only modify: date filters (last month, this month, etc.) and specific entity names
-10. If a column or table is not in SCHEMA or examples, output: {{"error":"UNKNOWN_COLUMN: <name>"}}
+🎯 ADAPTIVE STRATEGY (Based on Similarity Score: {top_similarity:.3f}):
+{adaptive_instructions}
+
+⚠️ LOGIC VALIDATION:
+- ALWAYS verify your SQL makes logical sense
+- NEVER create contradictory conditions (e.g., X NOT IN (...) AND X IN (...))
+- If the question's logic differs from examples, ADAPT the pattern, don't blindly copy
+- Think through: "Does this SQL actually answer the question?"
 
 SIMPLICITY RULE:
 Simpler SQL is better. If you can answer with one CTE and one CROSS JOIN (like examples), 

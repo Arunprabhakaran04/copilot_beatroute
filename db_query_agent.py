@@ -9,6 +9,7 @@ from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from sql_query_decomposer import SQLQueryDecomposer
 from improved_sql_generator import ImprovedSQLGenerator
+from multi_step_sql_generator import MultiStepSQLGenerator
 from sql_exception_agent import SQLExceptionAgent
 from summary_agent import SummaryAgent
 from db_connection import get_database_connection, execute_sql
@@ -17,7 +18,8 @@ from token_tracker import track_llm_call, get_token_tracker
 class DBQueryAgent(BaseAgent):
     """
     DB Query Agent orchestrator for handling both simple and complex multi-step SQL queries.
-    Uses ImprovedSQLGenerator exclusively for all SQL generation tasks.
+    Uses ImprovedSQLGenerator for single-step and Step 1 of multi-step queries.
+    Uses MultiStepSQLGenerator for Step 2+ of multi-step queries (stricter Cube.js rules).
     """
     
     def __init__(self, llm, schema_file_path: str = None):
@@ -26,8 +28,9 @@ class DBQueryAgent(BaseAgent):
         
         # Initialize sub-agents (schema will come from UserContext)
         self.sql_generator = ImprovedSQLGenerator(llm, schema_file_path=None)
+        self.multi_step_sql_generator = MultiStepSQLGenerator(llm, schema_file_path=None)
         self.exception_agent = SQLExceptionAgent(llm, schema_file_path=None, max_iterations=5)
-        self.summary_agent = SummaryAgent(llm, "gpt-4.1-mini")
+        self.summary_agent = SummaryAgent(llm, "gpt-4o-mini")
         self.conversation_history = []  
         
         self.decomposer = SQLQueryDecomposer(llm)
@@ -40,7 +43,8 @@ class DBQueryAgent(BaseAgent):
             self.sql_retriever = SQLRetrieverAgent(llm, "embeddings.pkl")
             logger.info("DBQueryAgent initialized as orchestrator with sub-agents:")
             logger.info("  - SQL Query Decomposer: for multi-step analysis")
-            logger.info("  - Improved SQL Generator: for all SQL generation")
+            logger.info("  - Improved SQL Generator: for single-step & Step 1 of multi-step")
+            logger.info("  - Multi-Step SQL Generator: for Step 2+ of multi-step (strict Cube.js rules)")
             logger.info("  - SQL Retriever: for step-specific context retrieval")
             logger.info("  - SQL Exception Agent: for error analysis and fixing")
             logger.info("  - Summary Agent: for generating data summaries")
@@ -49,7 +53,8 @@ class DBQueryAgent(BaseAgent):
             self.sql_retriever = None
             logger.info("DBQueryAgent initialized as orchestrator with sub-agents:")
             logger.info("  - SQL Query Decomposer: for multi-step analysis")
-            logger.info("  - SQL Generator: for individual query generation")
+            logger.info("  - Improved SQL Generator: for single-step & Step 1")
+            logger.info("  - Multi-Step SQL Generator: for Step 2+ (strict Cube.js rules)")
             logger.info("  - SQL Retriever: NOT AVAILABLE (will use fallback)")
             logger.info("  - SQL Exception Agent: for error analysis and fixing")
             logger.info("  - Summary Agent: for generating data summaries")
@@ -354,21 +359,33 @@ class DBQueryAgent(BaseAgent):
                         query_data_df = None
                     
                     # Send table data immediately via callback (before summary generation)
+                    # 🚫 DO NOT send intermediate step tables in multi-step queries
                     table_sent_via_callback = False
+                    is_multi_step = state.get("is_multi_step", False)
+                    current_step = state.get("current_step", 1)
+                    total_steps = state.get("total_steps", 1)
+                    is_final_step = (current_step == total_steps)
+                    
+                    # Only send table if: (1) single-step query, OR (2) final step of multi-step
+                    should_send_table = (not is_multi_step) or is_final_step
+                    
                     if state.get("table_callback") and execution_result.get("query_results"):
-                        try:
-                            table_data = execution_result["query_results"].get("data")
-                            if table_data:
-                                logger.info("Calling table_callback to send data immediately")
-                                import asyncio
-                                loop = asyncio.new_event_loop()
-                                loop.run_until_complete(state["table_callback"](table_data))
-                                loop.close()
-                                table_sent_via_callback = True
-                                logger.info("Table sent via callback successfully")
-                        except Exception as cb_error:
-                            logger.error(f"Table callback failed: {cb_error}")
-                            table_sent_via_callback = False
+                        if should_send_table:
+                            try:
+                                table_data = execution_result["query_results"].get("data")
+                                if table_data:
+                                    logger.info(f"📤 Calling table_callback to send data immediately (step {current_step}/{total_steps})")
+                                    import asyncio
+                                    loop = asyncio.new_event_loop()
+                                    loop.run_until_complete(state["table_callback"](table_data))
+                                    loop.close()
+                                    table_sent_via_callback = True
+                                    logger.info("✅ Table sent via callback successfully")
+                            except Exception as cb_error:
+                                logger.error(f"❌ Table callback failed: {cb_error}")
+                                table_sent_via_callback = False
+                        else:
+                            logger.info(f"⏭️ Skipping table callback for intermediate step {current_step}/{total_steps}")
                     
                     # Generate summary using Summary Agent
                     logger.info("Generating summary for query results...")
@@ -521,6 +538,17 @@ class DBQueryAgent(BaseAgent):
                 logger.info(f" EXECUTING MULTI-STEP QUERY - STEP {step_idx}/{step_count}")
                 logger.info(f"Step {step_idx} Question: {step_question}")
                 
+                # 🚫 CRITICAL: Remove table_callback for intermediate steps
+                # Only the final step (handled by multi-step handler) should send tables
+                original_callback = state.get("table_callback")
+                if step_idx < step_count:
+                    # Temporarily remove callback for intermediate steps
+                    state["table_callback"] = None
+                    logger.info(f"⏭️ Suppressing table_callback for intermediate step {step_idx}/{step_count}")
+                else:
+                    # Restore callback for final step (though multi-step handler sends it)
+                    logger.info(f"📤 Final step {step_idx}/{step_count} - callback will be used by multi-step handler")
+                
                 # ✅ PERFORMANCE OPTIMIZATION: Use cached SQLs for FIRST step only
                 # Subsequent steps get fresh retrieval since they're different questions
                 if step_idx == 1:
@@ -588,24 +616,37 @@ class DBQueryAgent(BaseAgent):
                     "retrieved_examples": [
                         ex.get("question", "") if isinstance(ex, dict) else str(ex)[:60] 
                         for ex in step_specific_sqls[:3]
-                    ]
+                    ],
+                    # ✅ FIX: Include actual execution results for visualization
+                    "query_results": step_result.get("query_results", {}),
+                    "formatted_output": step_result.get("formatted_output", ""),
+                    "json_results": step_result.get("json_results", "[]")
                 }
                 
                 executed_steps.append(step_info)
                 all_sql_queries.append(step_result["sql"])
                 
-                # Store results for next step with enhanced metadata
+                # ✅ CRITICAL FIX: Store actual query results for multi-step generator
                 previous_results[f"step_{step_idx}"] = {
                     "sql": step_result["sql"],
                     "question": step_question,
                     "step_number": step_idx,
                     "context_count": len(step_specific_sqls),
                     "context_quality": step_result.get("context_quality", "unknown"),
-                    "retrieval_quality": "high" if len(step_specific_sqls) >= 3 else "low"
+                    "retrieval_quality": "high" if len(step_specific_sqls) >= 3 else "low",
+                    # ✅ Include actual query results for value extraction
+                    "query_results": step_result.get("query_results", {}),
+                    "formatted_output": step_result.get("formatted_output", ""),
+                    "json_results": step_result.get("json_results", "[]")
                 }
                 
                 logger.info(f"Step {step_idx} completed successfully")
                 logger.info("" + "-" * 80)
+            
+            # ✅ Restore original callback after loop
+            if original_callback:
+                state["table_callback"] = original_callback
+                logger.info("✅ Restored original table_callback after multi-step execution")
             
             final_sql = all_sql_queries[-1]  # Last query is usually the final answer
             
@@ -726,6 +767,27 @@ class DBQueryAgent(BaseAgent):
             # Add final query data for easy access by other agents
             db_state["query_data"] = final_query_results.get("data", [])
             
+            # ✅ SEND FINAL STEP TABLE VIA CALLBACK (not intermediate steps)
+            if state.get("table_callback") and final_query_results.get("data"):
+                try:
+                    logger.info("📤 Calling table_callback to send FINAL STEP data immediately")
+                    table_data = final_query_results.get("data", [])
+                    
+                    # Convert to JSON string if it's a list
+                    if isinstance(table_data, list):
+                        import json
+                        table_data = json.dumps(table_data)
+                    
+                    # Send table via callback
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(state["table_callback"](table_data))
+                    loop.close()
+                    logger.info("✅ FINAL STEP table sent via callback successfully")
+                except Exception as callback_error:
+                    logger.error(f"Failed to send table via callback: {callback_error}")
+            
             # Add to conversation history
             summary = f"Multi-step query with {step_count} steps completed. Final SQL: {final_sql}"
             self._add_to_conversation_history(state["query"], summary)
@@ -817,6 +879,18 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"Available context examples: {len(similar_sqls)}")
             logger.info(f"Previous results available: {len(previous_results)}")
             
+            # ✅ DETERMINE WHICH GENERATOR TO USE
+            # Use MultiStepSQLGenerator for Step 2+ (has previous_results)
+            # Use ImprovedSQLGenerator for Step 1 (no previous_results)
+            use_multi_step_generator = bool(previous_results)
+            
+            if use_multi_step_generator:
+                logger.info("🔄 Using MultiStepSQLGenerator (Step 2+, has previous results)")
+                active_generator = self.multi_step_sql_generator
+            else:
+                logger.info("🔄 Using ImprovedSQLGenerator (Step 1, no previous results)")
+                active_generator = self.sql_generator
+            
             # ✅ CRITICAL FIX: Ensure user_context is available in state for focused schema
             # During multi-step execution, user_context may not be in step state
             if state and "user_context" not in state and hasattr(self, 'user_context'):
@@ -826,7 +900,7 @@ class DBQueryAgent(BaseAgent):
             # Get conversation history from state (if available)
             conversation_history = state.get("conversation_history", []) if state else []
             
-            # Generate SQL using Improved SQL Generator
+            # Generate SQL using appropriate generator
             original_query = state.get("original_query", question)
             entity_info = state.get("entity_info", None)
             
@@ -854,7 +928,14 @@ class DBQueryAgent(BaseAgent):
                 entity_info["cached_focused_schema"] = cached_schema
                 logger.info(f"💾 Passing cached focused schema to SQL generator (multi-step)")
             
-            generation_result = self.sql_generator.generate_sql(
+            # ✅ Pass schema_manager to multi-step generator if available
+            if use_multi_step_generator and state and "user_context" in state:
+                user_context = state["user_context"]
+                if hasattr(user_context, 'schema_manager'):
+                    active_generator.schema_manager = user_context.schema_manager
+                    logger.info("✅ Passed schema_manager to MultiStepSQLGenerator")
+            
+            generation_result = active_generator.generate_sql(
                 question=question,
                 similar_sqls=similar_sqls,
                 previous_results=previous_results,
@@ -862,7 +943,9 @@ class DBQueryAgent(BaseAgent):
                 entity_info=entity_info,
                 conversation_history=conversation_history
             )
-            logger.info(f"Using Improved SQL Generator (method: {generation_result.get('method', 'unknown')})")
+            
+            generator_name = "Multi-Step SQL Generator" if use_multi_step_generator else "Improved SQL Generator"
+            logger.info(f"Using {generator_name} (method: {generation_result.get('method', 'unknown')})")
             
             if not generation_result["success"]:
                 return {
