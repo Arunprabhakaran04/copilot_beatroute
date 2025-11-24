@@ -166,17 +166,34 @@ class AgentAwareDecomposer:
                     }
         
         # PATTERN 3: Visualize followup (cached data + visualization)
-        viz_patterns = [
+        # CRITICAL: Only match if query is TRULY a followup ("that", "this", "it")
+        # DO NOT match if query contains data retrieval keywords ("get", "show", "top", "list", "sales", "trend")
+        viz_followup_patterns = [
             "visualize that", "visualize this", "visualize it",
             "chart that", "chart this", "graph that", "graph this",
-            "plot that", "plot this", "create a chart", "create a graph"
+            "plot that", "plot this"
         ]
         
-        if any(pattern in lowered for pattern in viz_patterns):
+        # Keywords indicating NEW data retrieval is needed (NOT a simple followup)
+        data_retrieval_keywords = [
+            "give me", "show me", "get me", "find", "list",
+            "top", "best", "highest", "lowest", "most",
+            "sales", "trend", "total", "count", "sum",
+            "last month", "this month", "last year", "this year",
+            "customers", "products", "skus", "orders", "users"
+        ]
+        
+        has_viz_followup = any(pattern in lowered for pattern in viz_followup_patterns)
+        has_data_retrieval = any(keyword in lowered for keyword in data_retrieval_keywords)
+        
+        logger.debug(f" Viz followup pattern: {has_viz_followup}, Data retrieval: {has_data_retrieval}")
+        
+        # Only treat as followup if it matches followup pattern AND does NOT have data retrieval keywords
+        if has_viz_followup and not has_data_retrieval:
             # Find most recent db_query result
             for entry in reversed(history):
                 if entry.get("agent_type") == "db_query" and entry.get("result"):
-                    logger.info(f" Heuristic: Visualization followup detected")
+                    logger.info(f" Heuristic: Visualization followup detected (no new data needed)")
                     return {
                         "is_multi_step": False,
                         "confidence": 0.90,
@@ -193,6 +210,14 @@ class AgentAwareDecomposer:
                         "decomposition_method": "heuristic_viz_followup",
                         "optimization_notes": "Using cached data for visualization."
                     }
+        
+        # If query has "and visualize" or "and also visualize" with data retrieval keywords,
+        # it's a multi-step query requiring db_query FIRST
+        if ("and visualize" in lowered or "also visualize" in lowered) and has_data_retrieval:
+            logger.info(f" Heuristic: Multi-step query detected (data + visualization)")
+            logger.debug(f"  → Query requires NEW data retrieval + visualization")
+            # Return None to trigger LLM decomposition for proper multi-step handling
+            return None
         
         # PATTERN 4: Summarize followup (cached data + summary)
         summary_patterns = [
@@ -275,6 +300,14 @@ You are an expert query decomposer with COMPLETE KNOWLEDGE of all available agen
    - summary agent REQUIRES data from db_query first
    - visualization agent REQUIRES data from db_query first
    - If Step 2 needs results from Step 1, they MUST be separate tasks
+
+⚠️ **CRITICAL PATTERN:** "get/show/give [data] and visualize"
+   - This ALWAYS requires TWO steps:
+     * Step 1: db_query to get the data
+     * Step 2: visualization using results from Step 1
+   - Example: "show sales trend and visualize" = db_query → visualization
+   - Example: "top 3 SKUs and also visualize" = db_query → visualization
+   - NEVER route directly to visualization without db_query first!
 
 ## Rule 3: AVOID REDUNDANT STEPS
 ❌ **NEVER** create redundant database queries:
@@ -399,7 +432,7 @@ Respond with this EXACT JSON structure:
                 output=content,
                 agent_type="agent_aware_decomposer",
                 operation="decomposition",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             analysis = self._safe_json_parse(content)
@@ -482,8 +515,16 @@ Respond with this EXACT JSON structure:
         query_lower = query.lower()
         
         is_multi = any(keyword in query_lower for keyword in [
-            "and then", "followed by", " and visualize", " and send", " and email"
+            "and then", "followed by", " and visualize", " and also visualize",
+            " and send", " and email", " and create", " and show"
         ])
+        
+        # Additional check: if query mentions visualization + data retrieval, it's multi-step
+        has_viz = any(kw in query_lower for kw in ["visualize", "chart", "graph", "plot"])
+        has_data = any(kw in query_lower for kw in ["give me", "show me", "get", "top", "sales", "trend"])
+        
+        if has_viz and has_data:
+            is_multi = True
         
         return {
             "is_multi_step": is_multi,

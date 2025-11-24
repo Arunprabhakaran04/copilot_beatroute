@@ -126,7 +126,7 @@ class SQLQueryDecomposer(BaseAgent):
                 output=content,
                 agent_type="sql_decomposer",
                 operation="analyze_query",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             try:

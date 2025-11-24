@@ -17,7 +17,7 @@ class SQLExceptionAgent(BaseAgent):
     This agent is designed to be extremely fault-tolerant and learns from patterns to improve.
     """
     
-    def __init__(self, llm, schema_file_path: str = None, max_iterations: int = 5):
+    def __init__(self, llm, schema_file_path: str = None, max_iterations: int = 3):
         super().__init__(llm)
         self.schema_file_path = schema_file_path
         self.max_iterations = max_iterations
@@ -393,7 +393,7 @@ Respond in JSON format:
                 output=content,
                 agent_type="sql_exception",
                 operation="analyze_error",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
@@ -501,7 +501,10 @@ relationships between tables. The ONLY solution is to use fewer tables - often j
 FOR SALES QUERIES - FIELD NAMES (CRITICAL - Use EXACT names from schema):
 - CustomerInvoice (invoice level): dispatchedvalue, netvalue, discount, dispatchedDate (date), item_discount
 - CustomerInvoiceDetail (item level): skuAmount, taxAmount, sellingQuantity, base_quantity, dispatch_date (date)
+- ViewCustomer (customer info): name, mobile, email, city, district, state, subType, subTypeId, class, classId, chain, chainId
 - CRITICAL: Note the difference - CustomerInvoice uses 'dispatchedDate' but CustomerInvoiceDetail uses 'dispatch_date'
+- CRITICAL: ViewCustomer has 'subType' NOT 'category' - use ViewCustomer.subType for customer categorization
+- CRITICAL: For doctor/retailer categorization, use ViewCustomer.subType field (e.g., WHERE ViewCustomer.subType = 'Doctors')
 
 WORKING PATTERN FOR SALES TRENDS (Invoice Level):
 ```sql
@@ -513,14 +516,30 @@ WHERE CustomerInvoice.dispatchedDate >= DATE_TRUNC('quarter', CURRENT_DATE - INT
   AND CustomerInvoice.dispatchedDate < DATE_TRUNC('quarter', CURRENT_DATE)
 ```
 
-CUBE.JS SQL API CRITICAL RULES:
-1. MINIMAL TABLES - Use 1 table if possible, maximum 2
-2. ONLY use CROSS JOIN if multiple tables needed
-3. NO JOIN conditions with ON clauses  
-4. Use MEASURE() function ONLY inside WITH clauses
-5. NEVER use SELECT * - always specify exact columns
-6. Use DATE_TRUNC() for all date operations
-7. CustomerInvoice table contains most sales data needed
+CUBE.JS SQL API CRITICAL RULES (STRICTLY FOLLOW):
+1. **JOINS**: STRICTLY ONLY USE CROSS JOIN - DO NOT USE INNER JOIN, LEFT JOIN, RIGHT JOIN, or FULL JOIN
+2. **NO JOIN CONDITIONS**: DO NOT USE 'ON' CLAUSE with joins - use WHERE clause for filtering instead
+3. **NO SELECT ***: ALWAYS specify exact columns - SELECT * is forbidden
+4. **MEASURE()**: Use MEASURE() ONLY inside WITH clauses - Use SUM/COUNT/AVG outside WITH clauses
+5. **FORBIDDEN FUNCTIONS**: DO NOT USE TO_CHAR(), EXTRACT(), COALESCE(), GET_DATE() - these are not supported
+6. **DATE OPERATIONS**: Use DATE_TRUNC() for all date operations
+7. **MINIMAL TABLES**: Use 1 table if possible, maximum 2 tables to avoid join path errors
+8. **NO ALIASES IN WHERE**: Do not use column aliases in WHERE clause
+9. **WITH CLAUSE**: When using WITH clause, always assign aliases and use GROUP BY inside it
+10. **NO SUBQUERIES IN WHERE**: Never use subqueries in WHERE clause
+11. **CROSS JOIN ONLY**: Even when joining tables, use CROSS JOIN without ON conditions
+
+WRONG EXAMPLES (DO NOT DO THIS):
+❌ SELECT ViewCustomer.name FROM CustomerInvoice JOIN ViewCustomer ON CustomerInvoice.customer_id = ViewCustomer.id
+❌ SELECT * FROM CustomerInvoice
+❌ SELECT TO_CHAR(date_field, 'YYYY-MM-DD') FROM CustomerInvoice
+❌ SELECT COUNT(DISTINCT ViewCustomer.id) FROM ViewCustomer
+
+CORRECT EXAMPLES (FOLLOW THIS):
+✅ SELECT ViewCustomer.name FROM CustomerInvoice CROSS JOIN ViewCustomer WHERE [conditions]
+✅ SELECT CustomerInvoice.dispatchedvalue, CustomerInvoice.dispatchedDate FROM CustomerInvoice
+✅ SELECT DATE_TRUNC('month', CustomerInvoice.dispatchedDate) FROM CustomerInvoice
+✅ SELECT MEASURE(ViewCustomer.count) FROM ViewCustomer
 
 STRATEGIC FIX FOR "{fix_strategy}":
 {self._get_strategy_specific_instructions(fix_strategy, error_analysis)}
@@ -536,6 +555,13 @@ CRITICAL FOR THIS QUERY "{original_question}":
 - For sales data (item level): CustomerInvoiceDetail.skuAmount, CustomerInvoiceDetail.dispatch_date (note: dispatch_date not dispatchedDate!)
 - If query involves SKUs → Must use CustomerInvoiceDetail table
 - Use minimal tables but ensure correct field names from schema
+
+COMMON FIELD NAME CORRECTIONS (USE THE SCHEMA):
+- If error mentions "ViewCustomer.category" → Use ViewCustomer.subType instead (category doesn't exist)
+- If question mentions "doctors", "retailers", "category" → Use ViewCustomer.subType field
+- ViewCustomerActivity has: activityTime (for visit date/time)
+- ViewCustomer and ViewCustomerActivity can be CROSS JOINed to get customer visits
+- For customer visits: Use ViewCustomerActivity table with activityTime field for date filtering
 
 TIME-BASED AGGREGATION PATTERNS (FIELD NAMES MUST MATCH SCHEMA):
 - Monthly (Invoice): SELECT DATE_TRUNC('month', CustomerInvoice.dispatchedDate), SUM(dispatchedvalue) GROUP BY DATE_TRUNC('month', CustomerInvoice.dispatchedDate)
@@ -587,7 +613,7 @@ Always return valid JSON with the corrected SQL or failure explanation."""
                 output=content,
                 agent_type="sql_exception",
                 operation="fix_sql",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             logger.debug(f"LLM response for SQL correction: {content[:300]}...")
@@ -1105,9 +1131,9 @@ LIMIT 100;"""
         # Use focused schema if provided, otherwise fall back to schema_content
         schema_to_use = focused_schema if focused_schema else self.schema_content
         if focused_schema:
-            logger.info("✅ Using focused schema from UserContext")
+            logger.info(f"✅ Using focused schema from UserContext ({len(focused_schema)} chars)")
         elif self.schema_content:
-            logger.info("📄 Using schema from file")
+            logger.info(f"📄 Using schema from file ({len(self.schema_content)} chars)")
         else:
             logger.warning("⚠️ No schema available for SQL fixing")
         

@@ -30,7 +30,7 @@ class VisualizationAgent(BaseAgent):
     Creates static image files stored in the visualizations directory for frontend integration.
     """
     
-    def __init__(self, llm, model_name: str = "gpt-4o"):
+    def __init__(self, llm, model_name: str = "gpt-4.1-mini"):
         super().__init__(llm)
         self.model_name = model_name
         self.visualizations_dir = os.path.join(os.path.dirname(__file__), "visualizations")
@@ -217,9 +217,22 @@ class VisualizationAgent(BaseAgent):
             if 'query_results' in result_data:
                 query_results = result_data['query_results']
                 if isinstance(query_results, dict):
-                    if 'data' in query_results and isinstance(query_results['data'], list):
-                        logger.info("Converting query_results data to DataFrame")
-                        return pd.DataFrame(query_results['data'])
+                    if 'data' in query_results:
+                        data = query_results['data']
+                        
+                        # Handle JSON string (common format from db_query_agent)
+                        if isinstance(data, str):
+                            try:
+                                data = json.loads(data)
+                                logger.info(f"✅ Parsed query_results['data'] from JSON string: {len(data)} rows")
+                            except json.JSONDecodeError as e:
+                                logger.error(f"❌ Failed to parse query_results['data'] as JSON: {e}")
+                                data = None
+                        
+                        # Convert to DataFrame if it's a list
+                        if isinstance(data, list) and len(data) > 0:
+                            logger.info("Converting query_results data to DataFrame")
+                            return pd.DataFrame(data)
             
             # Case 4: Direct list of dictionaries
             if isinstance(result_data, list) and len(result_data) > 0:

@@ -8,7 +8,8 @@ from loguru import logger
 from langchain.prompts import ChatPromptTemplate
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from sql_query_decomposer import SQLQueryDecomposer
-from sql_generator_agent import SQLGeneratorAgent
+from improved_sql_generator import ImprovedSQLGenerator
+from multi_step_sql_generator import MultiStepSQLGenerator
 from sql_exception_agent import SQLExceptionAgent
 from summary_agent import SummaryAgent
 from db_connection import get_database_connection, execute_sql
@@ -16,8 +17,9 @@ from token_tracker import track_llm_call, get_token_tracker
 
 class DBQueryAgent(BaseAgent):
     """
-    DB Query Agent now works as an orchestrator for handling both simple and complex multi-step SQL queries.
-    It coordinates between the SQL Query Decomposer and SQL Generator agents.
+    DB Query Agent orchestrator for handling both simple and complex multi-step SQL queries.
+    Uses ImprovedSQLGenerator for single-step and Step 1 of multi-step queries.
+    Uses MultiStepSQLGenerator for Step 2+ of multi-step queries (stricter Cube.js rules).
     """
     
     def __init__(self, llm, schema_file_path: str = None):
@@ -25,28 +27,24 @@ class DBQueryAgent(BaseAgent):
         self.schema_file_path = schema_file_path  # Kept for backward compatibility, not used
         
         # Initialize sub-agents (schema will come from UserContext)
-        self.sql_generator = SQLGeneratorAgent(llm, schema_file_path=None)
+        self.sql_generator = ImprovedSQLGenerator(llm, schema_file_path=None)
+        self.multi_step_sql_generator = MultiStepSQLGenerator(llm, schema_file_path=None)
         self.exception_agent = SQLExceptionAgent(llm, schema_file_path=None, max_iterations=5)
-        self.summary_agent = SummaryAgent(llm, "gpt-4o")  # Add summary agent
+        self.summary_agent = SummaryAgent(llm, "gpt-4o-mini")
         self.conversation_history = []  
         
         self.decomposer = SQLQueryDecomposer(llm)
         
-        # Add improved SQL generator
-        try:
-            from improved_sql_generator import ImprovedSQLGenerator
-            self.improved_sql_generator = ImprovedSQLGenerator(llm, schema_file_path=None)
-            logger.info("  - Improved SQL Generator: ENABLED (for better accuracy)")
-        except ImportError:
-            logger.warning("  - Improved SQL Generator: NOT AVAILABLE (using fallback)")
-            self.improved_sql_generator = None
+        # Keep reference as improved_sql_generator for compatibility
+        self.improved_sql_generator = self.sql_generator
         
         try:
             from sql_retriever_agent import SQLRetrieverAgent
             self.sql_retriever = SQLRetrieverAgent(llm, "embeddings.pkl")
             logger.info("DBQueryAgent initialized as orchestrator with sub-agents:")
             logger.info("  - SQL Query Decomposer: for multi-step analysis")
-            logger.info("  - SQL Generator: for individual query generation")
+            logger.info("  - Improved SQL Generator: for single-step & Step 1 of multi-step")
+            logger.info("  - Multi-Step SQL Generator: for Step 2+ of multi-step (strict Cube.js rules)")
             logger.info("  - SQL Retriever: for step-specific context retrieval")
             logger.info("  - SQL Exception Agent: for error analysis and fixing")
             logger.info("  - Summary Agent: for generating data summaries")
@@ -55,7 +53,8 @@ class DBQueryAgent(BaseAgent):
             self.sql_retriever = None
             logger.info("DBQueryAgent initialized as orchestrator with sub-agents:")
             logger.info("  - SQL Query Decomposer: for multi-step analysis")
-            logger.info("  - SQL Generator: for individual query generation")
+            logger.info("  - Improved SQL Generator: for single-step & Step 1")
+            logger.info("  - Multi-Step SQL Generator: for Step 2+ (strict Cube.js rules)")
             logger.info("  - SQL Retriever: NOT AVAILABLE (will use fallback)")
             logger.info("  - SQL Exception Agent: for error analysis and fixing")
             logger.info("  - Summary Agent: for generating data summaries")
@@ -235,10 +234,24 @@ class DBQueryAgent(BaseAgent):
         try:
             logger.info("Processing single-step query")
             
-            # ✅ FIX: Retrieve SQL examples for single-step queries too!
-            # Previously only multi-step queries retrieved examples, causing single-step to generate wrong SQL
-            logger.info("🔍 Retrieving SQL examples for single-step query...")
-            retrieved_sqls = self._retrieve_step_specific_sqls(state["query"])
+            # ✅ PERFORMANCE OPTIMIZATION: Use cached SQLs from EnrichAgent if available
+            cached_sqls = state.get("cached_retrieved_sqls", [])
+            cache_source = state.get("cache_source_query", "")
+            retrieval_query = state.get("original_query", state["query"])
+            
+            # Validate cache: ensure it's for the SAME question (cache invalidation)
+            if cached_sqls and cache_source == retrieval_query:
+                logger.info(f"💾 Using cached SQL examples from EnrichAgent: {len(cached_sqls)} SQLs")
+                logger.info(f"   Cache is valid for query: '{cache_source}'")
+                retrieved_sqls = cached_sqls
+            else:
+                # Cache miss or invalid - retrieve fresh
+                if cached_sqls:
+                    logger.warning(f"❌ Cache invalid: source='{cache_source}' vs current='{retrieval_query}'")
+                logger.info(f"🔍 Retrieving SQL examples for: '{retrieval_query}'")
+                if retrieval_query != state["query"]:
+                    logger.info(f"   (Enriched query: '{state['query']}')")
+                retrieved_sqls = self._retrieve_step_specific_sqls(retrieval_query)
             
             # Check if this is part of a multi-step workflow (has intermediate_results from previous steps)
             intermediate_results = state.get("intermediate_results", {})
@@ -256,7 +269,43 @@ class DBQueryAgent(BaseAgent):
             
             logger.info(f"📚 Passing {len(retrieved_sqls)} SQL examples to generator")
             
-            result_state = self.sql_generator.process(generator_state)
+            # Use Improved SQL Generator for all SQL generation
+            logger.info("Using Improved SQL Generator for single-step query")
+            
+            # Get entity info and conversation history
+            entity_info = state.get("verified_entities", {})
+            conversation_history = state.get("conversation_history", [])
+            
+            # ✅ PERFORMANCE OPTIMIZATION: Pass cached focused schema to SQL generator
+            cached_schema = state.get("cached_focused_schema", "")
+            if cached_schema and not entity_info:
+                entity_info = {}
+            if cached_schema:
+                entity_info["cached_focused_schema"] = cached_schema
+                logger.info(f"💾 Passing cached focused schema to SQL generator ({len(cached_schema)} chars)")
+            
+            generation_result = self.sql_generator.generate_sql(
+                question=state["query"],
+                similar_sqls=retrieved_sqls,
+                previous_results=state.get("previous_step_results", {}),
+                original_query=state.get("original_query", state["query"]),
+                entity_info=entity_info,
+                conversation_history=conversation_history
+            )
+            
+            # Convert to expected format
+            if generation_result.get("success"):
+                result_state = {
+                    "status": "completed",
+                    "sql_query": generation_result["sql"],
+                    "query_type": generation_result.get("query_type", "SELECT"),
+                    "explanation": generation_result.get("explanation", "Generated with Improved SQL Generator")
+                }
+            else:
+                result_state = {
+                    "status": "failed",
+                    "error_message": generation_result.get("error", "SQL generation failed")
+                }
             
             logger.info(f"🔍 SQL GENERATOR RESULT:")
             logger.info(f"   Type: {type(result_state)}")
@@ -310,21 +359,33 @@ class DBQueryAgent(BaseAgent):
                         query_data_df = None
                     
                     # Send table data immediately via callback (before summary generation)
+                    # 🚫 DO NOT send intermediate step tables in multi-step queries
                     table_sent_via_callback = False
+                    is_multi_step = state.get("is_multi_step", False)
+                    current_step = state.get("current_step", 1)
+                    total_steps = state.get("total_steps", 1)
+                    is_final_step = (current_step == total_steps)
+                    
+                    # Only send table if: (1) single-step query, OR (2) final step of multi-step
+                    should_send_table = (not is_multi_step) or is_final_step
+                    
                     if state.get("table_callback") and execution_result.get("query_results"):
-                        try:
-                            table_data = execution_result["query_results"].get("data")
-                            if table_data:
-                                logger.info("Calling table_callback to send data immediately")
-                                import asyncio
-                                loop = asyncio.new_event_loop()
-                                loop.run_until_complete(state["table_callback"](table_data))
-                                loop.close()
-                                table_sent_via_callback = True
-                                logger.info("Table sent via callback successfully")
-                        except Exception as cb_error:
-                            logger.error(f"Table callback failed: {cb_error}")
-                            table_sent_via_callback = False
+                        if should_send_table:
+                            try:
+                                table_data = execution_result["query_results"].get("data")
+                                if table_data:
+                                    logger.info(f"📤 Calling table_callback to send data immediately (step {current_step}/{total_steps})")
+                                    import asyncio
+                                    loop = asyncio.new_event_loop()
+                                    loop.run_until_complete(state["table_callback"](table_data))
+                                    loop.close()
+                                    table_sent_via_callback = True
+                                    logger.info("✅ Table sent via callback successfully")
+                            except Exception as cb_error:
+                                logger.error(f"❌ Table callback failed: {cb_error}")
+                                table_sent_via_callback = False
+                        else:
+                            logger.info(f"⏭️ Skipping table callback for intermediate step {current_step}/{total_steps}")
                     
                     # Generate summary using Summary Agent
                     logger.info("Generating summary for query results...")
@@ -477,8 +538,34 @@ class DBQueryAgent(BaseAgent):
                 logger.info(f" EXECUTING MULTI-STEP QUERY - STEP {step_idx}/{step_count}")
                 logger.info(f"Step {step_idx} Question: {step_question}")
                 
-                # Retrieve SQL examples specific to this step
-                step_specific_sqls = self._retrieve_step_specific_sqls(step_question)
+                # 🚫 CRITICAL: Remove table_callback for intermediate steps
+                # Only the final step (handled by multi-step handler) should send tables
+                original_callback = state.get("table_callback")
+                if step_idx < step_count:
+                    # Temporarily remove callback for intermediate steps
+                    state["table_callback"] = None
+                    logger.info(f"⏭️ Suppressing table_callback for intermediate step {step_idx}/{step_count}")
+                else:
+                    # Restore callback for final step (though multi-step handler sends it)
+                    logger.info(f"📤 Final step {step_idx}/{step_count} - callback will be used by multi-step handler")
+                
+                # ✅ PERFORMANCE OPTIMIZATION: Use cached SQLs for FIRST step only
+                # Subsequent steps get fresh retrieval since they're different questions
+                if step_idx == 1:
+                    cached_sqls = state.get("cached_retrieved_sqls", [])
+                    cache_source = state.get("cache_source_query", "")
+                    original_query = state.get("original_query", state["query"])
+                    
+                    # Validate cache for first step (should match original query)
+                    if cached_sqls and cache_source == original_query:
+                        logger.info(f"💾 Using cached SQL examples for step 1: {len(cached_sqls)} SQLs")
+                        step_specific_sqls = cached_sqls
+                    else:
+                        logger.info(f"🔍 Cache miss for step 1 - retrieving fresh examples")
+                        step_specific_sqls = self._retrieve_step_specific_sqls(step_question)
+                else:
+                    # For steps 2+, always retrieve fresh (different questions)
+                    step_specific_sqls = self._retrieve_step_specific_sqls(step_question)
                 
                 logger.info(f" Retrieved {len(step_specific_sqls)} SQL examples for step {step_idx}")
                 if step_specific_sqls:
@@ -529,24 +616,37 @@ class DBQueryAgent(BaseAgent):
                     "retrieved_examples": [
                         ex.get("question", "") if isinstance(ex, dict) else str(ex)[:60] 
                         for ex in step_specific_sqls[:3]
-                    ]
+                    ],
+                    # ✅ FIX: Include actual execution results for visualization
+                    "query_results": step_result.get("query_results", {}),
+                    "formatted_output": step_result.get("formatted_output", ""),
+                    "json_results": step_result.get("json_results", "[]")
                 }
                 
                 executed_steps.append(step_info)
                 all_sql_queries.append(step_result["sql"])
                 
-                # Store results for next step with enhanced metadata
+                # ✅ CRITICAL FIX: Store actual query results for multi-step generator
                 previous_results[f"step_{step_idx}"] = {
                     "sql": step_result["sql"],
                     "question": step_question,
                     "step_number": step_idx,
                     "context_count": len(step_specific_sqls),
                     "context_quality": step_result.get("context_quality", "unknown"),
-                    "retrieval_quality": "high" if len(step_specific_sqls) >= 3 else "low"
+                    "retrieval_quality": "high" if len(step_specific_sqls) >= 3 else "low",
+                    # ✅ Include actual query results for value extraction
+                    "query_results": step_result.get("query_results", {}),
+                    "formatted_output": step_result.get("formatted_output", ""),
+                    "json_results": step_result.get("json_results", "[]")
                 }
                 
                 logger.info(f"Step {step_idx} completed successfully")
                 logger.info("" + "-" * 80)
+            
+            # ✅ Restore original callback after loop
+            if original_callback:
+                state["table_callback"] = original_callback
+                logger.info("✅ Restored original table_callback after multi-step execution")
             
             final_sql = all_sql_queries[-1]  # Last query is usually the final answer
             
@@ -667,6 +767,27 @@ class DBQueryAgent(BaseAgent):
             # Add final query data for easy access by other agents
             db_state["query_data"] = final_query_results.get("data", [])
             
+            # ✅ SEND FINAL STEP TABLE VIA CALLBACK (not intermediate steps)
+            if state.get("table_callback") and final_query_results.get("data"):
+                try:
+                    logger.info("📤 Calling table_callback to send FINAL STEP data immediately")
+                    table_data = final_query_results.get("data", [])
+                    
+                    # Convert to JSON string if it's a list
+                    if isinstance(table_data, list):
+                        import json
+                        table_data = json.dumps(table_data)
+                    
+                    # Send table via callback
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(state["table_callback"](table_data))
+                    loop.close()
+                    logger.info("✅ FINAL STEP table sent via callback successfully")
+                except Exception as callback_error:
+                    logger.error(f"Failed to send table via callback: {callback_error}")
+            
             # Add to conversation history
             summary = f"Multi-step query with {step_count} steps completed. Final SQL: {final_sql}"
             self._add_to_conversation_history(state["query"], summary)
@@ -758,6 +879,18 @@ class DBQueryAgent(BaseAgent):
             logger.info(f"Available context examples: {len(similar_sqls)}")
             logger.info(f"Previous results available: {len(previous_results)}")
             
+            # ✅ DETERMINE WHICH GENERATOR TO USE
+            # Use MultiStepSQLGenerator for Step 2+ (has previous_results)
+            # Use ImprovedSQLGenerator for Step 1 (no previous_results)
+            use_multi_step_generator = bool(previous_results)
+            
+            if use_multi_step_generator:
+                logger.info("🔄 Using MultiStepSQLGenerator (Step 2+, has previous results)")
+                active_generator = self.multi_step_sql_generator
+            else:
+                logger.info("🔄 Using ImprovedSQLGenerator (Step 1, no previous results)")
+                active_generator = self.sql_generator
+            
             # ✅ CRITICAL FIX: Ensure user_context is available in state for focused schema
             # During multi-step execution, user_context may not be in step state
             if state and "user_context" not in state and hasattr(self, 'user_context'):
@@ -767,62 +900,52 @@ class DBQueryAgent(BaseAgent):
             # Get conversation history from state (if available)
             conversation_history = state.get("conversation_history", []) if state else []
             
-            # Generate SQL for this step - use improved generator if available
-            if hasattr(self, 'improved_sql_generator') and self.improved_sql_generator:
-                original_query = state.get("original_query", question)
-                entity_info = state.get("entity_info", None)  # Get entity info from state
-                
-                # ✅ FIXED: Better entity_info validation and fallback
-                if entity_info is None:
-                    # Try alternative state keys where entity info might be stored
-                    entity_info = state.get("verified_entities", None)
-                    if entity_info:
-                        logger.info(f"✅ Found entity_info under 'verified_entities' key")
-                    else:
-                        logger.warning(f"⚠️ No entity_info in state. Available keys: {list(state.keys())}")
-                        # Create empty entity_info structure to prevent downstream errors
-                        entity_info = {
-                            "entities": [],
-                            "entity_types": [],
-                            "entity_mapping": {},
-                            "verified_entities": {}
-                        }
+            # Generate SQL using appropriate generator
+            original_query = state.get("original_query", question)
+            entity_info = state.get("entity_info", None)
+            
+            # Validate and get entity_info
+            if entity_info is None:
+                entity_info = state.get("verified_entities", None)
+                if entity_info:
+                    logger.info(f"Found entity_info under 'verified_entities' key")
                 else:
-                    logger.info(f"✅ Entity info available: {len(entity_info.get('entities', []))} entities")
-                
-                generation_result = self.improved_sql_generator.generate_sql(
-                    question=question,
-                    similar_sqls=similar_sqls,
-                    previous_results=previous_results,
-                    original_query=original_query,
-                    entity_info=entity_info,  # Pass entity info to SQL generator
-                    conversation_history=conversation_history  # Pass conversation history
-                )
-                logger.info(f"Using improved SQL generator (method: {generation_result.get('method', 'unknown')})")
+                    logger.warning(f"No entity_info in state. Available keys: {list(state.keys())}")
+                    entity_info = {
+                        "entities": [],
+                        "entity_types": [],
+                        "entity_mapping": {},
+                        "verified_entities": {}
+                    }
             else:
-                entity_info = state.get("entity_info", None)
-                
-                # ✅ FIXED: Same validation for standard generator
-                if entity_info is None:
-                    entity_info = state.get("verified_entities", None)
-                    if entity_info:
-                        logger.info(f"✅ Found entity_info under 'verified_entities' key (standard gen)")
-                    else:
-                        logger.warning(f"⚠️ No entity_info in state (standard gen)")
-                        entity_info = {
-                            "entities": [],
-                            "entity_types": [],
-                            "entity_mapping": {},
-                            "verified_entities": {}
-                        }
-                
-                generation_result = self.sql_generator.generate_sql(
-                    question=question,
-                    similar_sqls=similar_sqls,
-                    previous_results=previous_results,
-                    entity_info=entity_info  # Pass entity info here too
-                )
-                logger.info("Using standard SQL generator")
+                logger.info(f"Entity info available: {len(entity_info.get('entities', []))} entities")
+            
+            # ✅ PERFORMANCE OPTIMIZATION: Pass cached focused schema for multi-step queries
+            cached_schema = state.get("cached_focused_schema", "") if state else ""
+            if cached_schema and not entity_info:
+                entity_info = {}
+            if cached_schema:
+                entity_info["cached_focused_schema"] = cached_schema
+                logger.info(f"💾 Passing cached focused schema to SQL generator (multi-step)")
+            
+            # ✅ Pass schema_manager to multi-step generator if available
+            if use_multi_step_generator and state and "user_context" in state:
+                user_context = state["user_context"]
+                if hasattr(user_context, 'schema_manager'):
+                    active_generator.schema_manager = user_context.schema_manager
+                    logger.info("✅ Passed schema_manager to MultiStepSQLGenerator")
+            
+            generation_result = active_generator.generate_sql(
+                question=question,
+                similar_sqls=similar_sqls,
+                previous_results=previous_results,
+                original_query=original_query,
+                entity_info=entity_info,
+                conversation_history=conversation_history
+            )
+            
+            generator_name = "Multi-Step SQL Generator" if use_multi_step_generator else "Improved SQL Generator"
+            logger.info(f"Using {generator_name} (method: {generation_result.get('method', 'unknown')})")
             
             if not generation_result["success"]:
                 return {
@@ -1003,6 +1126,42 @@ class DBQueryAgent(BaseAgent):
             
             logger.info(f" SQL EXECUTION FAILED - INVOKING EXCEPTION AGENT")
             logger.info(f"Error: {execution_result['error']}")
+            
+            # Check if error is due to non-existent field/column (graceful handling)
+            error_msg = execution_result['error'].lower()
+            if "no field named" in error_msg or "column does not exist" in error_msg:
+                logger.info("🔍 Detected missing field/column error - checking if data exists...")
+                
+                # Extract the missing field name from error message
+                import re
+                field_match = re.search(r"no field named '([^']+)'", execution_result['error'], re.IGNORECASE)
+                if field_match:
+                    missing_field = field_match.group(1)
+                    logger.info(f"❌ Field '{missing_field}' does not exist in schema")
+                    
+                    # Check if this is a filter condition (e.g., category='Doctors')
+                    if "category" in missing_field.lower() or "subtype" in missing_field.lower():
+                        logger.info("💡 Graceful handling: Returning empty result (no data matches criteria)")
+                        
+                        return {
+                            "success": True,
+                            "final_sql": sql_query,
+                            "message": f"No data found - field '{missing_field}' does not exist in the database schema",
+                            "attempts": 1,
+                            "query_results": {
+                                "data": [],
+                                "columns": [],
+                                "summary": {
+                                    "total_rows": 0,
+                                    "columns_count": 0,
+                                    "query_type": "SELECT"
+                                }
+                            },
+                            "formatted_output": "No data found matching your criteria. The requested field does not exist in the database.",
+                            "json_results": "[]",
+                            "graceful_empty": True,
+                            "graceful_reason": f"Field '{missing_field}' does not exist in schema"
+                        }
             
             fix_result = self.exception_agent.iterative_fix_sql(
                 original_question=original_question,

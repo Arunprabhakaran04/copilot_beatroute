@@ -30,6 +30,10 @@ class BaseAgentState(TypedDict):
     conversation_history: List[Dict[str, Any]]
     # Table callback for immediate streaming
     table_callback: Optional[Any]
+    # Caching for performance optimization (per-question cache)
+    cached_retrieved_sqls: Optional[List[Dict[str, Any]]]  # 20 retrieved SQL examples
+    cached_focused_schema: Optional[str]  # Focused schema from SchemaManager
+    cache_source_query: Optional[str]  # Original query used to generate cache (for invalidation)
 
 class MeetingAgentState(BaseAgentState):
     meeting_date: str

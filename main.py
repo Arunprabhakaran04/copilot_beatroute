@@ -49,14 +49,14 @@ class CentralOrchestrator:
             raise ValueError("OPENAI_API_KEY not found in environment variables.")
         
         self.llm = ChatOpenAI(
-            model="gpt-4o",
+            model="gpt-4.1-mini",
             api_key=openai_api_key,
             temperature=0.1,
             max_tokens=1000
         )
         
         self.db_llm = ChatOpenAI(
-            model="gpt-4o", 
+            model="gpt-4.1-mini", 
             api_key=openai_api_key,
             temperature=0.1,
             max_tokens=2000
@@ -66,26 +66,26 @@ class CentralOrchestrator:
         self.schema_file_path = schema_file_path
         
         self.agents = {
-            "entity_verification": EntityVerificationAgent(self.llm, execute_sql, "gpt-4o"),
+            "entity_verification": EntityVerificationAgent(self.llm, execute_sql, "gpt-4.1-mini"),
             "db_query": DBQueryAgent(self.db_llm, schema_file_path),
             "email": EmailAgent(self.llm),
             "meeting": MeetingSchedulerAgent(self.llm, files_directory),
             "campaign": CampaignAgent(self.llm),
             "sql_retriever": SQLRetrieverAgent(self.db_llm, "embeddings.pkl"),
-            "summary": SummaryAgent(self.db_llm, "gpt-4o"),
-            "visualization": VisualizationAgent(self.db_llm, "gpt-4o"),
+            "summary": SummaryAgent(self.db_llm, "gpt-4.1-mini"),
+            "visualization": VisualizationAgent(self.db_llm, "gpt-4.1-mini"),
             # Note: ImprovedSQLGenerator will be recreated per-request with user_context
             "improved_sql_generator": ImprovedSQLGenerator(self.db_llm, schema_file_path=None)
         }
         
         logger.info("Initialized CentralOrchestrator with:")
-        logger.info(f"  - Entity Verification Agent: OpenAI GPT-4o (for entity validation)")
-        logger.info(f"  - DB Query Agent: OpenAI GPT-4o (orchestrator with multi-step capability)")
-        logger.info(f"  - Email Agent: OpenAI GPT-4o")
-        logger.info(f"  - Meeting Agent: OpenAI GPT-4o")
-        logger.info(f"  - SQL Retriever Agent: OpenAI GPT-4o (for embeddings and retrieval)")
-        logger.info(f"  - Summary Agent: OpenAI GPT-4o (for data summarization)")
-        logger.info(f"  - Visualization Agent: OpenAI GPT-4o (for data visualization)")
+        logger.info(f"  - Entity Verification Agent: OpenAI GPT-4.1-mini (for entity validation)")
+        logger.info(f"  - DB Query Agent: OpenAI GPT-4.1-mini (orchestrator with multi-step capability)")
+        logger.info(f"  - Email Agent: OpenAI GPT-4.1-mini")
+        logger.info(f"  - Meeting Agent: OpenAI GPT-4.1-mini")
+        logger.info(f"  - SQL Retriever Agent: OpenAI GPT-4.1-mini (for embeddings and retrieval)")
+        logger.info(f"  - Summary Agent: OpenAI GPT-4.1-mini (for data summarization)")
+        logger.info(f"  - Visualization Agent: OpenAI GPT-4.1-mini (for data visualization)")
         
         self.classification_keywords = {
             "db_query": [
@@ -181,11 +181,11 @@ class CentralOrchestrator:
         self.enrich_agent = EnrichAgent(
             openai_client=self.openai_client,
             sql_retriever_agent=self.agents["sql_retriever"],
-            model="gpt-4o",
+            model="gpt-4.1-mini",
             max_tokens=2000,
             temperature=0.3
         )
-        logger.info("  - Enrich Agent: OpenAI GPT-4o (for intelligent query enrichment)")
+        logger.info("  - Enrich Agent: OpenAI GPT-4.1-mini (for intelligent query enrichment)")
         
         self.graph = self._build_orchestrator_graph()
     
@@ -248,7 +248,9 @@ class CentralOrchestrator:
         """Central thinking agent that orchestrates multi-step queries"""
         try:
             if state.get("current_step", 0) == 0:
-                state["original_query"] = state["query"]
+                # Only set original_query if not already set (preserve the true original from process_query)
+                if "original_query" not in state or not state["original_query"]:
+                    state["original_query"] = state["query"]
                 state["completed_steps"] = []
                 state["intermediate_results"] = {}
                 state["current_step"] = 1
@@ -872,7 +874,7 @@ class CentralOrchestrator:
                 output=content,
                 agent_type="orchestrator", 
                 operation="query_decomposition",
-                model_name="gpt-4o"
+                model_name="gpt-4.1-mini"
             )
             
             # Parse tasks
@@ -1437,11 +1439,26 @@ class CentralOrchestrator:
             if state["agent_type"] == "visualization":
                 return self._handle_visualization_routing(state, agent)
             
-            # ❌ REMOVED: Duplicate SQL retrieval (db_query_agent handles this internally)
-            # The db_query_agent will retrieve step-specific SQLs for each decomposed question
-            # Retrieving here creates wasteful duplicate calls and stale context
-            
-            result_state = agent.process(state)
+            # Special handling for meeting agent - needs session_id and user_id for DB access
+            if state["agent_type"] == "meeting":
+                session_id = state.get("session_id")
+                user_id = state.get("user_id")
+                auth_token = os.getenv("BEATROUTE_AUTH_TOKEN")
+                
+                # Recreate meeting agent with current session context
+                meeting_agent = MeetingSchedulerAgent(
+                    llm=self.llm,
+                    auth_token=auth_token,
+                    user_id=user_id,
+                    session_id=session_id
+                )
+                result_state = meeting_agent.process(state)
+            else:
+                # ❌ REMOVED: Duplicate SQL retrieval (db_query_agent handles this internally)
+                # The db_query_agent will retrieve step-specific SQLs for each decomposed question
+                # Retrieving here creates wasteful duplicate calls and stale context
+                
+                result_state = agent.process(state)
             
             if "session_id" in state and "user_id" in state:
                 self.classification_validator.validate_classification(
@@ -2006,10 +2023,10 @@ class CentralOrchestrator:
             # Get conversation history from Redis
             conversation_history = self.memory.get_recent(session_id, n=5, user_id=user_id)
             
-            # Update EnrichAgent with schema_manager if user_context is provided
+            # Update EnrichAgent with user_context metadata if provided
             if user_context is not None and user_context.is_schema_loaded():
-                self.enrich_agent.schema_manager = user_context.get_schema_manager()
-                logger.info("EnrichAgent now using focused schema from UserContext")
+                self.enrich_agent.update_user_context(user_context)
+                logger.info("✅ EnrichAgent updated with UserContext (schema + metadata)")
             
             # Call EnrichAgent to enrich query
             try:
@@ -2058,14 +2075,28 @@ class CentralOrchestrator:
                         logger.info(f"ENRICHED QUERY: {enriched_query}")
                     else:
                         logger.info(f"NO ENRICHMENT: Query used as-is (no context needed)")
+                    
+                    # ✅ PERFORMANCE OPTIMIZATION: Extract cache from EnrichAgent response
+                    cached_sqls = enrich_response.get("_cached_retrieved_sqls", [])
+                    cached_schema = enrich_response.get("_cached_focused_schema", "")
+                    cache_source = enrich_response.get("_cache_source_query", "")
+                    
+                    if cached_sqls and cached_schema:
+                        logger.info(f"✅ Retrieved cache from EnrichAgent: {len(cached_sqls)} SQLs, schema={len(cached_schema)} chars")
                 else:
                     # Fallback: if response format is unexpected, use original query
                     logger.warning(f"Unexpected EnrichAgent response format: {enrich_response}")
                     enriched_query = query
+                    cached_sqls = []
+                    cached_schema = ""
+                    cache_source = ""
                     
             except Exception as e:
                 logger.error(f"EnrichAgent failed: {e}. Using original query.")
                 enriched_query = query
+                cached_sqls = []
+                cached_schema = ""
+                cache_source = ""
 
             # Retrieve intermediate_results from previous query in this session
             # This allows agents to access results from the immediately preceding query
@@ -2125,7 +2156,11 @@ class CentralOrchestrator:
                 # Conversation history for agents
                 conversation_history=conversation_history,
                 # Table callback for immediate streaming
-                table_callback=table_callback
+                table_callback=table_callback,
+                # ✅ PERFORMANCE OPTIMIZATION: Per-question cache from EnrichAgent
+                cached_retrieved_sqls=cached_sqls,  # 20 SQL examples
+                cached_focused_schema=cached_schema,  # Focused schema
+                cache_source_query=cache_source  # Original query for cache validation
             )
             
             logger.info(f"PROCESSING QUERY: {query}")

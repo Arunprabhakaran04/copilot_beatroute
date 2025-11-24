@@ -508,27 +508,44 @@ class SchemaManager:
             table_name = table_schema.split("\n")[0][7:]  # Remove "Table: " prefix
             set_tables.add(table_name)
         
-        # Step 2: Extract tables from retrieved SQL queries
-        sql_queries = [item['sql'] for item in list_similar_question_sql_pair if 'sql' in item]
+        # Step 2: Extract tables from TOP 5 most similar SQL queries (weighted approach)
+        if list_similar_question_sql_pair:
+            sorted_pairs = sorted(list_similar_question_sql_pair, 
+                                 key=lambda x: x.get('similarity', 0), 
+                                 reverse=True)[:5]
+            sql_queries = [item['sql'] for item in sorted_pairs if 'sql' in item]
+        else:
+            sql_queries = []
         tables_from_sql = self.extract_table_names_from_sql(sql_queries)
         
-        # Step 3: Keyword boosting - add tables with matching keywords
-        # This ensures important domain-specific tables aren't missed by embedding similarity
+        # Step 3: Add core essential tables (always include)
+        core_tables = {'ViewCustomer', 'Order', 'CustomerInvoice', 'Sku'}
+        set_tables.update(core_tables)
+        logger.info(f"SCHEMA | Added {len(core_tables)} core tables: {sorted(core_tables)}")
+        
+        # Step 4: Keyword boosting - add tables with matching keywords
         question_lower = current_question.lower()
         keyword_matches = set()
         
-        # Define keyword -> table patterns
         keyword_patterns = {
-            'visit': ['visit', 'call'],  # If query mentions "visit", include tables with "visit" or "call"
-            'call': ['visit', 'call'],
-            'attendance': ['attendance', 'schedule'],
+            'visit': ['visit', 'call', 'schedule'],
+            'call': ['visit', 'call', 'schedule'],
+            'attendance': ['attendance', 'schedule', 'user'],
             'inventory': ['inventory', 'stock'],
             'outstanding': ['outstanding', 'payment', 'debit', 'credit'],
             'payment': ['payment', 'outstanding', 'debit', 'credit'],
             'scheme': ['scheme', 'campaign'],
             'campaign': ['scheme', 'campaign'],
-            'return': ['return'],
+            'return': ['return', 'order'],
             'offtake': ['offtake'],
+            'order': ['order', 'orderdetail'],
+            'invoice': ['invoice', 'customer'],
+            'sales': ['invoice', 'order', 'customer'],
+            'customer': ['customer', 'viewcustomer'],
+            'distributor': ['distributor', 'viewdistributor'],
+            'user': ['user', 'viewuser'],
+            'sku': ['sku', 'category', 'brand'],
+            'product': ['sku', 'category', 'brand'],
         }
         
         # Check if question contains any keywords
@@ -545,11 +562,11 @@ class SchemaManager:
         if keyword_matches:
             logger.info(f"SCHEMA | Keyword boosting added {len(keyword_matches)} tables: {sorted(keyword_matches)}")
         
-        # Step 4: Combine all three sets
+        # Step 5: Combine all sets
         set_tables.update(tables_from_sql)
         set_tables.update(keyword_matches)
         
-        # Step 5: Build schema for prompt
+        # Step 6: Build schema for prompt
         schema_for_prompt = []
         tables_present = []
         tables_missing = []

@@ -1,13 +1,11 @@
 import re
 import json
-import logging
+import os
 from datetime import datetime
 from typing import List, Dict, Any
 from base_agent import BaseAgent, BaseAgentState, DBAgentState
 from token_tracker import track_llm_call
-from loguru import logger as loguru_logger
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 class ImprovedSQLGenerator(BaseAgent):
     """
@@ -68,21 +66,13 @@ class ImprovedSQLGenerator(BaseAgent):
             return ""
     
     def _get_schema_context(self, focused_schema: str = None) -> str:
-        """
-        Get schema context for the prompt
-        
-        Args:
-            focused_schema: Optional focused schema from SchemaManager
-            
-        Returns:
-            Schema string to use in prompt
-        """
+        """Use ONLY focused schema if available, otherwise return empty"""
         if focused_schema:
             logger.info("Using focused schema from SchemaManager")
             return focused_schema
-        else:
-            logger.info("Using full schema from file")
-            return self.schema_content
+        
+        logger.warning("No focused schema available")
+        return ""
     
     def _preserve_original_context(self, current_question: str, original_query: str) -> str:
         """
@@ -218,25 +208,14 @@ class ImprovedSQLGenerator(BaseAgent):
                      entity_info: Dict[str, Any] = None,
                      conversation_history: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Generate SQL query with improved context handling.
-        Always uses LLM generation for accuracy (simple generation disabled).
+        Generate SQL query using LLM with retrieved examples as context.
         
         Args:
-            entity_info: Dictionary containing verified entity information from entity verification
-                        Format: {'entities': ['name'], 'entity_types': ['ViewCustomer'], 
-                                'entity_mapping': {'name': 'ViewCustomer'}}
+            entity_info: Dictionary containing verified entity information
             conversation_history: List of previous conversation entries from RedisMemoryManager
-                        Format: [{'original': str, 'result': dict, 'timestamp': float}, ...]
         """
         try:
-            enhanced_question = self._preserve_original_context(
-                question, original_query or question
-            )
-            
-            intent = self._detect_query_intent(enhanced_question)
-            
-            # ALWAYS use LLM generation 
-            return self._generate_with_llm(enhanced_question, similar_sqls, previous_results, intent, entity_info, conversation_history)
+            return self._generate_with_llm(question, similar_sqls, previous_results, entity_info, conversation_history)
             
         except Exception as e:
             logger.error(f"SQL generation error: {e}")
@@ -247,11 +226,11 @@ class ImprovedSQLGenerator(BaseAgent):
             }
     
     def _generate_with_llm(self, question: str, similar_sqls: List[Dict], 
-                          previous_results: Dict[str, Any], intent: Dict[str, Any],
+                          previous_results: Dict[str, Any],
                           entity_info: Dict[str, Any] = None,
                           conversation_history: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Generate SQL using LLM with focused prompts and better validation.
+        Generate SQL using LLM with retrieved examples injected as conversation history.
         
         Args:
             entity_info: Dictionary containing verified entity information
@@ -278,11 +257,19 @@ class ImprovedSQLGenerator(BaseAgent):
         # NOTE: We no longer filter examples - all 20 retrieved SQLs are injected into conversation
         # The LLM will naturally focus on the most similar ones (which are last in conversation)
         
-        # Get focused schema if SchemaManager is available
+        # ✅ PERFORMANCE OPTIMIZATION: Use cached focused schema if available
+        # Check if we have a cached schema passed from EnrichAgent via state
+        cached_schema = entity_info.get("cached_focused_schema") if entity_info else None
         focused_schema = None
         focused_tables = []
         
-        if self.schema_manager is not None:
+        if cached_schema:
+            # Use cached schema from EnrichAgent (no regeneration needed)
+            focused_schema = cached_schema
+            import re
+            focused_tables = re.findall(r'^Table: (.+)$', focused_schema, re.MULTILINE)
+            logger.info(f"💾 Using cached focused schema from EnrichAgent: {len(focused_tables)} tables (0.00s)")
+        elif self.schema_manager is not None:
             try:
                 schema_start = time.time()
                 focused_schema = self.schema_manager.get_schema_to_use_in_prompt(
@@ -305,15 +292,20 @@ class ImprovedSQLGenerator(BaseAgent):
         else:
             logger.info("No SchemaManager - using full schema from file")
         
+        # Calculate top similarity for adaptive prompt
+        top_similarity = 0.0
+        if similar_sqls and len(similar_sqls) > 0:
+            sorted_sqls = sorted(similar_sqls, key=lambda x: x.get('similarity', 0))
+            top_similarity = sorted_sqls[-1].get('similarity', 0) if sorted_sqls else 0
+        
         # Create focused prompt with previous results and entity context
-        # Note: We pass similar_sqls instead of filtered examples since all SQLs are in conversation
         prompt = self._create_focused_prompt(
             question, 
-            similar_sqls,  # Pass all retrieved SQLs (for year extraction)
-            intent,  # Keep for logging purposes only
+            similar_sqls,
             cleaned_previous_results, 
             entity_info,
-            focused_schema=focused_schema  # Pass focused schema to prompt
+            focused_schema=focused_schema,
+            top_similarity=top_similarity
         )
         
         # Build user message with explicit entity names if available
@@ -331,7 +323,7 @@ class ImprovedSQLGenerator(BaseAgent):
             user_message += "\nNote: Use these exact values in your WHERE clause (case-sensitive)."
         
         # Build message log with conversation history AND retrieved SQLs
-        # Retrieved SQLs are injected as fake conversation to make LLM pay attention
+        # Retrieved SQLs are injected as user-assistant pairs with JSON format
         message_log = self._build_message_log_with_history(
             system_prompt=prompt,
             current_question=user_message,
@@ -341,58 +333,40 @@ class ImprovedSQLGenerator(BaseAgent):
             max_retrieved_sqls=20  # Inject up to 20 retrieved SQLs (increased from 10)
         )
         
-        # ✅ CRITICAL: Add explicit instruction to follow retrieved SQL patterns
-        # This is THE MOST IMPORTANT fix to make LLM use retrieved examples
+        # Calculate top similarity and determine dynamic temperature
+        top_similarity = 0.0
         if similar_sqls and len(similar_sqls) > 0:
             num_examples = min(len(similar_sqls), 20)
-            top_similarity = similar_sqls[0].get('similarity', 0) if similar_sqls else 0
+            sorted_sqls = sorted(similar_sqls[:num_examples], key=lambda x: x.get('similarity', 0))
+            top_similarity = sorted_sqls[-1].get('similarity', 0) if sorted_sqls else 0
             
-            # Find the last user message (current question) to enhance it
-            last_user_idx = None
-            for i in range(len(message_log) - 1, -1, -1):
-                if message_log[i]["role"] == "user":
-                    last_user_idx = i
-                    break
-            
-            if last_user_idx is not None:
-                original_question = message_log[last_user_idx]["content"]
-                
-                # ✅ Add EMPHATIC instruction to prioritize retrieved examples
-                enhanced_question = f"""{original_question}
-
-🎯 CRITICAL INSTRUCTIONS - FOLLOW RETRIEVED EXAMPLES:
-
-The conversation history above contains {num_examples} real SQL examples from our database.
-These examples are PROVEN to work with our exact schema and field names.
-
-YOU MUST CAREFULLY STUDY THESE EXAMPLES FOR:
-1. ✅ Exact field names to use (e.g., ViewCustomerActivity.__user, NOT ViewCustomer.name)
-2. ✅ Table join patterns (single table vs CROSS JOIN)
-3. ✅ WHERE clause syntax and date filtering
-4. ✅ GROUP BY and aggregation patterns
-5. ✅ Field availability in each table
-
-⚠️ COMMON MISTAKES TO AVOID:
-- DO NOT invent field names that don't exist in the examples
-- DO NOT join tables if examples use single table approach
-- DO NOT use fields from one table when selecting from another
-- DO NOT ignore the exact syntax patterns shown in examples
-
-🔥 HIGHEST PRIORITY: Match the patterns from the example with similarity {top_similarity:.3f}
-This example is the MOST similar to your current question - follow its structure closely!
-
-Now generate SQL following these proven patterns:"""
-                
-                message_log[last_user_idx]["content"] = enhanced_question
-                logger.info(f"✅ Added explicit instruction to follow {num_examples} retrieved SQL patterns")
-                logger.info(f"   Top similarity: {top_similarity:.3f} - LLM instructed to prioritize this example")
+            logger.info(f"Passed {num_examples} examples to LLM as user-assistant pairs")
+            logger.info(f"   Top similarity (last example): {top_similarity:.3f}")
         
-        # ADAPTIVE TEMPERATURE: Adjust creativity based on similarity
-        # Note: No longer using filtered examples, just use similarity scores from retrieved SQLs
-        adaptive_llm = self._get_adaptive_temperature_llm(similar_sqls)
+        # 🎯 DYNAMIC TEMPERATURE based on similarity score
+        if top_similarity > 0.80:
+            temperature = 0.1  # High similarity - deterministic, copy pattern closely
+            creativity_level = "LOW (COPY pattern)"
+        elif top_similarity >= 0.60:
+            temperature = 0.4  # Moderate similarity - moderate creativity, adapt pattern
+            creativity_level = "MODERATE (ADAPT pattern)"
+        else:
+            temperature = 0.6  # Low similarity - high creativity, be inventive
+            creativity_level = "HIGH (BE CREATIVE)"
         
-        # Generate response with adaptive temperature
-        response = adaptive_llm.invoke(message_log)
+        logger.info(f"🌡️ Dynamic temperature: {temperature} (similarity: {top_similarity:.3f}, creativity: {creativity_level})")
+        
+        # Generate SQL with dynamic temperature
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            model="gpt-4.1-mini",
+            api_key=os.getenv("OPENAI_API_KEY"),
+            temperature=temperature,
+            seed=42,
+            max_tokens=2000
+        )
+        
+        response = llm.invoke(message_log)
         content = response.content.strip()
         
         track_llm_call(
@@ -400,14 +374,14 @@ Now generate SQL following these proven patterns:"""
             output=content,
             agent_type="improved_sql_generator",
             operation="generate_sql",
-            model_name="gpt-4.1"
+            model_name="gpt-4.1-mini"
         )
         
         # Log execution timing
         execution_time = time.time() - start_time
         logger.info(f"SQL generation completed in {execution_time:.2f}s")
         
-        return self._parse_and_validate_response(content, question, intent)
+        return self._parse_and_validate_response(content, question)
     
     def _build_message_log_with_history(
         self,
@@ -419,11 +393,10 @@ Now generate SQL following these proven patterns:"""
         max_retrieved_sqls: int = 20
     ) -> List[Dict[str, str]]:
         """
-        Build message log with conversation history AND retrieved SQLs for multi-turn context.
+        Build message log with conversation history AND retrieved SQLs as user-assistant pairs.
         
-        Strategy: Inject retrieved SQLs as fake conversation history to make LLM pay attention.
-        Retrieved SQLs are sorted in ASCENDING order of similarity (most similar last = most recent).
-        This makes LLM think the most relevant example was just generated.
+        Strategy: Examples appear as real Q->A pairs with assistant returning JSON format.
+        Retrieved SQLs are sorted in ASCENDING order of similarity (most similar last).
         
         Args:
             system_prompt: System prompt with instructions
@@ -456,16 +429,16 @@ Now generate SQL following these proven patterns:"""
         else:
             logger.info("No real conversation history")
         
-        # Step 2: Inject RETRIEVED SQLs as fake conversation (ASCENDING similarity order)
+        # Step 2: Inject RETRIEVED SQLs as user-assistant pairs (ASCENDING similarity order)
         if retrieved_sqls and len(retrieved_sqls) > 0:
             # Sort by similarity ASCENDING (lowest first, highest last)
             sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
             
-            logger.info(f"🎯 Injecting {len(sorted_sqls)} retrieved SQLs as fake conversation (ASCENDING similarity)")
+            logger.info(f"Injecting {len(sorted_sqls)} retrieved SQLs as user-assistant pairs (ASCENDING similarity)")
             logger.info(f"   Similarity range: {sorted_sqls[0].get('similarity', 0):.3f} (first) -> {sorted_sqls[-1].get('similarity', 0):.3f} (last/most similar)")
             
-            # ✅ Log top 3 and bottom 1 to verify what LLM is seeing
-            logger.info(f"   📥 Sample injected SQLs:")
+            # Log top 3 and bottom 1 to verify what LLM is seeing
+            logger.info(f"   Sample injected SQLs:")
             for idx, sql_info in enumerate(sorted_sqls[:3], 1):
                 question = sql_info.get('question', '')
                 sql = sql_info.get('sql', '')
@@ -484,39 +457,44 @@ Now generate SQL following these proven patterns:"""
                 question = sql_info.get('question', '')
                 message_log.append({"role": "user", "content": question})
                 
-                # Add as assistant's SQL response (just the SQL, no explanation)
+                # Add as assistant's JSON response (CRITICAL: JSON format with sql key)
                 sql = sql_info.get('sql', '')
-                assistant_sql = f"```sql\n{sql}\n```"
-                message_log.append({"role": "assistant", "content": assistant_sql})
+                # Escape the SQL for JSON format
+                escaped_sql = json.dumps(sql)
+                assistant_json = f'{{"sql": {escaped_sql}}}'
+                message_log.append({"role": "assistant", "content": assistant_json})
         else:
             logger.info("No retrieved SQLs to inject")
         
-        # Step 3: Add CURRENT question with explicit instruction to follow examples
-        # ✅ CRITICAL: Add instruction to force LLM to follow retrieved SQL patterns
+        # Step 3: Add CURRENT question with explicit COPY instructions
         if retrieved_sqls and len(retrieved_sqls) > 0:
+            sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
+            most_similar = sorted_sqls[-1]
+            similarity = most_similar.get('similarity', 0)
+            most_similar_question = most_similar.get('question', '')
+            most_similar_sql = most_similar.get('sql', '')
+            
+            # Add STRICT copy instruction with pattern breakdown
             enhanced_question = f"""{current_question}
 
-🎯 CRITICAL INSTRUCTIONS - You MUST follow these:
-1. The {len(retrieved_sqls)} SQL examples above are REAL, WORKING queries from this exact database
-2. Study their patterns carefully:
-   - FIELD NAMES used (e.g., ViewCustomer.name requires CROSS JOIN ViewCustomer)
-   - TABLE JOINS (CROSS JOIN patterns are mandatory when selecting fields from multiple tables)
-   - WHERE clause date filtering patterns
-   - WITH clause structures for multi-step queries
-3. The MOST SIMILAR example (last one above) is the best pattern to follow
-4. If example uses CROSS JOIN ViewCustomer to access ViewCustomer.name, YOU MUST DO THE SAME
-5. DO NOT assume field names - use EXACT field names from the examples
-6. If ViewCustomerActivity is used, remember it has: __user, activityTime, count, calls, etc.
-7. If you need ViewCustomer.name, you MUST include: CROSS JOIN ViewCustomer
+CRITICAL COPY INSTRUCTIONS:
+The example immediately above (similarity: {similarity:.3f}) is your TEMPLATE.
+Question was: "{most_similar_question}"
 
-⚠️ COMMON MISTAKES TO AVOID:
-- Using ViewCustomer.name without CROSS JOIN ViewCustomer (will fail!)
-- Removing CROSS JOIN that was in the example pattern
-- Assuming field names that don't match the examples
-- Ignoring the table join patterns from similar examples"""
+STEP-BY-STEP COPYING RULES:
+1. COPY the FROM clause EXACTLY from that example
+2. COPY the CROSS JOIN pattern EXACTLY (same tables, same order)
+3. COPY the WHERE clause structure EXACTLY
+4. COPY the SELECT fields structure EXACTLY
+5. ONLY change: date values and entity names to match current question
+6. Do NOT add nested subqueries unless the example has them
+7. Do NOT add NOT IN unless the example uses it
+8. Do NOT add OR conditions unless the example uses them
+9. Keep the same level of complexity - do NOT make it more complex
+
+Remember: The example works. Copy it. Change only dates/names. Nothing else."""
             
             message_log.append({"role": "user", "content": enhanced_question})
-            logger.info("✅ Added explicit instruction to follow retrieved SQL patterns")
         else:
             message_log.append({"role": "user", "content": current_question})
         
@@ -526,6 +504,32 @@ Now generate SQL following these proven patterns:"""
         
         logger.info(f"FINAL message log: {total_messages} messages")
         logger.info(f"   = 1 system + {real_conv_count} real history + {injected_sql_count} injected SQLs + 1 current")
+        
+        # DEBUG: Log first 2 and last 2 injected examples to verify format
+        if retrieved_sqls and len(retrieved_sqls) > 0:
+            logger.info("DEBUG: Verifying injected example format:")
+            logger.info("   FIRST 2 examples (lowest similarity):")
+            example_count = 0
+            for i, msg in enumerate(message_log):
+                if msg["role"] == "user" and i > 0 and example_count < 2:
+                    if i + 1 < len(message_log) and message_log[i + 1]["role"] == "assistant":
+                        logger.info(f"      Example {example_count + 1}:")
+                        logger.info(f"         USER: {msg['content'][:80]}...")
+                        logger.info(f"         ASSISTANT: {message_log[i + 1]['content'][:150]}...")
+                        example_count += 1
+            
+            logger.info("   LAST 2 examples (highest similarity - most important):")
+            example_positions = []
+            for i, msg in enumerate(message_log):
+                if msg["role"] == "user" and i > 0 and i + 1 < len(message_log):
+                    if message_log[i + 1]["role"] == "assistant":
+                        example_positions.append(i)
+            
+            if len(example_positions) >= 2:
+                for idx, pos in enumerate(example_positions[-2:], 1):
+                    logger.info(f"      Example (last-{3-idx}):")
+                    logger.info(f"         USER: {message_log[pos]['content'][:80]}...")
+                    logger.info(f"         ASSISTANT: {message_log[pos + 1]['content'][:200]}...")
         
         return message_log
     
@@ -575,53 +579,7 @@ Now generate SQL following these proven patterns:"""
         
         return "\n".join(response_parts)
     
-    def _get_adaptive_temperature_llm(self, similar_sqls: List[Dict]):
-        """
-        Create LLM instance with simple 2-level adaptive temperature.
-        
-        Temperature Strategy (simplified):
-        - High similarity (≥0.70): Low temperature (0.1) - follow conversation patterns closely
-        - Low similarity (<0.70): Medium temperature (0.2) - more creative exploration
-        
-        Since examples are in conversation history, the LLM naturally focuses on the most
-        similar ones (which appear last). Temperature just adds a safety valve for low similarity.
-        """
-        try:
-            from langchain_openai import ChatOpenAI
-            import os
-            
-            # Get best similarity score from retrieved SQLs
-            best_similarity = 0
-            if similar_sqls and len(similar_sqls) > 0:
-                best_similarity = similar_sqls[0].get('similarity', 0) if isinstance(similar_sqls[0], dict) else 0
-            
-            # Simple 2-level temperature
-            if best_similarity >= 0.70:
-                temperature = 0.1
-                temp_reason = f"high similarity ({best_similarity:.3f}) - follow conversation patterns"
-            else:
-                temperature = 0.2
-                temp_reason = f"low similarity ({best_similarity:.3f}) - allow more creativity"
-            
-            logger.info(f"Temperature: {temperature} ({temp_reason})")
-            
-            # Create adaptive LLM instance
-            adaptive_llm = ChatOpenAI(
-                model="gpt-4.1",
-                api_key=os.getenv("OPENAI_API_KEY"),
-                temperature=0.1,  # Fixed at 0.1 for maximum accuracy
-                max_tokens=2000
-            )
-            
-            return adaptive_llm
-            
-        except Exception as e:
-            logger.warning(f"Failed to create adaptive LLM: {e}, using original LLM")
-            return self.llm
-    
-    # NOTE: _filter_relevant_examples() method removed
-    # We no longer filter examples since ALL 20 retrieved SQLs are injected into conversation history.
-    # The LLM naturally focuses on the most similar ones (which appear last in conversation).
+
     
     def _clean_previous_results(self, previous_results: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -698,13 +656,15 @@ Now generate SQL following these proven patterns:"""
     def _create_focused_prompt(self, question: str, examples: List[Dict], intent: Dict[str, Any], 
                               previous_results: Dict[str, Any] = None,
                               entity_info: Dict[str, Any] = None,
-                              focused_schema: str = None) -> str:
+                              focused_schema: str = None,
+                              top_similarity: float = 0.0) -> str:
         """
         Create a focused prompt that emphasizes accuracy and proper SQL generation.
         
         Args:
             entity_info: Dictionary containing verified entity information
             focused_schema: Optional focused schema containing only relevant tables
+            top_similarity: Highest similarity score from retrieved examples (for adaptive instructions)
         """
         data_year = self._extract_year_from_examples(examples)
         
@@ -770,57 +730,220 @@ Now generate SQL following these proven patterns:"""
         # Note: Retrieved SQL examples are now part of conversation history (not in prompt)
         # This makes LLM pay more attention to them as "recent successful queries"
         
-        return f"""You are an expert SQL generator for Cube.js.
+        schema_content = self._get_schema_context(focused_schema)
+        schema_warning = ""
+        if not schema_content or len(schema_content.strip()) == 0:
+            schema_warning = "\n⚠️ WARNING: No schema available - you MUST copy field names EXACTLY from the examples above!\n"
+        
+        # Build few-shot examples section with top 3 most similar SQLs
+        few_shot_examples = ""
+        if examples and len(examples) > 0:
+            # Get top 3 most similar examples (they're already sorted by similarity)
+            top_examples = sorted(examples, key=lambda x: x.get('similarity', 0), reverse=True)[:3]
+            
+            few_shot_examples = "\n" + "="*80 + "\n"
+            few_shot_examples += "📚 FEW-SHOT EXAMPLES - TOP 3 MOST SIMILAR PATTERNS\n"
+            few_shot_examples += "="*80 + "\n"
+            few_shot_examples += "These are PROVEN, TESTED SQL patterns that work correctly in CubeJS.\n"
+            few_shot_examples += "YOU MUST FOLLOW THESE PATTERNS EXACTLY.\n\n"
+            
+            for idx, example in enumerate(top_examples, 1):
+                question = example.get('question', 'N/A')
+                sql = example.get('sql', 'N/A')
+                similarity = example.get('similarity', 0)
+                
+                few_shot_examples += f"EXAMPLE {idx} (Similarity: {similarity:.3f}):\n"
+                few_shot_examples += f"User Question: {question}\n"
+                few_shot_examples += f"Correct SQL Pattern:\n{sql}\n"
+                few_shot_examples += f"\nKey Pattern Elements to COPY:\n"
+                
+                # Extract pattern elements
+                if 'CROSS JOIN' in sql:
+                    cross_joins = sql.count('CROSS JOIN')
+                    few_shot_examples += f"  ✓ Uses {cross_joins} CROSS JOIN(s) - YOU MUST USE SAME NUMBER\n"
+                if 'WITH' in sql.upper():
+                    few_shot_examples += f"  ✓ Uses WITH clause (CTE) - YOU CAN USE THIS PATTERN\n"
+                if 'ViewCustomer' in sql:
+                    few_shot_examples += f"  ✓ Uses ViewCustomer table - COPY THIS IF YOUR QUERY INVOLVES CUSTOMERS\n"
+                if 'NOT IN' in sql.upper():
+                    few_shot_examples += f"  ⚠️ Uses NOT IN - ONLY USE IF ABSOLUTELY NECESSARY\n"
+                if 'GROUP BY' in sql.upper():
+                    few_shot_examples += f"  ✓ Uses GROUP BY - COPY THIS PATTERN IF AGGREGATING\n"
+                
+                few_shot_examples += "\n"
+            
+            few_shot_examples += "="*80 + "\n\n"
+        
+        # 🎯 Generate adaptive instructions based on similarity score
+        if top_similarity > 0.75:
+            adaptive_instructions = """🔒 HIGH SIMILARITY (>0.75) - COPY MODE:
+1. COPY the FROM clause WORD-FOR-WORD from the most similar example
+2. COPY the JOIN structure CHARACTER-BY-CHARACTER from the example
+3. COPY the WHERE clause structure from the example
+4. Only modify: date filters, entity names, and minor adjustments
+5. Do NOT add patterns the example doesn't show
+6. TRUST the example - it's proven to work"""
+        elif top_similarity >= 0.50:
+            adaptive_instructions = """🔄 MODERATE SIMILARITY (0.50-0.75) - ADAPT MODE:
+1. USE the example as a GUIDE, not strict template
+2. ADAPT the logic to fit your specific question
+3. Be creative with WHERE conditions if question logic differs
+4. Keep the same table selection and JOIN pattern
+5. Think critically: Does example logic match question logic?
+6. If logic doesn't match, redesign the approach while keeping SQL style"""
+        else:
+            adaptive_instructions = """🚀 LOW SIMILARITY (<0.50) - CREATIVE MODE:
+1. Examples are just REFERENCE - be creative and independent
+2. Design SQL from scratch based on question requirements
+3. Follow CubeJS rules (CROSS JOIN, no forbidden functions)
+4. Think through the logic step-by-step
+5. Use simple patterns: WITH clause + CROSS JOIN + clean WHERE
+6. Don't force-fit an example pattern that doesn't match"""
+        
+        return f"""You are an expert Cube.js SQL generator.
 
-🎯 CRITICAL INSTRUCTION - READ THIS FIRST
-================================================================================
-The conversation history above contains REAL SQL examples from this database.
-Examples are ordered by similarity score (ASCENDING order).
-→ The MOST RECENT message in conversation = HIGHEST similarity = BEST pattern to follow
+CRITICAL: Must output JSON only: {{"sql": "..."}}
 
-Your PRIMARY task: COPY the pattern from the MOST RECENT example (last message before current question).
+=== CUBE.JS SQL API STRICT RULES (FAILURE = QUERY REJECTED) ===
 
-⚠️ The MOST RECENT example has the HIGHEST similarity score.
-⚠️ If similarity > 0.70, you MUST copy that example's structure exactly.
+🚫 ABSOLUTE PROHIBITIONS (THESE WILL FAIL):
+1. ❌ NO JOIN CONDITIONS: ONLY use CROSS JOIN, NO ON clause, NO join conditions in WHERE
+   - WRONG: FROM Table1 CROSS JOIN Table2 WHERE Table1.id = Table2.id
+   - RIGHT: FROM Table1 CROSS JOIN Table2
+   
+2. ❌ NO SUBQUERIES IN WHERE CLAUSE: Especially NOT IN (SELECT ...) or IN (SELECT ...)
+   - WRONG: WHERE customer IN (SELECT customer FROM ...)
+   - WRONG: WHERE customer NOT IN (SELECT customer FROM ...)
+   - RIGHT: Use WITH clause to create CTEs, then simple WHERE conditions
+   
+3. ❌ NO FORBIDDEN FUNCTIONS: TO_CHAR(), EXTRACT(), COALESCE(), GETDATE()
+   
+4. ❌ NO SELECT *: Must explicitly list columns
+   
+5. ❌ NO ALIASES IN WHERE: Cannot reference column aliases in WHERE clause
+   
+6. ❌ NO NESTED SUBQUERIES: Subqueries inside other subqueries in WHERE/HAVING
 
-REQUIRED STEPS:
-1. Check the MOST RECENT example (last message before current question)
-2. What TABLE does it use? → YOU use the SAME table
-3. Does it use CROSS JOIN ViewCustomer? → YOU use CROSS JOIN ViewCustomer
-4. Copy the WHERE clause pattern, date logic, and structure
-5. Change ONLY the specific date ranges for the current question
+=== MANDATORY PATTERNS (ONLY THESE WORK) ===
 
-⛔ CRITICAL TABLE RULES:
-- Question about "visits"? → Use ViewCustomerActivity (from examples)
-- Question about "sales/orders"? → Use CustomerInvoice (from examples)
-- Need customer names? → MUST use "CROSS JOIN ViewCustomer"
-- DO NOT use tables not shown in examples above
+✅ WITH Clause Pattern (for complex queries):
+   - Define CTEs first with WITH clause
+   - Use MEASURE() inside WITH clause for aggregations
+   - Use SUM() outside WITH clause (MEASURE doesn't work outside)
+   - Always assign aliases in WITH clause
+   - Include GROUP BY inside WITH clause
+   - ⚠️ DO NOT create 2 tables with WITH and then JOIN them - use UNION ALL instead
+   
+✅ CROSS JOIN Pattern:
+   - Use CROSS JOIN ONLY (no other join types)
+   - NO ON clause ever
+   - NO join conditions in WHERE clause
+   - Tables are automatically related by CROSS JOIN
+   
+✅ Table Relationships (use CROSS JOIN for these):
+   - Order ↔ ViewCustomer, ViewDistributor, ViewUser, OrderDetail
+   - OrderDetail ↔ Sku
+   - Sku ↔ Brand, Category
+   - CustomerInvoice ↔ CustomerInvoiceDetail, ViewCustomer
+   
+✅ Name Column Patterns:
+   - Customer names: CROSS JOIN ViewCustomer, use ViewCustomer.name
+   - User names: CROSS JOIN ViewUser, use ViewUser.name
+   - Distributor names: CROSS JOIN ViewDistributor, use ViewDistributor.name
+   - SKU names: CROSS JOIN Sku, use Sku.name (NOT Order.skuName or CustomerInvoiceDetail.skuName)
+   - Category names: CROSS JOIN Category with Sku, use Category.name
+   - Brand names: CROSS JOIN Brand with Sku, use Brand.name
+   
+✅ Date Field Patterns:
+   - Order dates: Order.datetime
+   - Sales/Revenue/Dispatch dates: CustomerInvoice.dispatchedDate
+   
+✅ Count Patterns:
+   - WRONG: COUNT(DISTINCT ViewCustomer.id)
+   - RIGHT: MEASURE(ViewCustomer.count)
 
-⛔ CRITICAL CROSS JOIN RULE:
-If example shows: "CROSS JOIN ViewCustomer" to get ViewCustomer.name
-→ YOU MUST also use "CROSS JOIN ViewCustomer"
-→ NEVER access ViewCustomer.name without CROSS JOIN
+🎯 CRITICAL PATTERN: "Items in Period A but NOT in Period B"
+This is YOUR CURRENT TASK TYPE - PAY CLOSE ATTENTION!
 
-Example Pattern (COPY THIS):
-```sql
-SELECT DISTINCT ViewCustomer.name 
-FROM ViewCustomerActivity 
-CROSS JOIN ViewCustomer
-WHERE ViewCustomerActivity.activityTime >= ...
-```
+❌ WRONG APPROACH (WILL FAIL IN CUBEJS):
+WITH period_a AS (SELECT DISTINCT name FROM Order CROSS JOIN ViewCustomer WHERE date >= a1 AND date < a2)
+SELECT name FROM ViewCustomer 
+WHERE name IN (SELECT name FROM period_a) 
+  AND name NOT IN (SELECT name FROM Order CROSS JOIN ViewCustomer WHERE date >= b1)  -- ❌ SUBQUERY IN WHERE!
 
-YEAR RULE: Current data year is {data_year}. Use this year in date filters.
+✅ CORRECT APPROACH (METHOD 1 - Two CTEs):
+WITH august_orders AS (
+  SELECT DISTINCT ViewCustomer.name AS customer_name
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= '2024-08-01' AND Order.datetime < '2024-09-01'
+), september_orders AS (
+  SELECT DISTINCT ViewCustomer.name AS customer_name
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= '2024-09-01' AND Order.datetime < '2024-10-01'
+)
+SELECT customer_name AS CustomerName
+FROM august_orders
+WHERE customer_name NOT IN (SELECT customer_name FROM september_orders)
+ORDER BY CustomerName
 
+✅ CORRECT APPROACH (METHOD 2 - COUNT DISTINCT):
+WITH all_order_months AS (
+  SELECT 
+    ViewCustomer.name AS customer_name,
+    DATE_TRUNC('month', Order.datetime) AS order_month
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= '2024-08-01' AND Order.datetime < '2024-10-01'
+  GROUP BY ViewCustomer.name, DATE_TRUNC('month', Order.datetime)
+), customer_month_count AS (
+  SELECT 
+    customer_name,
+    COUNT(DISTINCT order_month) AS month_count
+  FROM all_order_months
+  GROUP BY customer_name
+)
+SELECT customer_name AS CustomerName
+FROM customer_month_count
+WHERE month_count = 1  -- Only ordered in one month (August, not September)
+ORDER BY CustomerName
+
+KEY DIFFERENCES:
+- ✅ Method 1: No subqueries in WHERE of main SELECT
+- ✅ Method 2: No subqueries at all, uses HAVING clause
+- ❌ Never: WHERE x IN (...) AND x NOT IN (...) in main SELECT
+
+SCHEMA:
+{schema_content}
+{schema_warning}
+
+DATABASE YEAR: {data_year}
 {entity_context}
+{previous_context}
 
-DATABASE SCHEMA:
-{self._get_schema_context(focused_schema)}
+{few_shot_examples}
 
-RETURN FORMAT: {{"sql": "YOUR_QUERY_HERE"}}
+CRITICAL PATTERN MATCHING INSTRUCTIONS:
+You will see example queries in the conversation history before the current question.
+These examples are sorted by similarity - the MOST RECENT example (just before the current question) is the MOST SIMILAR.
 
-Now generate SQL by COPYING the most similar example's pattern."""
+🎯 ADAPTIVE STRATEGY (Based on Similarity Score: {top_similarity:.3f}):
+{adaptive_instructions}
+
+⚠️ LOGIC VALIDATION:
+- ALWAYS verify your SQL makes logical sense
+- NEVER create contradictory conditions (e.g., X NOT IN (...) AND X IN (...))
+- If the question's logic differs from examples, ADAPT the pattern, don't blindly copy
+- Think through: "Does this SQL actually answer the question?"
+
+SIMPLICITY RULE:
+Simpler SQL is better. If you can answer with one CTE and one CROSS JOIN (like examples), 
+do NOT add more complexity. More complexity = higher chance of failure.
+
+OUTPUT FORMAT: {{"sql": "YOUR_QUERY_HERE"}}"""
     
-    def _parse_and_validate_response(self, content: str, question: str, intent: Dict[str, Any]) -> Dict[str, Any]:
+    def _parse_and_validate_response(self, content: str, question: str) -> Dict[str, Any]:
         """
         Parse LLM response and validate the generated SQL.
         """
@@ -862,53 +985,38 @@ Now generate SQL by COPYING the most similar example's pattern."""
                             "invalid_sql": sql
                         }
                     
-                    # Validate SQL matches intent
-                    if self._validate_sql_intent(sql, intent):
-                        return {
-                            "success": True,
-                            "sql": sql,
-                            "query_type": "SELECT",
-                            "explanation": "Generated with LLM and validated",
-                            "method": "llm_validated",
-                            "intent": intent
-                        }
-                    else:
-                        logger.warning("Generated SQL doesn't match intent")
-                        return {
-                            "success": False,
-                            "error": "Generated SQL doesn't match detected intent",
-                            "type": "validation_error",
-                            "invalid_sql": sql
-                        }
+                    return {
+                        "success": True,
+                        "sql": sql,
+                        "query_type": "SELECT",
+                        "explanation": "Generated with LLM",
+                        "method": "llm_validated"
+                    }
             
             # Approach 2: Try to extract SQL from markdown code block
             sql_block_match = re.search(r'```(?:sql)?\s*(.*?)\s*```', content, re.DOTALL | re.IGNORECASE)
             if sql_block_match:
                 sql = sql_block_match.group(1).strip()
                 logger.info("Extracted SQL from markdown code block")
-                if self._validate_sql_intent(sql, intent):
-                    return {
-                        "success": True,
-                        "sql": sql,
-                        "query_type": "SELECT",
-                        "explanation": "Generated with LLM (extracted from markdown)",
-                        "method": "llm_markdown_extraction",
-                        "intent": intent
-                    }
+                return {
+                    "success": True,
+                    "sql": sql,
+                    "query_type": "SELECT",
+                    "explanation": "Generated with LLM (extracted from markdown)",
+                    "method": "llm_markdown_extraction"
+                }
             
             # Approach 3: Check if content itself is raw SQL
             if content.upper().strip().startswith(('SELECT', 'WITH')):
                 sql = content.strip()
                 logger.info("Content appears to be raw SQL")
-                if self._validate_sql_intent(sql, intent):
-                    return {
-                        "success": True,
-                        "sql": sql,
-                        "query_type": "SELECT",
-                        "explanation": "Generated with LLM (raw SQL)",
-                        "method": "llm_raw_sql",
-                        "intent": intent
-                    }
+                return {
+                    "success": True,
+                    "sql": sql,
+                    "query_type": "SELECT",
+                    "explanation": "Generated with LLM (raw SQL)",
+                    "method": "llm_raw_sql"
+                }
             
             # If all parsing attempts fail, return error
             logger.error("Failed to parse LLM response using all methods")
