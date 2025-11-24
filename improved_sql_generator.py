@@ -20,28 +20,6 @@ class ImprovedSQLGenerator(BaseAgent):
         
         # Load full schema from file as fallback (only if path provided)
         self.schema_content = self._load_schema_file() if schema_file_path else ""
-        
-        self.core_patterns = {
-            "monthly_sales": """
-            SELECT
-                DATE_TRUNC('month', CustomerInvoice.dispatchedDate) AS MonthYear,
-                SUM(CustomerInvoice.dispatchedvalue) AS TotalSales
-            FROM CustomerInvoice
-            WHERE {date_filter}
-            GROUP BY DATE_TRUNC('month', CustomerInvoice.dispatchedDate)
-            ORDER BY MonthYear
-            """,
-            "total_sales": """
-            SELECT SUM(CustomerInvoice.dispatchedvalue) AS TotalSales
-            FROM CustomerInvoice
-            WHERE {date_filter}
-            """,
-            "average_order_value": """
-            SELECT AVG(Order.value) AS AverageOrderValue
-            FROM Order
-            WHERE {date_filter}
-            """
-        }
     
     def get_agent_type(self) -> str:
         return "improved_sql_generator"
@@ -73,134 +51,6 @@ class ImprovedSQLGenerator(BaseAgent):
         
         logger.warning("No focused schema available")
         return ""
-    
-    def _preserve_original_context(self, current_question: str, original_query: str) -> str:
-        """
-        Preserve the original query context when dealing with generic multi-step tasks.
-        This prevents loss of specific details during decomposition.
-        """
-        current_lower = current_question.lower()
-        original_lower = original_query.lower()
-        
-        if ("get" in current_lower or "retrieve" in current_lower) and len(original_lower) > len(current_lower):
-            # Extract specific details from original query
-            preserved_details = []
-            
-            time_matches = re.findall(r'(august|september|october|november|december|january|february|march|april|may|june|july)', original_lower)
-            if time_matches:
-                preserved_details.extend([f"month: {month}" for month in set(time_matches)])
-            
-            year_matches = re.findall(r'(202[0-9])', original_lower)
-            if year_matches:
-                preserved_details.extend([f"year: {year}" for year in set(year_matches)])
-            
-            if 'last 12 months' in original_lower or '12 months' in original_lower:
-                preserved_details.append("time range: last 12 months")
-            elif 'last 6 months' in original_lower or '6 months' in original_lower:
-                preserved_details.append("time range: last 6 months")
-            elif 'last 3 months' in original_lower or '3 months' in original_lower:
-                preserved_details.append("time range: last 3 months")
-            
-            if 'sku' in original_lower:
-                if 'top 3 sku' in original_lower or 'top 3 sku' in current_lower:
-                    preserved_details.append("requirement: top 3 SKUs")
-                elif 'top' in original_lower and any(char.isdigit() for char in original_lower):
-                    top_n = re.search(r'top\s*(\d+)', original_lower)
-                    if top_n:
-                        preserved_details.append(f"requirement: top {top_n.group(1)} SKUs")
-            
-            specific_terms = re.findall(r'(separately|monthly|total|average|by month|month wise|trend|sales trend)', original_lower)
-            if specific_terms:
-                preserved_details.extend([f"grouping: {term}" for term in set(specific_terms)])
-            
-            if preserved_details:
-                enhanced_question = f"{current_question} ({', '.join(preserved_details)})"
-                logger.info(f"Enhanced generic question: '{current_question}' -> '{enhanced_question}'")
-                return enhanced_question
-        
-        return current_question
-    
-    def _detect_query_intent(self, question: str) -> Dict[str, Any]:
-        """
-        Detect the primary intent of the query and return appropriate pattern and parameters.
-        """
-        question_lower = question.lower()
-        
-        # Default to SUM aggregation (will be changed to None for LIST queries)
-        intent = {
-            "pattern": None,
-            "table": "CustomerInvoice",
-            "date_column": "dispatchedDate", 
-            "value_column": "dispatchedvalue",
-            "aggregation": "SUM",
-            "grouping": None,
-            "time_filter": None,
-            "is_simple": False,  
-            "requires_sku_join": False,
-            "requires_top_n": False,
-            "top_n_value": None
-        }
-        
-        # Detect LIST queries (no aggregation needed)
-        list_indicators = ['list of', 'show me', 'give me', 'get me', 'find', 'which customers', 'which users', 'who']
-        aggregation_indicators = ['total', 'sum', 'count', 'average', 'avg', 'maximum', 'minimum', 'max', 'min']
-        
-        # If query asks for a list AND doesn't ask for aggregation, set aggregation to None
-        is_list_query = any(indicator in question_lower for indicator in list_indicators)
-        has_aggregation = any(agg in question_lower for agg in aggregation_indicators)
-        
-        if is_list_query and not has_aggregation:
-            intent["aggregation"] = None
-            logger.info("🎯 Detected LIST query (no aggregation required)")
-        
-        # Detect SKU-related queries
-        if 'sku' in question_lower:
-            intent["requires_sku_join"] = True
-            intent["is_simple"] = False  # SKU queries need LLM
-            
-            # Detect top N requirements
-            if 'top' in question_lower:
-                top_n_match = re.search(r'top\s*(\d+)', question_lower)
-                if top_n_match:
-                    intent["requires_top_n"] = True
-                    intent["top_n_value"] = int(top_n_match.group(1))
-        
-        if any(month in question_lower for month in ['august', 'september', 'october']):
-            months = []
-            if 'august' in question_lower:
-                months.append("august")
-            if 'september' in question_lower:
-                months.append("september")
-            if 'october' in question_lower:
-                months.append("october")
-            
-            if len(months) > 1 and ('separately' in question_lower or 'each' in question_lower):
-                intent["pattern"] = "monthly_sales"
-                intent["grouping"] = "month"
-                intent["months_requested"] = months
-            else:
-                intent["pattern"] = "total_sales"
-                intent["months_requested"] = months
-        
-        # Detect time ranges (last N months)
-        time_range_match = re.search(r'last\s*(\d+)\s*months?', question_lower)
-        if time_range_match:
-            num_months = int(time_range_match.group(1))
-            intent["time_range_months"] = num_months
-            intent["grouping"] = "month" if 'trend' in question_lower or 'monthly' in question_lower else None
-        
-        # Detect order vs sales queries
-        if any(term in question_lower for term in ['order', 'orders']):
-            intent["table"] = "Order"
-            intent["date_column"] = "datetime"
-            intent["value_column"] = "value"
-        
-        # Detect aggregation type
-        if 'average' in question_lower:
-            intent["aggregation"] = "AVG"
-            intent["pattern"] = "average_order_value" if intent["table"] == "Order" else "total_sales"
-        
-        return intent
     
     def generate_sql(self, question: str, similar_sqls: List[str] = None, 
                      previous_results: Dict[str, Any] = None, 
@@ -302,8 +152,8 @@ class ImprovedSQLGenerator(BaseAgent):
         prompt = self._create_focused_prompt(
             question, 
             similar_sqls,
-            cleaned_previous_results, 
-            entity_info,
+            previous_results=cleaned_previous_results, 
+            entity_info=entity_info,
             focused_schema=focused_schema,
             top_similarity=top_similarity
         )
@@ -387,13 +237,14 @@ class ImprovedSQLGenerator(BaseAgent):
         self,
         system_prompt: str,
         current_question: str,
-        conversation_history: List[Dict[str, Any]] = None,
+        conversation_history: List[Dict[str, Any]] = None,  # Kept for compatibility but not used
         retrieved_sqls: List[Dict[str, Any]] = None,
-        max_history: int = 5,
+        max_history: int = 5,  # Not used anymore
         max_retrieved_sqls: int = 20
     ) -> List[Dict[str, str]]:
         """
-        Build message log with conversation history AND retrieved SQLs as user-assistant pairs.
+        Build message log with ONLY retrieved SQLs (no real conversation history).
+        Each query gets fresh context with only the 20 most similar examples.
         
         Strategy: Examples appear as real Q->A pairs with assistant returning JSON format.
         Retrieved SQLs are sorted in ASCENDING order of similarity (most similar last).
@@ -401,9 +252,9 @@ class ImprovedSQLGenerator(BaseAgent):
         Args:
             system_prompt: System prompt with instructions
             current_question: Current user question
-            conversation_history: List of previous REAL conversation entries (from Redis)
+            conversation_history: NOT USED - kept for compatibility
             retrieved_sqls: List of retrieved SQL examples from embedding search
-            max_history: Maximum number of previous conversations to include
+            max_history: NOT USED - kept for compatibility
             max_retrieved_sqls: Maximum number of retrieved SQLs to inject (default 20)
             
         Returns:
@@ -411,25 +262,8 @@ class ImprovedSQLGenerator(BaseAgent):
         """
         message_log = [{"role": "system", "content": system_prompt}]
         
-        # Step 1: Add REAL conversation history (if exists)
-        if conversation_history and len(conversation_history) > 0:
-            recent_history = conversation_history[-max_history:] if len(conversation_history) > max_history else conversation_history
-            
-            logger.info(f"Adding {len(recent_history)} REAL conversation(s) from Redis")
-            
-            for idx, entry in enumerate(recent_history, 1):
-                user_query = entry.get("original", "")
-                message_log.append({"role": "user", "content": user_query})
-                
-                result = entry.get("result", {})
-                assistant_response = self._format_assistant_response(result, max_rows=5)
-                message_log.append({"role": "assistant", "content": assistant_response})
-                
-                logger.info(f"   Real conversation {idx}: '{user_query[:50]}...'")
-        else:
-            logger.info("No real conversation history")
-        
-        # Step 2: Inject RETRIEVED SQLs as user-assistant pairs (ASCENDING similarity order)
+        # Inject ONLY retrieved SQLs as user-assistant pairs (ASCENDING similarity order)
+        # NO real conversation history - keeps context focused on similar patterns
         if retrieved_sqls and len(retrieved_sqls) > 0:
             # Sort by similarity ASCENDING (lowest first, highest last)
             sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
@@ -466,7 +300,7 @@ class ImprovedSQLGenerator(BaseAgent):
         else:
             logger.info("No retrieved SQLs to inject")
         
-        # Step 3: Add CURRENT question with explicit COPY instructions
+        # Add CURRENT question with explicit COPY instructions
         if retrieved_sqls and len(retrieved_sqls) > 0:
             sorted_sqls = sorted(retrieved_sqls[:max_retrieved_sqls], key=lambda x: x.get('similarity', 0))
             most_similar = sorted_sqls[-1]
@@ -474,36 +308,48 @@ class ImprovedSQLGenerator(BaseAgent):
             most_similar_question = most_similar.get('question', '')
             most_similar_sql = most_similar.get('sql', '')
             
-            # Add STRICT copy instruction with pattern breakdown
+            # Add STRICT copy instruction with FULL SQL pattern shown (no truncation)
+            # Show complete SQL so LLM can copy exact structure
+            
             enhanced_question = f"""{current_question}
 
-CRITICAL COPY INSTRUCTIONS:
-The example immediately above (similarity: {similarity:.3f}) is your TEMPLATE.
-Question was: "{most_similar_question}"
+🎯 CRITICAL: Your TEMPLATE is immediately above (similarity: {similarity:.3f})
+Template Question: "{most_similar_question}"
 
-STEP-BY-STEP COPYING RULES:
-1. COPY the FROM clause EXACTLY from that example
-2. COPY the CROSS JOIN pattern EXACTLY (same tables, same order)
-3. COPY the WHERE clause structure EXACTLY
-4. COPY the SELECT fields structure EXACTLY
-5. ONLY change: date values and entity names to match current question
-6. Do NOT add nested subqueries unless the example has them
-7. Do NOT add NOT IN unless the example uses it
-8. Do NOT add OR conditions unless the example uses them
-9. Keep the same level of complexity - do NOT make it more complex
+Template SQL Pattern (COMPLETE - NO TRUNCATION):
+```sql
+{most_similar_sql}
+```
 
-Remember: The example works. Copy it. Change only dates/names. Nothing else."""
+⚠️ MANDATORY COPYING RULES:
+1. ✅ COPY the WITH clause structure (how many CTEs, their names)
+2. ✅ COPY the FROM + CROSS JOIN pattern (same tables, same order)  
+3. ✅ COPY the WHERE clause structure (AND logic, date comparisons)
+4. ✅ COPY the main SELECT logic (NOT IN, columns, grouping)
+5. ✅ ONLY modify: specific dates (e.g., '2025-10-01' instead of CURRENT_DATE - INTERVAL)
+6. ❌ Do NOT use OR conditions in WHERE if template uses AND
+7. ❌ Do NOT combine multiple time periods in one CTE if template separates them
+8. ❌ Do NOT add extra complexity (nested subqueries, extra joins)
+
+🔴 CRITICAL: If query asks for "X but not Y", use TWO separate CTEs:
+   - CTE 1: Filter for X only
+   - CTE 2: Filter for Y only
+   - Main SELECT: FROM CTE1 WHERE NOT IN (CTE2)
+   
+DO NOT use OR to combine time periods - this creates cartesian products!
+
+The template SQL WORKS. Copy its structure. Change ONLY dates/values. Nothing else."""
             
             message_log.append({"role": "user", "content": enhanced_question})
         else:
             message_log.append({"role": "user", "content": current_question})
         
         total_messages = len(message_log)
-        real_conv_count = len(conversation_history) * 2 if conversation_history else 0
         injected_sql_count = len(retrieved_sqls) * 2 if retrieved_sqls else 0
         
         logger.info(f"FINAL message log: {total_messages} messages")
-        logger.info(f"   = 1 system + {real_conv_count} real history + {injected_sql_count} injected SQLs + 1 current")
+        logger.info(f"   = 1 system + {injected_sql_count} injected SQLs + 1 current")
+        logger.info(f"   (No real conversation history - fresh context per query)")
         
         # DEBUG: Log first 2 and last 2 injected examples to verify format
         if retrieved_sqls and len(retrieved_sqls) > 0:
@@ -653,7 +499,7 @@ Remember: The example works. Copy it. Change only dates/names. Nothing else."""
         logger.info(f"No year found in examples, using current year: {datetime.now().year}")
         return datetime.now().year
     
-    def _create_focused_prompt(self, question: str, examples: List[Dict], intent: Dict[str, Any], 
+    def _create_focused_prompt(self, question: str, examples: List[Dict],
                               previous_results: Dict[str, Any] = None,
                               entity_info: Dict[str, Any] = None,
                               focused_schema: str = None,
@@ -868,6 +714,26 @@ CRITICAL: Must output JSON only: {{"sql": "..."}}
    - Order dates: Order.datetime
    - Sales/Revenue/Dispatch dates: CustomerInvoice.dispatchedDate
    
+🚨 CRITICAL: Hardcoded Date Handling (October, November, specific months):
+   ❌ WRONG - String literals may fail due to timezone/format:
+      WHERE Order.datetime >= '2025-10-01' AND Order.datetime < '2025-11-01'
+   
+   ✅ CORRECT - Use DATE_TRUNC for specific months/years:
+      -- For October 2025:
+      WHERE Order.datetime >= DATE_TRUNC('month', DATE '2025-10-01')
+        AND Order.datetime < DATE_TRUNC('month', DATE '2025-10-01') + INTERVAL '1 month'
+      
+      -- For November 2025:
+      WHERE Order.datetime >= DATE_TRUNC('month', DATE '2025-11-01')
+        AND Order.datetime < DATE_TRUNC('month', DATE '2025-11-01') + INTERVAL '1 month'
+   
+   ⚠️ WHY: DATE_TRUNC ensures proper date boundaries and handles timezone correctly.
+   String literals like '2025-10-01' may not match database datetime format.
+   
+   📋 PATTERN TO COPY:
+      DATE_TRUNC('month', DATE 'YYYY-MM-DD') for start of month
+      DATE_TRUNC('month', DATE 'YYYY-MM-DD') + INTERVAL '1 month' for end of month
+   
 ✅ Count Patterns:
    - WRONG: COUNT(DISTINCT ViewCustomer.id)
    - RIGHT: MEASURE(ViewCustomer.count)
@@ -887,27 +753,36 @@ WITH order_dates AS (
 )
 -- This will crash: millions of rows in cartesian product before WHERE filters
 
+❌ WRONG - OR COMBINING TIME PERIODS (CAUSES CARTESIAN PRODUCT):
+WITH combined_dates AS (
+  FROM Order CROSS JOIN ViewCustomer
+  WHERE (Order.datetime >= '2025-10-01' AND Order.datetime < '2025-11-01')
+     OR (Order.datetime >= '2025-11-01' AND Order.datetime < '2025-12-01')  -- ❌ OR creates BOTH periods together!
+)
+-- This creates: every order in Oct × every customer + every order in Nov × every customer = HUGE cartesian product
+
 ❌ WRONG - SUBQUERY IN MAIN WHERE CLAUSE:
 SELECT name FROM ViewCustomer 
 WHERE name NOT IN (SELECT name FROM Order CROSS JOIN ViewCustomer WHERE date >= ...)  -- ❌ SUBQUERY!
 
 ✅ CORRECT APPROACH (METHOD 1 - Two CTEs with NOT IN):
-WITH last_month_orders AS (
+-- Example: Customers with orders in October 2025 but not November 2025
+WITH october_orders AS (
   SELECT DISTINCT ViewCustomer.name AS customer_name
   FROM Order
   CROSS JOIN ViewCustomer
-  WHERE Order.datetime >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
-    AND Order.datetime < DATE_TRUNC('month', CURRENT_DATE)
-), this_month_orders AS (
+  WHERE Order.datetime >= DATE_TRUNC('month', DATE '2025-10-01')
+    AND Order.datetime < DATE_TRUNC('month', DATE '2025-10-01') + INTERVAL '1 month'
+), november_orders AS (
   SELECT DISTINCT ViewCustomer.name AS customer_name
   FROM Order
   CROSS JOIN ViewCustomer
-  WHERE Order.datetime >= DATE_TRUNC('month', CURRENT_DATE)
-    AND Order.datetime < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+  WHERE Order.datetime >= DATE_TRUNC('month', DATE '2025-11-01')
+    AND Order.datetime < DATE_TRUNC('month', DATE '2025-11-01') + INTERVAL '1 month'
 )
 SELECT customer_name AS CustomerName  -- ✅ Use CTE column (NOT ViewCustomer.name!)
-FROM last_month_orders
-WHERE customer_name NOT IN (SELECT customer_name FROM this_month_orders)
+FROM october_orders
+WHERE customer_name NOT IN (SELECT customer_name FROM november_orders)
 ORDER BY CustomerName
 LIMIT 1000;
 
@@ -1157,6 +1032,46 @@ OUTPUT FORMAT: {{"sql": "YOUR_QUERY_HERE"}}"""
                         logger.error(f"   Problematic block: {cross_join_block[:200]}...")
                         logger.warning("SQL likely to cause 'Join Error: task panicked' - rejecting")
                         return False
+                    
+                    # 🔴 SMART OR CHECK: Only reject OR combining date ranges in CROSS JOIN
+                    # Pattern: WHERE (date >= X AND date < Y) OR (date >= Z AND date < W)
+                    # This is BAD because it creates cartesian product for BOTH time periods
+                    # But OR for entity conditions (name = 'A' OR name = 'B') is OK
+                    if 'where' in cross_join_block and ' or ' in cross_join_block:
+                        # Extract WHERE clause
+                        where_clause = cross_join_block[cross_join_block.find('where'):]
+                        
+                        # Check if OR is combining date range conditions (date >= X AND date < Y) OR (date >= Z)
+                        # Look for pattern: parentheses with date comparisons separated by OR
+                        # Match: (datetime >= 'X' AND datetime < 'Y') OR (datetime >= 'Z' AND datetime < 'W')
+                        or_date_range_pattern = r'\([^)]*datetime[^)]*>=[^)]*AND[^)]*<[^)]*\)\s+OR\s+\([^)]*datetime[^)]*>=[^)]*'
+                        
+                        if re.search(or_date_range_pattern, where_clause, re.IGNORECASE):
+                            logger.error("🔴 CARTESIAN PRODUCT: OR combining DATE RANGES in CROSS JOIN!")
+                            logger.error(f"   Pattern: (date >= X AND date < Y) OR (date >= Z) creates cartesian product")
+                            logger.error(f"   Use TWO separate CTEs instead: one per time range, then NOT IN")
+                            logger.error(f"   Note: OR for entity filters (name = 'A' OR name = 'B') is OK, but not date ranges")
+                            logger.warning("SQL likely to cause 'dimensions.includes' error - rejecting")
+                            return False
+                        else:
+                            # OR exists but not with date ranges - this is OK (e.g., name = 'A' OR name = 'B')
+                            logger.info("ℹ️ OR condition detected but not with date ranges - allowing (likely entity filter)")
+                    
+                    # 🔴 NEW CHECK: Hardcoded date strings without DATE_TRUNC (can cause format mismatch)
+                    # Pattern: WHERE datetime >= '2025-10-01' (string literal)
+                    # Should be: WHERE datetime >= DATE_TRUNC('month', DATE '2025-10-01')
+                    if 'where' in cross_join_block:
+                        where_clause = cross_join_block[cross_join_block.find('where'):]
+                        # Look for datetime comparison with quoted date string (not using DATE_TRUNC)
+                        hardcoded_date_pattern = r"datetime\s*[><=]+\s*'\d{4}-\d{2}-\d{2}"
+                        if re.search(hardcoded_date_pattern, where_clause, re.IGNORECASE):
+                            # Check if DATE_TRUNC is NOT used
+                            if 'date_trunc' not in where_clause.lower():
+                                logger.warning("⚠️ HARDCODED DATE STRING detected without DATE_TRUNC!")
+                                logger.warning(f"   Pattern: datetime >= '2025-XX-XX' may cause format/timezone mismatch")
+                                logger.warning(f"   Recommend: Use DATE_TRUNC('month', DATE '2025-XX-XX') instead")
+                                logger.info("🔧 Allowing but flagging for potential issue (not rejecting)")
+                                # Don't reject - just warn, as it might work in some databases
         
         # 🔴 CRITICAL: Check for CTE scope violations (referencing original tables after FROM cte_name)
         if 'with' in sql_lower and 'as' in sql_lower:

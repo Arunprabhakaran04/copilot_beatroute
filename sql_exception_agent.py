@@ -419,12 +419,16 @@ Respond in JSON format:
                                focused_schema: str = None) -> Dict[str, Any]:
         """Enhanced SQL correction with deep Cube.js understanding and strategic fixes."""
         
-        # Format similar SQLs for context
+        # Format similar SQLs for context - show MORE examples (5 instead of 3)
         sql_examples_text = ""
+        sql_examples_count = 0
         if similar_sqls:
-            sql_examples_text = "\n".join([
-                f"Example {i+1}:\n{sql}" for i, sql in enumerate(similar_sqls[:3])
+            # Show up to 5 working examples to give LLM better patterns
+            sql_examples_count = len(similar_sqls)
+            sql_examples_text = "\n\n".join([
+                f"Working Example {i+1}:\n```sql\n{sql}\n```" for i, sql in enumerate(similar_sqls[:5])
             ])
+            logger.info(f"📚 Providing {min(5, sql_examples_count)} similar SQL examples to exception agent")
         
         previous_attempts_text = ""
         if previous_attempts:
@@ -432,6 +436,9 @@ Respond in JSON format:
                 f"Attempt {i+1}: FAILED - {attempt.get('error', 'Unknown error')}"
                 for i, attempt in enumerate(previous_attempts[-2:])  # Last 2 attempts
             ])
+        
+        # Analyze retrieved SQLs to extract common patterns
+        retrieved_patterns = self._analyze_similar_sql_patterns(similar_sqls) if similar_sqls else {}
         
         current_date = datetime.now().strftime('%Y-%m-%d')
         
@@ -491,8 +498,17 @@ ERROR ANALYSIS:
 PREVIOUS FAILED ATTEMPTS:
 {previous_attempts_text if previous_attempts_text else "This is the first attempt"}
 
-WORKING SQL EXAMPLES (Learn from these patterns):
-{sql_examples_text if sql_examples_text else "No examples available"}
+{'=' * 80}
+🎯 WORKING SQL EXAMPLES - COPY THESE PATTERNS ({sql_examples_count} available):
+{'=' * 80}
+{sql_examples_text if sql_examples_text else "⚠️ No similar examples available - generate from scratch using Cube.js rules"}
+
+💡 CRITICAL: If examples are available above, your corrected SQL should CLOSELY MATCH their structure.
+   - Copy the table selection strategy (which tables are used)
+   - Copy the CROSS JOIN pattern and WHERE clause structure
+   - Copy the date filtering approach (DATE_TRUNC usage)
+   - Copy the aggregation and GROUP BY patterns
+   - Only change the specific conditions to match the current question
 
 CUBE.JS CRITICAL INSIGHT:
 The error "Can't find join path" is VERY common in Cube.js. It means the system cannot establish 
@@ -540,6 +556,11 @@ CORRECT EXAMPLES (FOLLOW THIS):
 ✅ SELECT CustomerInvoice.dispatchedvalue, CustomerInvoice.dispatchedDate FROM CustomerInvoice
 ✅ SELECT DATE_TRUNC('month', CustomerInvoice.dispatchedDate) FROM CustomerInvoice
 ✅ SELECT MEASURE(ViewCustomer.count) FROM ViewCustomer
+
+{'=' * 80}
+📊 PATTERN ANALYSIS FROM SIMILAR SUCCESSFUL QUERIES:
+{'=' * 80}
+{self._format_pattern_insights(retrieved_patterns) if retrieved_patterns else "No patterns analyzed"}
 
 STRATEGIC FIX FOR "{fix_strategy}":
 {self._get_strategy_specific_instructions(fix_strategy, error_analysis)}
@@ -669,6 +690,75 @@ Always return valid JSON with the corrected SQL or failure explanation."""
             "tables_used": [],
             "validation_notes": "Response parsing failed"
         }
+    
+    def _analyze_similar_sql_patterns(self, similar_sqls: List[str]) -> Dict[str, Any]:
+        """Analyze patterns from similar SQLs to guide SQL correction."""
+        if not similar_sqls:
+            return {}
+        
+        patterns = {
+            "tables_used": [],
+            "uses_cross_join": False,
+            "uses_with_clause": False,
+            "uses_group_by": False,
+            "uses_date_trunc": False,
+            "max_tables": 0
+        }
+        
+        for sql in similar_sqls[:5]:  # Analyze first 5
+            sql_lower = sql.lower()
+            
+            # Extract table names
+            from_match = re.search(r'from\s+(\w+)', sql_lower)
+            if from_match:
+                table = from_match.group(1)
+                if table not in patterns["tables_used"]:
+                    patterns["tables_used"].append(table)
+            
+            # Count tables
+            table_count = len(re.findall(r'\bcross\s+join\b', sql_lower)) + 1
+            patterns["max_tables"] = max(patterns["max_tables"], table_count)
+            
+            # Check patterns
+            if 'cross join' in sql_lower:
+                patterns["uses_cross_join"] = True
+            if 'with ' in sql_lower:
+                patterns["uses_with_clause"] = True
+            if 'group by' in sql_lower:
+                patterns["uses_group_by"] = True
+            if 'date_trunc' in sql_lower:
+                patterns["uses_date_trunc"] = True
+        
+        logger.info(f"📊 Similar SQL patterns: {patterns}")
+        return patterns
+    
+    def _get_strategy_specific_instructions(self, strategy: str, error_analysis: Dict[str, Any]) -> str:
+        """Format pattern insights for the correction prompt."""
+        if not patterns:
+            return "No patterns available"
+        
+        insights = []
+        
+        if patterns.get("tables_used"):
+            tables = ", ".join(patterns["tables_used"])
+            insights.append(f"✅ Common tables in working queries: {tables}")
+        
+        if patterns.get("max_tables"):
+            insights.append(f"✅ Maximum tables used: {patterns['max_tables']} (use ≤ this number)")
+        
+        if patterns.get("uses_cross_join"):
+            insights.append("✅ Working queries use CROSS JOIN (not INNER/LEFT/RIGHT JOIN)")
+        
+        if patterns.get("uses_with_clause"):
+            insights.append("✅ Working queries use WITH clauses for CTEs")
+        
+        if patterns.get("uses_group_by"):
+            insights.append("✅ Working queries use GROUP BY for aggregation")
+        
+        if patterns.get("uses_date_trunc"):
+            insights.append("✅ Working queries use DATE_TRUNC for date operations")
+        
+        return "\n".join(insights) if insights else "No clear patterns detected"
     
     def _get_strategy_specific_instructions(self, strategy: str, error_analysis: Dict[str, Any]) -> str:
         """Get specific instructions based on the fix strategy."""
