@@ -807,14 +807,17 @@ CRITICAL: Must output JSON only: {{"sql": "..."}}
 === CUBE.JS SQL API STRICT RULES (FAILURE = QUERY REJECTED) ===
 
 🚫 ABSOLUTE PROHIBITIONS (THESE WILL FAIL):
-1. ❌ NO JOIN CONDITIONS: ONLY use CROSS JOIN, NO ON clause, NO join conditions in WHERE
-   - WRONG: FROM Table1 CROSS JOIN Table2 WHERE Table1.id = Table2.id
-   - RIGHT: FROM Table1 CROSS JOIN Table2
+1. ❌ NO JOIN CONDITIONS: ONLY use CROSS JOIN, NO ON clause
+   - WRONG: FROM Order JOIN ViewCustomer ON Order.customerId = ViewCustomer.id
+   - RIGHT: FROM Order CROSS JOIN ViewCustomer
+   - ⚠️ IMPORTANT: You CAN and MUST use WHERE filters on dates, entity names, etc!
+   - RIGHT: FROM Order CROSS JOIN ViewCustomer WHERE Order.datetime >= '2024-08-01' AND ViewCustomer.name = 'ABC Corp'
    
-2. ❌ NO SUBQUERIES IN WHERE CLAUSE: Especially NOT IN (SELECT ...) or IN (SELECT ...)
-   - WRONG: WHERE customer IN (SELECT customer FROM ...)
-   - WRONG: WHERE customer NOT IN (SELECT customer FROM ...)
-   - RIGHT: Use WITH clause to create CTEs, then simple WHERE conditions
+2. ❌ NO SUBQUERIES IN WHERE CLAUSE OF MAIN SELECT: Especially NOT IN (SELECT ...) or IN (SELECT ...)
+   - WRONG: SELECT * FROM ViewCustomer WHERE name IN (SELECT customer FROM Order WHERE ...)
+   - WRONG: SELECT * FROM ViewCustomer WHERE name NOT IN (SELECT customer FROM Order WHERE ...)
+   - RIGHT: Use WITH clause to create CTEs, then use NOT IN with CTE names
+   - RIGHT: WITH cte AS (...) SELECT * FROM main_table WHERE field NOT IN (SELECT field FROM cte)
    
 3. ❌ NO FORBIDDEN FUNCTIONS: TO_CHAR(), EXTRACT(), COALESCE(), GETDATE()
    
@@ -833,6 +836,13 @@ CRITICAL: Must output JSON only: {{"sql": "..."}}
    - Always assign aliases in WITH clause
    - Include GROUP BY inside WITH clause
    - ⚠️ DO NOT create 2 tables with WITH and then JOIN them - use UNION ALL instead
+   
+🔴 CRITICAL CTE SCOPE RULE:
+   - Tables referenced INSIDE a CTE are NOT accessible OUTSIDE the CTE
+   - Main SELECT can ONLY reference: (1) CTE name, (2) CTE output columns
+   - WRONG: WITH cte AS (SELECT Table.col AS x FROM Table) SELECT Table.col FROM cte
+   - RIGHT: WITH cte AS (SELECT Table.col AS x FROM Table) SELECT x FROM cte
+   - This is a UNIVERSAL SQL rule - violating it causes "field not found" errors
    
 ✅ CROSS JOIN Pattern:
    - Use CROSS JOIN ONLY (no other join types)
@@ -865,54 +875,88 @@ CRITICAL: Must output JSON only: {{"sql": "..."}}
 🎯 CRITICAL PATTERN: "Items in Period A but NOT in Period B"
 This is YOUR CURRENT TASK TYPE - PAY CLOSE ATTENTION!
 
-❌ WRONG APPROACH (WILL FAIL IN CUBEJS):
-WITH period_a AS (SELECT DISTINCT name FROM Order CROSS JOIN ViewCustomer WHERE date >= a1 AND date < a2)
-SELECT name FROM ViewCustomer 
-WHERE name IN (SELECT name FROM period_a) 
-  AND name NOT IN (SELECT name FROM Order CROSS JOIN ViewCustomer WHERE date >= b1)  -- ❌ SUBQUERY IN WHERE!
+⚠️ CARTESIAN PRODUCT WARNING - THIS IS YOUR MAIN ERROR:
+The most common failure is creating unfiltered CROSS JOINs that produce cartesian products.
 
-✅ CORRECT APPROACH (METHOD 1 - Two CTEs):
-WITH august_orders AS (
-  SELECT DISTINCT ViewCustomer.name AS customer_name
-  FROM Order
-  CROSS JOIN ViewCustomer
-  WHERE Order.datetime >= '2024-08-01' AND Order.datetime < '2024-09-01'
-), september_orders AS (
-  SELECT DISTINCT ViewCustomer.name AS customer_name
-  FROM Order
-  CROSS JOIN ViewCustomer
-  WHERE Order.datetime >= '2024-09-01' AND Order.datetime < '2024-10-01'
-)
-SELECT customer_name AS CustomerName
-FROM august_orders
-WHERE customer_name NOT IN (SELECT customer_name FROM september_orders)
-ORDER BY CustomerName
-
-✅ CORRECT APPROACH (METHOD 2 - COUNT DISTINCT):
-WITH all_order_months AS (
-  SELECT 
-    ViewCustomer.name AS customer_name,
-    DATE_TRUNC('month', Order.datetime) AS order_month
-  FROM Order
-  CROSS JOIN ViewCustomer
-  WHERE Order.datetime >= '2024-08-01' AND Order.datetime < '2024-10-01'
+❌ WRONG - UNFILTERED CROSS JOIN (CAUSES CARTESIAN PRODUCT):
+WITH order_dates AS (
+  SELECT ViewCustomer.name AS CustomerName, DATE_TRUNC('month', Order.datetime) AS OrderMonth
+  FROM Order CROSS JOIN ViewCustomer  -- ❌ NO WHERE CLAUSE = EVERY ORDER × EVERY CUSTOMER!
+  WHERE Order.datetime >= ... OR Order.datetime <= ...  -- ❌ Filters AFTER join
   GROUP BY ViewCustomer.name, DATE_TRUNC('month', Order.datetime)
-), customer_month_count AS (
-  SELECT 
-    customer_name,
-    COUNT(DISTINCT order_month) AS month_count
-  FROM all_order_months
-  GROUP BY customer_name
 )
-SELECT customer_name AS CustomerName
-FROM customer_month_count
-WHERE month_count = 1  -- Only ordered in one month (August, not September)
-ORDER BY CustomerName
+-- This will crash: millions of rows in cartesian product before WHERE filters
 
-KEY DIFFERENCES:
-- ✅ Method 1: No subqueries in WHERE of main SELECT
-- ✅ Method 2: No subqueries at all, uses HAVING clause
-- ❌ Never: WHERE x IN (...) AND x NOT IN (...) in main SELECT
+❌ WRONG - SUBQUERY IN MAIN WHERE CLAUSE:
+SELECT name FROM ViewCustomer 
+WHERE name NOT IN (SELECT name FROM Order CROSS JOIN ViewCustomer WHERE date >= ...)  -- ❌ SUBQUERY!
+
+✅ CORRECT APPROACH (METHOD 1 - Two CTEs with NOT IN):
+WITH last_month_orders AS (
+  SELECT DISTINCT ViewCustomer.name AS customer_name
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+    AND Order.datetime < DATE_TRUNC('month', CURRENT_DATE)
+), this_month_orders AS (
+  SELECT DISTINCT ViewCustomer.name AS customer_name
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= DATE_TRUNC('month', CURRENT_DATE)
+    AND Order.datetime < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+)
+SELECT customer_name AS CustomerName  -- ✅ Use CTE column (NOT ViewCustomer.name!)
+FROM last_month_orders
+WHERE customer_name NOT IN (SELECT customer_name FROM this_month_orders)
+ORDER BY CustomerName
+LIMIT 1000;
+
+KEY POINTS FOR METHOD 1:
+- ✅ Each CTE filters by date range IN THE CTE WHERE CLAUSE (not in main SELECT)
+- ✅ Main SELECT uses NOT IN with CTE names (NOT subqueries)
+- ✅ CROSS JOIN is used but WITH proper WHERE filters on dates
+- ✅ Main SELECT references CTE columns (customer_name), NOT original table columns (ViewCustomer.name)
+- ❌ NEVER create unfiltered CROSS JOIN - always add WHERE for dates/entities
+- ❌ NEVER reference original tables in main SELECT after FROM cte_name
+
+✅ CORRECT APPROACH (METHOD 2 - LEFT JOIN with NULL check):
+WITH last_month_orders AS (
+  SELECT DISTINCT ViewCustomer.name AS customer_name
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+    AND Order.datetime < DATE_TRUNC('month', CURRENT_DATE)
+), this_month_orders AS (
+  SELECT DISTINCT ViewCustomer.name AS customer_name
+  FROM Order
+  CROSS JOIN ViewCustomer
+  WHERE Order.datetime >= DATE_TRUNC('month', CURRENT_DATE)
+)
+SELECT lm.customer_name AS CustomerName
+FROM last_month_orders lm
+LEFT JOIN this_month_orders tm ON lm.customer_name = tm.customer_name
+WHERE tm.customer_name IS NULL
+ORDER BY CustomerName
+LIMIT 1000;
+
+KEY DIFFERENCES THAT PREVENT CARTESIAN PRODUCTS:
+- ✅ Each CTE MUST have WHERE clause filtering dates INSIDE the CTE
+- ✅ WHERE filters applied BEFORE CROSS JOIN result is materialized
+- ✅ Main SELECT uses NOT IN with CTE names (NOT inline subqueries)
+- ✅ Main SELECT references CTE columns ONLY (NOT original table columns)
+- ❌ NEVER: CROSS JOIN without WHERE filters (creates cartesian product)
+- ❌ NEVER: WHERE x NOT IN (SELECT ... FROM ... CROSS JOIN ... WHERE ...) in main SELECT
+- ❌ NEVER: GROUP BY before filtering dates (groups cartesian product)
+- ❌ NEVER: SELECT Table.column FROM cte_name (Table doesn't exist outside CTE!)
+
+🔴 THE #1 MISTAKE: Unfiltered CROSS JOIN
+If you write "FROM Order CROSS JOIN ViewCustomer" without WHERE filtering in the SAME CTE/query block,
+you create a cartesian product of EVERY order × EVERY customer, which crashes the system.
+
+🔴 THE #2 MISTAKE: Wrong Column Reference After CTE
+If you write "WITH cte AS (SELECT Table.col AS alias ...) SELECT Table.col FROM cte",
+you get "No field named 'Table.col'" error because Table only exists INSIDE the CTE.
+Always use: SELECT alias FROM cte
 
 SCHEMA:
 {schema_content}
@@ -983,6 +1027,17 @@ OUTPUT FORMAT: {{"sql": "YOUR_QUERY_HERE"}}"""
                             "error": "LLM generated placeholder SQL with WHERE 1=1",
                             "type": "validation_error",
                             "invalid_sql": sql
+                        }
+                    
+                    # 🔴 CRITICAL: Validate no unfiltered CROSS JOINs and CTE scope violations
+                    if not self._validate_sql_intent(sql, {}):
+                        logger.error("SQL validation failed - structural issue detected")
+                        return {
+                            "success": False,
+                            "error": "Generated SQL has structural issues (unfiltered CROSS JOIN or CTE scope violation)",
+                            "type": "validation_error",
+                            "invalid_sql": sql,
+                            "fix_hint": "1) Add WHERE clause to filter CROSS JOIN before GROUP BY, OR 2) Use CTE column aliases (not original table.column) in main SELECT after FROM cte_name"
                         }
                     
                     return {
@@ -1075,6 +1130,67 @@ OUTPUT FORMAT: {{"sql": "YOUR_QUERY_HERE"}}"""
         if cross_join_count > 6:
             logger.warning(f"SQL has too many CROSS JOINs: {cross_join_count}")
             return False
+        
+        # 🔴 CRITICAL: Check for unfiltered CROSS JOINs (cartesian product risk)
+        # Pattern: CROSS JOIN followed by another CROSS JOIN or GROUP BY without WHERE clause in between
+        if 'cross join' in sql_lower:
+            # Split SQL into CTEs and main query
+            parts = re.split(r'\bwith\b|\bselect\b', sql_lower, flags=re.IGNORECASE)
+            
+            for part in parts:
+                if 'cross join' in part:
+                    # Check if this CROSS JOIN block has WHERE clause before GROUP BY or end
+                    # Extract the portion from CROSS JOIN to next major clause
+                    cross_join_pos = part.find('cross join')
+                    remaining = part[cross_join_pos:]
+                    
+                    # Find next major clause (GROUP BY, ORDER BY, or end)
+                    group_by_pos = remaining.find('group by')
+                    order_by_pos = remaining.find('order by')
+                    next_clause_pos = min([p for p in [group_by_pos, order_by_pos, len(remaining)] if p > 0])
+                    
+                    cross_join_block = remaining[:next_clause_pos]
+                    
+                    # Check if WHERE exists in this block
+                    if 'where' not in cross_join_block:
+                        logger.error("🔴 CARTESIAN PRODUCT DETECTED: CROSS JOIN without WHERE clause!")
+                        logger.error(f"   Problematic block: {cross_join_block[:200]}...")
+                        logger.warning("SQL likely to cause 'Join Error: task panicked' - rejecting")
+                        return False
+        
+        # 🔴 CRITICAL: Check for CTE scope violations (referencing original tables after FROM cte_name)
+        if 'with' in sql_lower and 'as' in sql_lower:
+            # Extract CTE names
+            cte_pattern = r'with\s+(\w+)\s+as\s*\('
+            cte_names = re.findall(cte_pattern, sql_lower)
+            
+            if cte_names:
+                # Find main SELECT (after all CTEs)
+                # Split by ') SELECT' or ') \nSELECT' to get main query
+                main_select_match = re.search(r'\)\s*select\s+', sql_lower)
+                if main_select_match:
+                    main_select_start = main_select_match.end()
+                    main_select = sql_lower[main_select_start:]
+                    
+                    # Extract FROM clause in main SELECT
+                    from_match = re.search(r'\bfrom\s+(\w+)', main_select)
+                    if from_match:
+                        from_table = from_match.group(1)
+                        
+                        # If FROM references a CTE, check if SELECT references original tables
+                        if from_table in cte_names:
+                            # Check for table.column patterns in SELECT clause (before FROM)
+                            select_clause = main_select[:main_select.find('from')]
+                            # Look for patterns like ViewCustomer.name, Order.value, etc.
+                            table_ref_pattern = r'\b[A-Z]\w+\.[a-z_]+\b'
+                            table_refs = re.findall(table_ref_pattern, select_clause)
+                            
+                            if table_refs:
+                                logger.error(f"🔴 CTE SCOPE VIOLATION: Main SELECT references original table columns after FROM {from_table}")
+                                logger.error(f"   Problematic references: {table_refs}")
+                                logger.error(f"   FROM {from_table} means you can ONLY use columns defined in {from_table} CTE")
+                                logger.warning("SQL likely to cause 'No field named' error - rejecting")
+                                return False
         
         # Basic sanity check: SQL should start with SELECT or WITH
         if not sql.strip().upper().startswith(('SELECT', 'WITH')):
