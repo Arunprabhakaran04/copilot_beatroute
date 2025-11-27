@@ -177,6 +177,14 @@ class DBQueryAgent(BaseAgent):
                 execution_time = time.time() - start_time
                 result["execution_time"] = execution_time
                 
+                # Record timing in global tracker
+                try:
+                    from clean_logging import get_timing_tracker
+                    timing_tracker = get_timing_tracker()
+                    timing_tracker.record("db_query_multi_step", execution_time)
+                except ImportError:
+                    pass
+                
                 try:
                     from clean_logging import AgentLogger
                     AgentLogger.query_complete("db_query", execution_time)
@@ -192,6 +200,14 @@ class DBQueryAgent(BaseAgent):
                 # Add timing
                 execution_time = time.time() - start_time
                 result["execution_time"] = execution_time
+                
+                # Record timing in global tracker
+                try:
+                    from clean_logging import get_timing_tracker
+                    timing_tracker = get_timing_tracker()
+                    timing_tracker.record("db_query", execution_time)
+                except ImportError:
+                    pass
                 
                 try:
                     from clean_logging import AgentLogger

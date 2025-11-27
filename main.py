@@ -334,6 +334,9 @@ class CentralOrchestrator:
                     entity_result = entity_verification_agent.process(entity_state)
                     entity_time = time.time() - entity_start
                     
+                    # Record timing
+                    timing_tracker.record("entity_verification", entity_time)
+                    
                     try:
                         from clean_logging import AgentLogger
                         AgentLogger.query_complete("entity_verification", entity_time)
@@ -1364,6 +1367,9 @@ class CentralOrchestrator:
             logger.info(f"Executing step {state['current_step']}: {agent_type} agent")
             agent = self.agents[agent_type]
             
+            # Track agent execution time
+            agent_start_time = time.time()
+            
             if agent_type == "campaign":
                 result_state = self._handle_campaign_routing(state, agent)
             elif agent_type == "visualization":
@@ -1372,6 +1378,15 @@ class CentralOrchestrator:
                 result_state = self._handle_summary_routing(state, agent)
             else:
                 result_state = self._handle_direct_routing(state, agent)
+            
+            # Record agent execution time
+            agent_execution_time = time.time() - agent_start_time
+            try:
+                from clean_logging import get_timing_tracker
+                timing_tracker = get_timing_tracker()
+                timing_tracker.record(agent_type, agent_execution_time)
+            except ImportError:
+                pass
             
             # If agent execution was successful, capture the result
             if result_state["status"] == "completed":
@@ -2016,6 +2031,11 @@ class CentralOrchestrator:
         
         start_time = time.time()
         
+        # Initialize timing tracker for this query
+        from clean_logging import get_timing_tracker
+        timing_tracker = get_timing_tracker()
+        timing_tracker.start_tracking()
+        
         try:
             # Enrich query using EnrichAgent (replaces heuristic enrichment)
             logger.info(f"ORIGINAL QUERY: {query}")
@@ -2030,6 +2050,7 @@ class CentralOrchestrator:
             
             # Call EnrichAgent to enrich query
             try:
+                enrich_start = time.time()
                 enrich_response = self.enrich_agent.enrich_query(
                     session_id=session_id,
                     user_id=user_id,
@@ -2038,6 +2059,15 @@ class CentralOrchestrator:
                     user_name=getattr(user_context, 'user_name', None) if user_context else None,
                     email=getattr(user_context, 'email', None) if user_context else None
                 )
+                enrich_time = time.time() - enrich_start
+                
+                # Record enrich agent timing
+                try:
+                    from clean_logging import get_timing_tracker
+                    timing_tracker = get_timing_tracker()
+                    timing_tracker.record("enrich_agent", enrich_time)
+                except ImportError:
+                    pass
                 
                 # Check response type: answer, follow_up, or complete_question
                 if "answer" in enrich_response:
@@ -2186,6 +2216,10 @@ class CentralOrchestrator:
         result["start_time"] = start_time
         result["end_time"] = end_time
         result["execution_time"] = execution_time
+        
+        # End timing tracking and display statistics
+        timing_tracker.end_tracking()
+        timing_tracker.display_stats()
         
         # Get token usage summary
         token_tracker = get_token_tracker()

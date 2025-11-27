@@ -104,3 +104,117 @@ class OrchestrationLogger:
     @staticmethod
     def workflow_complete(steps: int, total_time: float):
         logger.success(f"WORKFLOW COMPLETE | {steps} steps in {total_time:.2f}s")
+
+
+class TimingTracker:
+    """Track and display execution time statistics for all agents"""
+    
+    def __init__(self):
+        self.timings = {}
+        self.total_start_time = None
+        self.total_end_time = None
+    
+    def start_tracking(self):
+        """Start tracking total query time"""
+        self.total_start_time = __import__('time').time()
+        self.timings = {}
+    
+    def record(self, agent_name: str, execution_time: float):
+        """Record execution time for an agent"""
+        if agent_name not in self.timings:
+            self.timings[agent_name] = []
+        self.timings[agent_name].append(execution_time)
+    
+    def end_tracking(self):
+        """End tracking total query time"""
+        self.total_end_time = __import__('time').time()
+    
+    def get_total_time(self) -> float:
+        """Get total query execution time"""
+        if self.total_start_time and self.total_end_time:
+            return self.total_end_time - self.total_start_time
+        return 0.0
+    
+    def display_stats(self):
+        """Display timing statistics in a formatted table"""
+        if not self.timings:
+            logger.info("No timing data available")
+            return
+        
+        total_query_time = self.get_total_time()
+        
+        # Calculate statistics
+        stats = []
+        total_agent_time = 0.0
+        
+        for agent_name, times in self.timings.items():
+            total_time = sum(times)
+            avg_time = total_time / len(times)
+            max_time = max(times)
+            min_time = min(times)
+            count = len(times)
+            
+            percentage = (total_time / total_query_time * 100) if total_query_time > 0 else 0
+            
+            stats.append({
+                'agent': agent_name,
+                'total': total_time,
+                'avg': avg_time,
+                'min': min_time,
+                'max': max_time,
+                'count': count,
+                'percentage': percentage
+            })
+            
+            total_agent_time += total_time
+        
+        # Sort by total time (descending)
+        stats.sort(key=lambda x: x['total'], reverse=True)
+        
+        # Display header
+        logger.info("\n" + "="*100)
+        logger.info("⏱️  AGENT EXECUTION TIME STATISTICS")
+        logger.info("="*100)
+        
+        # Display table header
+        header = f"{'Agent':<25} {'Calls':<8} {'Total(s)':<12} {'Avg(s)':<12} {'Min(s)':<12} {'Max(s)':<12} {'% of Total':<12}"
+        logger.info(header)
+        logger.info("-"*100)
+        
+        # Display each agent's stats
+        for stat in stats:
+            row = (
+                f"{stat['agent']:<25} "
+                f"{stat['count']:<8} "
+                f"{stat['total']:<12.3f} "
+                f"{stat['avg']:<12.3f} "
+                f"{stat['min']:<12.3f} "
+                f"{stat['max']:<12.3f} "
+                f"{stat['percentage']:<12.1f}"
+            )
+            logger.info(row)
+        
+        # Display footer
+        logger.info("-"*100)
+        
+        # Calculate overhead (time not accounted for by agents)
+        overhead = total_query_time - total_agent_time
+        overhead_percentage = (overhead / total_query_time * 100) if total_query_time > 0 else 0
+        
+        logger.info(f"{'Total Agent Time':<25} {'':<8} {total_agent_time:<12.3f} {'':<12} {'':<12} {'':<12} {(total_agent_time/total_query_time*100):<12.1f}")
+        logger.info(f"{'Overhead (non-agent)':<25} {'':<8} {overhead:<12.3f} {'':<12} {'':<12} {'':<12} {overhead_percentage:<12.1f}")
+        logger.info(f"{'TOTAL QUERY TIME':<25} {'':<8} {total_query_time:<12.3f}")
+        logger.info("="*100 + "\n")
+        
+        # Highlight slowest agent
+        if stats:
+            slowest = stats[0]
+            logger.warning(f"🐌 SLOWEST AGENT: {slowest['agent']} ({slowest['total']:.3f}s total, {slowest['percentage']:.1f}% of query time)")
+
+
+# Global timing tracker instance
+_timing_tracker = TimingTracker()
+
+def get_timing_tracker() -> TimingTracker:
+    """Get the global timing tracker instance"""
+    return _timing_tracker
