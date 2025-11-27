@@ -301,68 +301,92 @@ class CentralOrchestrator:
                     logger.warning(f"Early cache check failed: {cache_err}. Continuing normally.")
                 
                 # ============================================================
-                # ENTITY VERIFICATION: Before decomposition
+                # OPTIMIZATION 3: Smart Entity Verification (skip if no entities)
                 # ============================================================
                 try:
-                    logger.info("Running entity verification")
-                    entity_state = BaseAgentState(
-                        query=state["query"],
-                        agent_type="entity_verification",
-                        user_id=state.get("user_id", "default_user"),
-                        status="",
-                        error_message="",
-                        success_message="",
-                        result={},
-                        start_time=time.time(),
-                        end_time=0.0,
-                        execution_time=0.0,
-                        classification_confidence=None,
-                        redirect_count=0,
-                        original_query=state["query"],
-                        remaining_tasks=[],
-                        completed_steps=[],
-                        current_step=0,
-                        is_multi_step=False,
-                        intermediate_results={},
-                        session_id=state.get("session_id", "default_session")
-                    )
+                    # Fast heuristic: Check if query likely contains entity names
+                    query_lower = state["query"].lower()
                     
-                    entity_verification_agent = self.agents["entity_verification"]
+                    # Patterns indicating entity names (proper nouns, quoted strings)
+                    has_quotes = '"' in state["query"] or "'" in state["query"]
+                    has_common_entity_words = any(word in query_lower for word in [
+                        "customer", "brand", "category", "sku", "user", "distributor"
+                    ])
+                    # Check for capitalized words (potential entity names) - but exclude common SQL keywords
+                    words = state["query"].split()
+                    sql_keywords = {"SELECT", "FROM", "WHERE", "ORDER", "GROUP", "BY", "LIMIT", "AND", "OR"}
+                    capitalized_words = [w for w in words if w and w[0].isupper() and w.upper() not in sql_keywords]
+                    has_capitalized = len(capitalized_words) > 0
                     
-                    # Track entity verification timing
-                    entity_start = time.time()
-                    entity_result = entity_verification_agent.process(entity_state)
-                    entity_time = time.time() - entity_start
-                    
-                    # Record timing
-                    timing_tracker.record("entity_verification", entity_time)
-                    
-                    try:
-                        from clean_logging import AgentLogger
-                        AgentLogger.query_complete("entity_verification", entity_time)
-                    except ImportError:
-                        logger.success(f"ENTITY_VERIFICATION | Completed in {entity_time:.2f}s")
-                    
-                    if entity_result.get("status") == "entity_verification_needed":
-                        verification_message = entity_result.get("result", {}).get("verification_message", "")
-                        logger.info(f"Entity verification failed: {verification_message}")
-                        
-                        state["status"] = "completed"
-                        state["result"] = {
-                            "message": verification_message,
-                            "type": "entity_verification_error"
-                        }
-                        state["success_message"] = "Entity verification requires clarification"
-                        state["agent_type"] = "entity_verification"
-                        return state
+                    # Skip entity verification if no indicators of entity names
+                    if not has_quotes and not has_capitalized:
+                        logger.info("⚡ OPTIMIZATION: Skipping entity verification (no entities detected)")
+                        logger.info("   Entity verification passed")
                     else:
-                        # Store entity information for use by SQL generator
-                        entity_info = entity_result.get("result", {}).get("entity_info", {})
-                        if entity_info:
-                            state["entity_info"] = entity_info
-                            logger.info(f"Entity verification passed: {entity_info}")
+                        logger.info("Running entity verification")
+                        entity_state = BaseAgentState(
+                            query=state["query"],
+                            agent_type="entity_verification",
+                            user_id=state.get("user_id", "default_user"),
+                            status="",
+                            error_message="",
+                            success_message="",
+                            result={},
+                            start_time=time.time(),
+                            end_time=0.0,
+                            execution_time=0.0,
+                            classification_confidence=None,
+                            redirect_count=0,
+                            original_query=state["query"],
+                            remaining_tasks=[],
+                            completed_steps=[],
+                            current_step=0,
+                            is_multi_step=False,
+                            intermediate_results={},
+                            session_id=state.get("session_id", "default_session")
+                        )
+                        
+                        entity_verification_agent = self.agents["entity_verification"]
+                        
+                        # Track entity verification timing
+                        entity_start = time.time()
+                        entity_result = entity_verification_agent.process(entity_state)
+                        entity_time = time.time() - entity_start
+                        
+                        # Record timing (with error handling)
+                        try:
+                            from clean_logging import get_timing_tracker
+                            timing_tracker = get_timing_tracker()
+                            timing_tracker.record("entity_verification", entity_time)
+                        except Exception as timing_err:
+                            logger.debug(f"Timing tracker error: {timing_err}")
+                        
+                        try:
+                            from clean_logging import AgentLogger
+                            AgentLogger.query_complete("entity_verification", entity_time)
+                        except ImportError:
+                            logger.success(f"ENTITY_VERIFICATION | Completed in {entity_time:.2f}s")
+                        
+                        if entity_result.get("status") == "entity_verification_needed":
+                            verification_message = entity_result.get("result", {}).get("verification_message", "")
+                            logger.info(f"Entity verification failed: {verification_message}")
+                            
+                            state["status"] = "completed"
+                            state["result"] = {
+                                "message": verification_message,
+                                "type": "entity_verification_error"
+                            }
+                            state["success_message"] = "Entity verification requires clarification"
+                            state["agent_type"] = "entity_verification"
+                            return state
                         else:
-                            logger.info("Entity verification passed")
+                            # Store entity information for use by SQL generator
+                            entity_info = entity_result.get("result", {}).get("entity_info", {})
+                            if entity_info:
+                                state["entity_info"] = entity_info
+                                logger.info(f"Entity verification passed: {entity_info}")
+                            else:
+                                logger.info("Entity verification passed")
                         
                 except Exception as entity_err:
                     logger.warning(f"Entity verification failed: {entity_err}. Continuing normally.")
@@ -2037,8 +2061,72 @@ class CentralOrchestrator:
         timing_tracker.start_tracking()
         
         try:
-            # Enrich query using EnrichAgent (replaces heuristic enrichment)
+            # ============================================================
+            # OPTIMIZATION 1: Check cache BEFORE EnrichAgent (save 6s)
+            # ============================================================
             logger.info(f"ORIGINAL QUERY: {query}")
+            
+            # Check if we have cached result for this exact query BEFORE running EnrichAgent
+            try:
+                cached_result = self.memory.get_cached_result_for_query(
+                    session_id=session_id,
+                    query=query,
+                    user_id=user_id
+                )
+                
+                if cached_result:
+                    logger.info(f"🎯 CACHE HIT: Found cached result for exact query")
+                    logger.info(f"⚡ OPTIMIZATION: Skipping EnrichAgent (saved ~6s)")
+                    
+                    # Extract the actual result from cache structure
+                    actual_result = cached_result.get("final_result", {})
+                    is_multi_step = cached_result.get("is_multi_step", False)
+                    
+                    # ✅ FIX: Ensure table data is included in the response for websocket
+                    # The websocket handler needs table_sent_via_callback=False to send the table
+                    if "query_results" in actual_result:
+                        # Mark that table was NOT sent via callback (it's from cache)
+                        actual_result["table_sent_via_callback"] = False
+                        logger.info(f"📊 Cache includes table data - will be sent to client")
+                        logger.info(f"   Query results keys: {list(actual_result.get('query_results', {}).keys())}")
+                    else:
+                        logger.warning(f"⚠️ Cached result missing 'query_results' - table may not display")
+                    
+                    # End timing tracking and display statistics
+                    timing_tracker.end_tracking()
+                    timing_tracker.display_stats()
+                    
+                    # Get token usage summary
+                    token_tracker = get_token_tracker()
+                    token_summary = token_tracker.get_session_summary()
+                    TokenLogger.session_summary(
+                        token_summary['total_tokens'], 
+                        token_summary['total_cost'], 
+                        token_summary['total_calls']
+                    )
+                    
+                    # Return cached result immediately
+                    execution_time = time.time() - start_time
+                    logger.success(f"SUCCESS: Retrieved result from cache in {execution_time:.2f}s")
+                    
+                    return {
+                        "success": True,
+                        "agent_type": "db_query" if not is_multi_step else "multi_step",
+                        "result": actual_result,
+                        "status": "completed",
+                        "execution_time": execution_time,
+                        "cached": True,
+                        "cache_hit": True
+                    }
+                else:
+                    logger.debug(f"💾 No cache hit - proceeding with EnrichAgent")
+                    
+            except Exception as cache_err:
+                logger.warning(f"Cache check failed: {cache_err}. Continuing with EnrichAgent.")
+            
+            # ============================================================
+            # Continue with normal flow if no cache hit
+            # ============================================================
             
             # Get conversation history from Redis
             conversation_history = self.memory.get_recent(session_id, n=5, user_id=user_id)

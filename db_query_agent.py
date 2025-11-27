@@ -269,6 +269,25 @@ class DBQueryAgent(BaseAgent):
                     logger.info(f"   (Enriched query: '{state['query']}')")
                 retrieved_sqls = self._retrieve_step_specific_sqls(retrieval_query)
             
+            # ✅ PERFORMANCE OPTIMIZATION: Reduce SQL examples based on top similarity
+            # High similarity = fewer examples needed (pattern is clear)
+            if retrieved_sqls and len(retrieved_sqls) > 0:
+                # Get top similarity (retrieved_sqls are already sorted by similarity ascending)
+                top_similarity = retrieved_sqls[-1].get('similarity', 0) if isinstance(retrieved_sqls[-1], dict) else 0
+                original_count = len(retrieved_sqls)
+                
+                if top_similarity > 0.80:
+                    # Very high similarity - keep only top 10 examples
+                    retrieved_sqls = retrieved_sqls[-10:] if len(retrieved_sqls) > 10 else retrieved_sqls
+                    logger.info(f"⚡ High similarity ({top_similarity:.3f}) detected - reduced from {original_count} to {len(retrieved_sqls)} examples")
+                elif top_similarity > 0.70:
+                    # Good similarity - keep top 15 examples
+                    retrieved_sqls = retrieved_sqls[-15:] if len(retrieved_sqls) > 15 else retrieved_sqls
+                    logger.info(f"⚡ Good similarity ({top_similarity:.3f}) detected - reduced from {original_count} to {len(retrieved_sqls)} examples")
+                else:
+                    # Lower similarity - keep all 20 examples
+                    logger.info(f"📚 Lower similarity ({top_similarity:.3f}) - using all {len(retrieved_sqls)} examples")
+            
             # Check if this is part of a multi-step workflow (has intermediate_results from previous steps)
             intermediate_results = state.get("intermediate_results", {})
             if intermediate_results:
@@ -582,6 +601,20 @@ class DBQueryAgent(BaseAgent):
                 else:
                     # For steps 2+, always retrieve fresh (different questions)
                     step_specific_sqls = self._retrieve_step_specific_sqls(step_question)
+                
+                # ✅ PERFORMANCE OPTIMIZATION: Reduce SQL examples based on top similarity (multi-step)
+                if step_specific_sqls and len(step_specific_sqls) > 0:
+                    top_similarity = step_specific_sqls[-1].get('similarity', 0) if isinstance(step_specific_sqls[-1], dict) else 0
+                    original_count = len(step_specific_sqls)
+                    
+                    if top_similarity > 0.80:
+                        step_specific_sqls = step_specific_sqls[-10:] if len(step_specific_sqls) > 10 else step_specific_sqls
+                        logger.info(f"⚡ Step {step_idx}: High similarity ({top_similarity:.3f}) - reduced to {len(step_specific_sqls)} examples")
+                    elif top_similarity > 0.70:
+                        step_specific_sqls = step_specific_sqls[-15:] if len(step_specific_sqls) > 15 else step_specific_sqls
+                        logger.info(f"⚡ Step {step_idx}: Good similarity ({top_similarity:.3f}) - reduced to {len(step_specific_sqls)} examples")
+                    else:
+                        logger.info(f"📚 Step {step_idx}: Using all {len(step_specific_sqls)} examples (similarity: {top_similarity:.3f})")
                 
                 logger.info(f" Retrieved {len(step_specific_sqls)} SQL examples for step {step_idx}")
                 if step_specific_sqls:
