@@ -34,6 +34,10 @@ class BaseAgentState(TypedDict):
     cached_retrieved_sqls: Optional[List[Dict[str, Any]]]  # 20 retrieved SQL examples
     cached_focused_schema: Optional[str]  # Focused schema from SchemaManager
     cache_source_query: Optional[str]  # Original query used to generate cache (for invalidation)
+    # DB query fields (needed for semantic cache and LangGraph state propagation)
+    sql_query: Optional[str]
+    query_type: Optional[str]
+    query_data: Optional[str]
 
 class MeetingAgentState(BaseAgentState):
     meeting_date: str
@@ -41,8 +45,9 @@ class MeetingAgentState(BaseAgentState):
     file_path: str
 
 class DBAgentState(BaseAgentState):
-    sql_query: str
-    query_type: str
+    # sql_query, query_type, query_data now inherited from BaseAgentState
+    # This ensures LangGraph workflow properly propagates these fields
+    pass
 
 class EmailAgentState(BaseAgentState):
     email_to: str

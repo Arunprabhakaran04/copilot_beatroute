@@ -326,10 +326,17 @@ async def process_question(websocket: WebSocket, question: str, session_id: str,
             })
         
         if result.get("is_multi_step", False):
-            for idx, step in enumerate(result.get("completed_steps", []), 1):
-                step_agent_type = step.get("agent_type")
-                step_result = step.get("result", {})
+            # Only send the final step result to frontend
+            # Intermediate steps are for internal processing only
+            completed_steps = result.get("completed_steps", [])
+            if completed_steps:
+                # Send only the last (final) step
+                final_step = completed_steps[-1]
+                step_agent_type = final_step.get("agent_type")
+                step_result = final_step.get("result", {})
                 
+                logger.info(f"📤 Multi-step query: Sending ONLY final step ({len(completed_steps)}/{len(completed_steps)})")
+                logger.info(f"   Skipped {len(completed_steps) - 1} intermediate step(s)")
                 await send_agent_result(websocket, step_agent_type, step_result)
         else:
             await send_agent_result(websocket, agent_type, result_data)
