@@ -28,7 +28,7 @@ from db_connection import execute_sql
 from enrich_agent import EnrichAgent
 from openai import OpenAI
 from semantic_cache import (
-    get_from_semantic_cache,
+    get_from_semantic_cache_dual,
     _add_to_semantic_cache,
     generate_query_embedding
 )
@@ -2146,77 +2146,76 @@ class CentralOrchestrator:
             # OPTIMIZATION 1.5: Check SEMANTIC cache BEFORE EnrichAgent
             # ============================================================
             try:
-                logger.info("Checking semantic cache...")
-                query_embedding = generate_query_embedding(query)
+                logger.info("Checking semantic cache (dual-mode: normalized + raw)...")
                 
-                if query_embedding is not None:
-                    semantic_cached = get_from_semantic_cache(
-                        question_embedding=query_embedding,
-                        threshold=0.90
-                    )
+                # Use dual-mode cache lookup (normalized first, then raw fallback)
+                semantic_cached = get_from_semantic_cache_dual(
+                    question=query,
+                    raw_threshold=0.80,
+                    norm_threshold=0.90
+                )
+                
+                if semantic_cached:
+                    cache_mode = semantic_cached.get("cache_mode", "unknown")
+                    similarity = semantic_cached.get("similarity", 0.0)
+                    cached_question = semantic_cached.get("question", "N/A")
+                    logger.info(f"🎯 SEMANTIC CACHE HIT! (mode={cache_mode.upper()}, similarity: {similarity:.3f})")
+                    logger.info(f"   Original query: '{query}'")
+                    logger.info(f"   Cached query: '{cached_question}'")
+                    logger.info(f"⚡ OPTIMIZATION: Skipping EnrichAgent (semantic match, saved ~6-8s)")
                     
-                    if semantic_cached:
-                        similarity = semantic_cached.get("similarity", 0.0)
-                        cached_question = semantic_cached.get("question", "N/A")
-                        logger.info(f"🎯 SEMANTIC CACHE HIT! (similarity: {similarity:.3f})")
-                        logger.info(f"   Original query: '{query}'")
-                        logger.info(f"   Cached query: '{cached_question}'")
-                        logger.info(f"⚡ OPTIMIZATION: Skipping EnrichAgent (semantic match, saved ~6-8s)")
-                        
-                        # Extract cached data
-                        cached_sql = semantic_cached.get("sql")
-                        cached_results_json = semantic_cached.get("query_results")
-                        cached_focused_schema = semantic_cached.get("focused_schema")  # ⚡ NEW: Get cached schema
-                        
-                        if cached_focused_schema:
-                            logger.info(f"⚡ Using cached focused schema ({len(cached_focused_schema)} chars) - saved 4.2s!")
-                        else:
-                            logger.debug("⚠️ No cached focused_schema in semantic cache")
-                        
-                        if cached_sql and cached_results_json:
-                            # Parse query_results from JSON string
-                            import json
-                            query_results_dict = json.loads(cached_results_json)
-                            
-                            # Format return similar to exact cache
-                            actual_result = {
-                                "query_results": query_results_dict,
-                                "table_sent_via_callback": False,
-                                "sql_query": cached_sql
-                            }
-                            
-                            # End timing tracking and display statistics
-                            timing_tracker.end_tracking()
-                            timing_tracker.display_stats()
-                            
-                            # Get token usage summary
-                            token_tracker = get_token_tracker()
-                            token_summary = token_tracker.get_session_summary()
-                            TokenLogger.session_summary(
-                                token_summary['total_tokens'],
-                                token_summary['total_cost'],
-                                token_summary['total_calls']
-                            )
-                            
-                            # Return cached result immediately
-                            execution_time = time.time() - start_time
-                            logger.success(f"SUCCESS: Retrieved result from semantic cache in {execution_time:.2f}s")
-                            
-                            return {
-                                "success": True,
-                                "agent_type": "db_query",
-                                "result": actual_result,
-                                "status": "completed",
-                                "execution_time": execution_time,
-                                "cached": True,
-                                "semantic_cache_hit": True
-                            }
-                        else:
-                            logger.warning("Semantic cache hit but missing SQL or results data")
+                    # Extract cached data
+                    cached_sql = semantic_cached.get("sql")
+                    cached_results_json = semantic_cached.get("query_results")
+                    cached_focused_schema = semantic_cached.get("focused_schema")  # ⚡ NEW: Get cached schema
+                    
+                    if cached_focused_schema:
+                        logger.info(f"⚡ Using cached focused schema ({len(cached_focused_schema)} chars) - saved 4.2s!")
                     else:
-                        logger.info("❌ No semantic cache hit (threshold: 0.90)")
+                        logger.debug("⚠️ No cached focused_schema in semantic cache")
+                    
+                    if cached_sql and cached_results_json:
+                        # Parse query_results from JSON string
+                        import json
+                        query_results_dict = json.loads(cached_results_json)
+                        
+                        # Format return similar to exact cache
+                        actual_result = {
+                            "query_results": query_results_dict,
+                            "table_sent_via_callback": False,
+                            "sql_query": cached_sql
+                        }
+                        
+                        # End timing tracking and display statistics
+                        timing_tracker.end_tracking()
+                        timing_tracker.display_stats()
+                        
+                        # Get token usage summary
+                        token_tracker = get_token_tracker()
+                        token_summary = token_tracker.get_session_summary()
+                        TokenLogger.session_summary(
+                            token_summary['total_tokens'],
+                            token_summary['total_cost'],
+                            token_summary['total_calls']
+                        )
+                        
+                        # Return cached result immediately
+                        execution_time = time.time() - start_time
+                        logger.success(f"SUCCESS: Retrieved result from semantic cache in {execution_time:.2f}s")
+                        
+                        return {
+                            "success": True,
+                            "agent_type": "db_query",
+                            "result": actual_result,
+                            "status": "completed",
+                            "execution_time": execution_time,
+                            "cached": True,
+                            "semantic_cache_hit": True
+                        }
+                    else:
+                        logger.warning("Semantic cache hit but missing SQL or results data")
                 else:
-                    logger.warning("Failed to generate embedding for semantic cache check")
+                    logger.info("❌ No semantic cache hit (normalized threshold: 0.90, raw threshold: 0.80)")
                     
             except Exception as semantic_err:
                 logger.warning(f"Semantic cache check failed: {semantic_err}. Continuing with EnrichAgent.")
